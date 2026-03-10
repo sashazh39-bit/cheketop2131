@@ -532,6 +532,10 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
     def next_step(aw: str, prompt: str):
         _gen_send_next(state, aw, prompt, chat_id, token, tg_req)
 
+    if awaiting in ("gen_type", "gen_bank") and state.get("gen_bank_type") is None:
+        send("Выберите тип перевода и банк кнопками выше.")
+        return
+
     if awaiting == "gen_amount":
         nums = re.findall(r"\d+", text.strip())
         if not nums:
@@ -873,8 +877,8 @@ def run_bot(token: str) -> None:
                     _handle_vtb_full_input(token, uid, chat_id, text, msg, tg_request)
                     continue
 
-                # Режим «Сгенерировать»: пошаговый ввод
-                if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("gen_"):
+                # Режим «Сгенерировать»: по gen_bank_type (надёжнее, чем только awaiting)
+                if uid in USER_STATE and "gen_bank_type" in USER_STATE[uid]:
                     _handle_gen_input(token, uid, chat_id, text, msg, tg_request)
                     continue
 
@@ -944,7 +948,10 @@ def run_bot(token: str) -> None:
                     continue
 
                 if uid in USER_STATE:
-                    tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Сначала выберите банк (кнопками выше)."})
+                    if "gen_bank_type" in USER_STATE[uid]:
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Продолжайте ввод выше или нажмите кнопки."})
+                    else:
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Сначала выберите банк (кнопками выше)."})
                 else:
                     tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Сначала отправьте чек и выберите банк."})
 
@@ -956,21 +963,51 @@ def run_bot(token: str) -> None:
                     tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
                     continue
                 if q["data"] == "main_generate":
-                    USER_STATE[uid] = {"awaiting": "gen_bank", "gen_bank_type": None}
+                    USER_STATE[uid] = {"awaiting": "gen_type", "gen_transfer_type": None, "gen_bank_type": None}
                     tg_request(token, "editMessageText", {
                         "chat_id": q["message"]["chat"]["id"],
                         "message_id": q["message"]["message_id"],
                         "text": (
                             "✨ Сгенерировать чек\n\n"
+                            "Бот найдёт один чек из базы с нужными буквами.\n\n"
+                            "Выберите тип перевода:"
+                        ),
+                        "reply_markup": json.dumps({
+                            "inline_keyboard": [
+                                [{"text": "📱 Перевод по СБП", "callback_data": "gen_type_sbp"}],
+                                [{"text": "💳 По номеру карты (скоро)", "callback_data": "gen_type_card"}],
+                                [{"text": "🌐 Трансгран (скоро)", "callback_data": "gen_type_transgran"}],
+                                [{"text": "⬅️ Назад", "callback_data": "main_back"}],
+                            ],
+                        }),
+                    })
+                    continue
+                if q["data"] == "gen_type_sbp":
+                    USER_STATE[uid] = {"awaiting": "gen_bank", "gen_transfer_type": "sbp", "gen_bank_type": None}
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": (
+                            "✨ Перевод по СБП\n\n"
                             f"{VTB_UNSUPPORTED_NOTICE}\n\n"
-                            "Выберите банк (пока только ВТБ с полной заменой):"
+                            "Выберите банк (пока только ВТБ):"
                         ),
                         "reply_markup": json.dumps({
                             "inline_keyboard": [
                                 [{"text": "🏛 ВТБ", "callback_data": "gen_bank_vtb"}],
-                                [{"text": "⬅️ Назад", "callback_data": "main_back"}],
+                                [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
                             ],
                         }),
+                    })
+                    continue
+                if q["data"] in ("gen_type_card", "gen_type_transgran"):
+                    if uid in USER_STATE and "gen_bank_type" in USER_STATE[uid]:
+                        del USER_STATE[uid]
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "Пока доступен только перевод по СБП.",
+                        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
                     })
                     continue
                 if q["data"] == "main_db":
@@ -1031,9 +1068,11 @@ def run_bot(token: str) -> None:
                     })
                     continue
                 if q["data"] == "gen_bank_vtb":
+                    prev = USER_STATE.get(uid, {})
                     USER_STATE[uid] = {
                         "awaiting": "gen_amount",
                         "gen_bank_type": "vtb",
+                        "gen_transfer_type": prev.get("gen_transfer_type", "sbp"),
                     }
                     tg_request(token, "editMessageText", {
                         "chat_id": q["message"]["chat"]["id"],
