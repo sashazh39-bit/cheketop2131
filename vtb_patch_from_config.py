@@ -184,13 +184,9 @@ def patch_from_values(
                 if tm_m and float(tm_m.group(2)) > 100:
                     new_dec = new_dec.replace(tm_m.group(0), tm_m.group(1) + f"{new_x:.5f}".encode() + tm_m.group(3))
             if new_recipient_21:
-                tm_m = re.search(rb"(1 0 0 1 )([\d.]+)( 327\.11249 Tm)", new_dec)
-                if tm_m and 90 < float(tm_m.group(2)) < 120:
-                    n = n_glyphs(new_recipient_21)
-                    pts_h = pts["recipient"] * (10.5 / 9)
-                    shift = (17 - n) * pts_h / 2
-                    old_x = float(tm_m.group(2))
-                    new_dec = new_dec.replace(tm_m.group(0), tm_m.group(1) + f"{old_x + shift:.5f}".encode() + tm_m.group(3))
+                out327 = replace_field_by_y(new_dec, ["327.11249", "327.11", "327.2", "327.25", "327.43"], new_recipient_21, "recipient")
+                if out327 != new_dec:
+                    new_dec = out327
 
         if new_amount_tj:
             if OLD_AMOUNT in new_dec:
