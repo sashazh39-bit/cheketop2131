@@ -1,1 +1,1 @@
-worker: python3 bot_standalone.py
+web: python3 run_render.py
