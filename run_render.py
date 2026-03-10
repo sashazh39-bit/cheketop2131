@@ -8,40 +8,43 @@ UptimeRobot (бесплатно) для пинга каждые 5 мин.
 """
 import os
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Порт задаёт Render через переменную PORT
+# PORT обязателен для Render: https://render.com/docs/web-services#port-binding
 PORT = int(os.environ.get("PORT", 10000))
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, format, *args):
-        pass  # не засорять лог
-
-
-def run_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
-
-
 def run_bot():
-    from bot_standalone import run_bot, main
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        print("TELEGRAM_BOT_TOKEN не задан")
-        return
-    run_bot(token)
+    try:
+        from bot_standalone import run_bot as _run_bot
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            print("TELEGRAM_BOT_TOKEN не задан", flush=True)
+            return
+        _run_bot(token)
+    except Exception as e:
+        print(f"Bot error: {e}", flush=True)
 
 
 if __name__ == "__main__":
-    # Бот в отдельном потоке
-    t = threading.Thread(target=run_bot, daemon=True)
-    t.start()
-    # HTTP-сервер в главном потоке (Render проверяет порт)
-    run_server()
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            pass
+
+    # Сразу биндим порт — Render проверяет это в первые секунды
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Listening on 0.0.0.0:{PORT}", flush=True)
+
+    # Бот в фоне
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # serve_forever блокирует главный поток
+    server.serve_forever()
