@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""Telegram-бот без внешних зависимостей (только stdlib).
+Отправьте чек → выберите банк → введите "с какой на какую" → получите PDF.
+"""
+# Обход: прокси и SSL (корпоративные сети / Python на macOS)
+import os as _os
+import ssl
+import urllib.request as _ur
+from urllib.parse import urlparse
+_ssl_ctx = ssl._create_unverified_context()
+_proxy_url = _os.environ.get("HTTPS_PROXY") or _os.environ.get("https_proxy") or _os.environ.get("HTTP_PROXY") or _os.environ.get("http_proxy")
+_handlers = [_ur.HTTPSHandler(context=_ssl_ctx)]
+if _proxy_url:
+    _proxy = {"http": _proxy_url, "https": _proxy_url}
+    _handlers.insert(0, _ur.ProxyHandler(_proxy))
+    # Прокси с авторизацией user:pass@host:port
+    try:
+        p = urlparse(_proxy_url)
+        if p.username and p.password:
+            _pm = _ur.HTTPPasswordMgrWithDefaultRealm()
+            _pm.add_password(None, f"{p.scheme}://{p.hostname}:{p.port or (443 if p.scheme == 'https' else 80)}", p.username, p.password)
+            _handlers.insert(1, _ur.ProxyBasicAuthHandler(_pm))
+    except Exception:
+        pass
+_ur.install_opener(_ur.build_opener(*_handlers))
+
+import json
+import os
+import re
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+# Загрузка .env вручную (без python-dotenv)
+try:
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+except Exception:
+    pass
+
+from pdf_patcher import patch_pdf_file, patch_amount as pdf_patch_amount, format_amount_display
+from vtb_patch_from_config import patch_from_values
+from vtb_cmap import get_unsupported_chars, format_unsupported_error, suggest_replacement, FALLBACK_TIPS
+from vtb_sber_reference import scan_vtb_unsupported_chars
+
+BASE = "https://api.telegram.org/bot"
+
+VTB_UNSUPPORTED_NOTICE = (
+    "⚠️ Нельзя использовать: ё, Ё, неразрывный дефис (‑). "
+    "Замените на: е, Е, обычный дефис (-)."
+)
+USER_STATE: dict[int, dict] = {}
+
+# Разрешённые user_id (через запятую в .env: ALLOWED_USER_IDS=123456,789012)
+_ALLOWED_IDS: set[int] = set()
+_raw = os.environ.get("ALLOWED_USER_IDS", "").strip()
+if _raw:
+    for s in _raw.replace(" ", "").split(","):
+        if s.isdigit():
+            _ALLOWED_IDS.add(int(s))
+
+ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
+
+ZAYAVKI_DIR = Path(__file__).parent / "заявки"
+STATUS_LABELS = {"новый": "🆕 Новый", "в работе": "🔄 В работе", "оплачено": "💰 Оплачено"}
+STATUS_SHORT = {"n": "новый", "w": "в работе", "o": "оплачено"}
+STATUS_TO_SHORT = {"новый": "n", "в работе": "w", "оплачено": "o"}
+
+
+def save_zayavka(uid: int, username: str, amount_from: int, amount_to: int, bank: str, pdf_name: str, description: str) -> Path | None:
+    """Сохранить заявку в JSON (файл по дате). Возвращает путь к файлу или None."""
+    try:
+        ZAYAVKI_DIR.mkdir(parents=True, exist_ok=True)
+        day = datetime.now().strftime("%Y-%m-%d")
+        filepath = ZAYAVKI_DIR / f"{day}.json"
+        data = []
+        if filepath.exists():
+            try:
+                data = json.loads(filepath.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = []
+        entry = {
+            "id": f"{int(time.time() * 1000)}_{uid}",
+            "user_id": uid,
+            "username": username or "",
+            "timestamp": datetime.now().isoformat(),
+            "amount_from": amount_from,
+            "amount_to": amount_to,
+            "bank": bank,
+            "pdf_name": pdf_name,
+            "описание": description,
+            "статус": "новый",
+        }
+        data.append(entry)
+        filepath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return filepath
+    except Exception as e:
+        print(f"  ⚠️ Ошибка сохранения заявки: {e}")
+        return None
+
+
+def load_all_zayavki() -> list[dict]:
+    """Загрузить все заявки из JSON (все файлы заявки/*.json), сортировка по дате (новые сверху)."""
+    result = []
+    if not ZAYAVKI_DIR.exists():
+        return result
+    for fp in sorted(ZAYAVKI_DIR.glob("*.json"), reverse=True):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            for e in data:
+                e.setdefault("статус", "новый")
+                result.append(e)
+        except (json.JSONDecodeError, OSError):
+            continue
+    result.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    return result
+
+
+def update_zayavka_status(zayavka_id: str, new_status: str) -> bool:
+    """Обновить статус заявки по id. Вернуть True если успешно."""
+    if not ZAYAVKI_DIR.exists():
+        return False
+    for fp in ZAYAVKI_DIR.glob("*.json"):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            for i, e in enumerate(data):
+                if e.get("id") == zayavka_id:
+                    data[i]["статус"] = new_status
+                    fp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    return True
+        except (json.JSONDecodeError, OSError):
+            continue
+    return False
+
+
+def get_zayavka_by_id(zayavka_id: str) -> dict | None:
+    """Найти заявку по id."""
+    for z in load_all_zayavki():
+        if z.get("id") == zayavka_id:
+            return z
+    return None
+
+
+def build_zayavki_list(limit: int = 15) -> tuple[str, str]:
+    """Список заявок: каждая — кнопка для открытия."""
+    try:
+        items = load_all_zayavki()
+    except Exception as e:
+        print(f"  ⚠️ Ошибка загрузки заявок: {e}")
+        return "📋 Заявки:\n\nОшибка загрузки.", json.dumps({"inline_keyboard": []})
+    if not items:
+        return "📋 Заявки:\n\nНет заявок. Нажмите на заявку для просмотра.", json.dumps({"inline_keyboard": []})
+    lines = [f"📋 Заявки (всего {len(items)})\n\nНажмите на заявку:"]
+    keyboard = []
+    for i, z in enumerate(items[:limit]):
+        try:
+            st = z.get("статус", "новый")
+            am_from = int(z.get("amount_from") or 0)
+            am_to = int(z.get("amount_to") or 0)
+            ts = (z.get("timestamp") or "")[:10]
+            lbl = STATUS_LABELS.get(st, st)
+            btn_text = f"{i+1}. {format_amount_display(am_from)}→{format_amount_display(am_to)} ₽ · {ts} {lbl}"[:64]
+            zid = z.get("id") or ""
+            if not zid:
+                continue
+            cb = f"v_{zid}"[:64]
+            keyboard.append([{"text": btn_text, "callback_data": cb}])
+        except Exception as e:
+            print(f"  ⚠️ Ошибка заявки {i}: {e}")
+            continue
+    return "\n".join(lines), json.dumps({"inline_keyboard": keyboard})
+
+
+def build_zayavka_detail(zayavka_id: str) -> tuple[str, str] | None:
+    """Карточка заявки с кнопками [В работе] [Оплачено] [Назад]."""
+    z = get_zayavka_by_id(zayavka_id)
+    if not z:
+        return None
+    st = z.get("статус", "новый")
+    am_from = int(z.get("amount_from") or 0)
+    am_to = int(z.get("amount_to") or 0)
+    ts = (z.get("timestamp") or "")[:16].replace("T", " ")
+    desc = z.get("описание") or "(без описания)"
+    bank = z.get("bank", "")
+    bank_name = {"alfa": "Альфа", "vtb": "ВТБ", "auto": "Авто"}.get(bank, bank)
+    lbl = STATUS_LABELS.get(st, st)
+    txt = (
+        f"📋 Заявка\n\n"
+        f"💰 {format_amount_display(am_from)} → {format_amount_display(am_to)} ₽\n"
+        f"🏦 {bank_name} · {ts}\n"
+        f"📌 {lbl}\n\n"
+        f"📝 {desc}"
+    )
+    cb_w = f"st_{zayavka_id}_w"[:64]
+    cb_o = f"st_{zayavka_id}_o"[:64]
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 В работе", "callback_data": cb_w},
+                {"text": "💰 Оплачено", "callback_data": cb_o},
+            ],
+            [{"text": "⬅️ К списку", "callback_data": "main_zayavki"}],
+        ]
+    }
+    return txt, json.dumps(kb)
+
+
+def tg_request(token: str, method: str, data: dict | None = None, files: dict | None = None) -> dict:
+    url = f"{BASE}{token}/{method}"
+    max_retries = 3
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return _tg_request_once(url, data, files)
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                delay = (attempt + 1) * 3
+                print(f"  ⚠️ Сеть: {e}. Повтор через {delay} сек...")
+                time.sleep(delay)
+            else:
+                raise
+    raise last_err
+
+
+def _tg_request_once(url: str, data: dict | None, files: dict | None) -> dict:
+    if files:
+        boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
+        body = []
+        if data:
+            for k, v in data.items():
+                body.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+        for k, (fname, fbytes) in files.items():
+            body.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fname}\"\r\nContent-Type: application/pdf\r\n\r\n".encode())
+            body.append(fbytes)
+            body.append(b"\r\n")
+        body.append(f"--{boundary}--\r\n".encode())
+        full_body = b"".join(body)
+        req = urllib.request.Request(url, data=full_body, method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    elif data:
+        req = urllib.request.Request(url, data=json.dumps(data).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+    else:
+        req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=35) as r:
+        return json.loads(r.read().decode())
+
+
+def tg_get_file(token: str, file_path: str) -> bytes:
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                return r.read()
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            if attempt < 2:
+                print(f"  ⚠️ Загрузка файла: {e}. Повтор...")
+                time.sleep(3)
+            else:
+                raise
+
+
+def tg_get_file_path(token: str, file_id: str) -> str:
+    r = tg_request(token, "getFile", {"file_id": file_id})
+    if not r.get("ok"):
+        raise RuntimeError(r.get("description", "getFile failed"))
+    return r["result"]["file_path"]
+
+
+def parse_amounts(text: str) -> tuple[int, int] | None:
+    nums = re.findall(r"\d+", text.strip())
+    if len(nums) >= 2:
+        return int(nums[0]), int("".join(nums[1:]))
+    return None
+
+
+def _vtb_full_validate_text(text: str, field_name: str) -> str | None:
+    """Валидация текста. Вернуть None если ок, иначе сообщение об ошибке."""
+    bad = get_unsupported_chars(text)
+    if not bad:
+        return None
+    return format_unsupported_error(bad, field_name)
+
+
+def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Выполнить патч ВТБ и отправить PDF."""
+    inp = state["file_path"]
+    amount_from = state.get("vtb_amount_from") or state.get("vtb_amount")
+    amount_to = state.get("vtb_amount")
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    try:
+        data = bytearray(Path(inp).read_bytes())
+        # Сначала замена суммы (работает с любой суммой в чеке)
+        ok_sum, err_sum, new_data = pdf_patch_amount(data, amount_from, amount_to, bank="vtb")
+        if not ok_sum or new_data is None:
+            send(f"❌ Сумма не найдена.\nПроверь: в чеке должна быть сумма {format_amount_display(amount_from)} ₽. {err_sum or ''}")
+            return
+        data = bytearray(new_data)
+        # Остальные поля (дата, ФИО, телефон, банк) — amount=None, сумму уже поменяли
+        out_bytes = patch_from_values(
+            data,
+            Path(inp),
+            date_str=state.get("vtb_date", "now"),
+            payer=state.get("vtb_payer"),
+            recipient=state.get("vtb_recipient"),
+            phone=state.get("vtb_phone"),
+            bank=state.get("vtb_bank"),
+            amount=None,
+        )
+        out_name = Path(state["file_name"]).stem + f"_{format_amount_display(state['vtb_amount']).replace(' ', '_')}.pdf"
+        try:
+            os.unlink(inp)
+        except OSError:
+            pass
+        del USER_STATE[uid]
+        am_from = state.get("vtb_amount_from") or state.get("vtb_amount")
+        caption = f"✅ Готово: {format_amount_display(am_from)} ₽ → {format_amount_display(state['vtb_amount'])} ₽"
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+        USER_STATE[uid] = {
+            "awaiting": "report_choice",
+            "amount_from": state.get("vtb_amount_from") or state.get("vtb_amount", 0),
+            "amount_to": state["vtb_amount"],
+            "bank": "vtb",
+            "pdf_name": out_name,
+        }
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "📋 Отчёт:",
+            "reply_markup": json.dumps({
+                "inline_keyboard": [
+                    [{"text": "Тест", "callback_data": "report_test"}],
+                    [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                ],
+            }),
+        })
+    except ValueError as e:
+        send(f"❌ Ошибка: {e}")
+    except Exception as e:
+        send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
+
+
+def _vtb_full_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: str, tg_req) -> None:
+    """Отправить следующий шаг. Для payer/recipient/phone/bank — с кнопкой «Оставить текущим»."""
+    KEEP_PROMPTS = {
+        "vtb_payer": ("3️⃣ Плательщик (ФИО):", "vtb_keep_payer"),
+        "vtb_recipient": ("4️⃣ Получатель (ФИО):", "vtb_keep_recipient"),
+        "vtb_phone": ("5️⃣ Телефон получателя:", "vtb_keep_phone"),
+        "vtb_bank": ("6️⃣ Банк получателя:", "vtb_keep_bank"),
+    }
+    state["awaiting"] = aw
+    if aw in KEEP_PROMPTS:
+        p, cb = KEEP_PROMPTS[aw]
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": p,
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "📌 Оставить текущим", "callback_data": cb}]]}),
+        })
+    else:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": prompt})
+
+
+def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
+    """Обработка пошагового ввода для ВТБ «Все поля»."""
+    state = USER_STATE[uid]
+    awaiting = state.get("awaiting", "")
+    inp = state["file_path"]
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    def next_step(aw: str, prompt: str):
+        _vtb_full_send_next(state, aw, prompt, chat_id, token, tg_req)
+
+    if awaiting == "vtb_amount":
+        parsed = parse_amounts(text)
+        if not parsed:
+            send("❌ Введите две суммы: с какой на какую (например: 10 1000 или 50 50000)")
+            return
+        amount_from, amount_to = parsed
+        if amount_from <= 0 or amount_to <= 0:
+            send("❌ Суммы должны быть больше 0.")
+            return
+        state["vtb_amount_from"] = amount_from
+        state["vtb_amount"] = amount_to
+        next_step("vtb_date", "2️⃣ Дата (дд.мм.гггг, чч:мм). Enter или «сейчас» — текущая дата")
+
+    elif awaiting == "vtb_date":
+        text_stripped = text.strip().lower()
+        if not text_stripped or text_stripped in ("сейчас", "enter", ""):
+            state["vtb_date"] = "now"
+        else:
+            state["vtb_date"] = text.strip()
+        next_step("vtb_payer", "3️⃣ Плательщик (ФИО):")
+
+    elif awaiting == "vtb_payer":
+        t = text.strip().lower()
+        if t in ("оставить", "текущим", "оставить текущим", "пропустить", "-", "="):
+            state["vtb_payer"] = None
+            next_step("vtb_recipient", "4️⃣ Получатель (ФИО):")
+            return
+        t = text.strip()
+        err = _vtb_full_validate_text(t, "Плательщик")
+        if err:
+            suggested = suggest_replacement(t)
+            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
+            return
+        state["vtb_payer"] = t
+        next_step("vtb_recipient", "4️⃣ Получатель (ФИО):")
+
+    elif awaiting == "vtb_recipient":
+        t = text.strip().lower()
+        if t in ("оставить", "текущим", "оставить текущим", "пропустить", "-", "="):
+            state["vtb_recipient"] = None
+            next_step("vtb_phone", "5️⃣ Телефон получателя:")
+            return
+        t = text.strip()
+        err = _vtb_full_validate_text(t, "Получатель")
+        if err:
+            suggested = suggest_replacement(t)
+            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
+            return
+        state["vtb_recipient"] = t
+        next_step("vtb_phone", "5️⃣ Телефон получателя:")
+
+    elif awaiting == "vtb_phone":
+        t = text.strip().lower()
+        if t in ("оставить", "текущим", "оставить текущим", "пропустить", "-", "="):
+            state["vtb_phone"] = None
+            next_step("vtb_bank", "6️⃣ Банк получателя:")
+            return
+        t = text.strip()
+        err = _vtb_full_validate_text(t, "Телефон")
+        if err:
+            suggested = suggest_replacement(t)
+            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
+            return
+        state["vtb_phone"] = t
+        next_step("vtb_bank", "6️⃣ Банк получателя:")
+
+    elif awaiting == "vtb_bank":
+        t = text.strip().lower()
+        if t in ("оставить", "текущим", "оставить текущим", "пропустить", "-", "="):
+            state["vtb_bank"] = None
+            send("⏳ Обрабатываю чек...")
+            _run_vtb_full_patch(token, uid, chat_id, state, tg_req)
+            return
+        t = text.strip()
+        err = _vtb_full_validate_text(t, "Банк")
+        if err:
+            suggested = suggest_replacement(t)
+            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
+            return
+        state["vtb_bank"] = t
+        send("⏳ Обрабатываю чек...")
+        _run_vtb_full_patch(token, uid, chat_id, state, tg_req)
+
+
+def run_bot(token: str) -> None:
+    offset = 0
+    print("Бот запущен (без зависимостей)...")
+
+    while True:
+        try:
+            # timeout 10 — короткий long-poll, меньше обрывов на нестабильной сети
+            r = tg_request(token, "getUpdates", {"offset": offset, "timeout": 10})
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode(errors="replace")
+            except Exception:
+                pass
+            err_msg = body or e.reason
+            if e.code == 400:
+                offset = 0
+                print(f"⚠️ getUpdates 400: {err_msg[:120]}")
+                if "webhook" in err_msg.lower():
+                    print("   Подсказка: webhook мог остаться — перезапустите бота.")
+            else:
+                print(f"Ошибка getUpdates HTTP {e.code}: {err_msg[:80]}")
+            time.sleep(5)
+            continue
+        except Exception as e:
+            print(f"Ошибка getUpdates: {e}")
+            time.sleep(5)
+            continue
+
+        if not r.get("ok"):
+            print("Ответ API:", r)
+            time.sleep(5)
+            continue
+
+        for upd in r.get("result", []):
+            offset = upd["update_id"] + 1
+
+            if "message" in upd:
+                msg = upd["message"]
+                uid = msg["from"]["id"]
+                chat_id = msg["chat"]["id"]
+                if _ALLOWED_IDS and uid not in _ALLOWED_IDS:
+                    tg_request(token, "sendMessage", {"chat_id": chat_id, "text": ACCESS_DENIED_MSG})
+                    continue
+                text = msg.get("text", "").strip()
+
+                if text == "/start":
+                    if uid in USER_STATE:
+                        if "file_path" in USER_STATE[uid]:
+                            try:
+                                os.unlink(USER_STATE[uid]["file_path"])
+                            except OSError:
+                                pass
+                        del USER_STATE[uid]
+                    tg_request(token, "sendMessage", {
+                        "chat_id": msg["chat"]["id"],
+                        "text": (
+                            "👋 Главная\n\n"
+                            "📄 Отправьте PDF-чек — чтобы изменить сумму.\n"
+                            "📋 Заявки — просмотр и смена статусов."
+                        ),
+                        "reply_markup": json.dumps({
+                            "inline_keyboard": [
+                                [{"text": "📄 Новый чек", "callback_data": "main_new"}],
+                                [{"text": "📋 Заявки", "callback_data": "main_zayavki"}],
+                            ],
+                        }),
+                    })
+                    continue
+
+                if text == "/main":
+                    txt, km = build_zayavki_list()
+                    kb = json.loads(km)
+                    kb["inline_keyboard"].append([{"text": "🔄 Обновить", "callback_data": "main_zayavki"}, {"text": "⬅️ Назад", "callback_data": "main_back"}])
+                    tg_request(token, "sendMessage", {"chat_id": chat_id, "text": txt, "reply_markup": json.dumps(kb)})
+                    continue
+
+                if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "report_choice":
+                    tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "📋 Нажмите кнопку «Тест» или «Заявка» выше."})
+                    continue
+                if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "zayavka_description":
+                    state = USER_STATE[uid]
+                    description = text or "(без описания)"
+                    username = msg.get("from", {}).get("username", "") or msg.get("from", {}).get("first_name", "")
+                    fp = save_zayavka(
+                        uid, username,
+                        state["amount_from"], state["amount_to"], state["bank"], state["pdf_name"],
+                        description,
+                    )
+                    del USER_STATE[uid]
+                    if fp:
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "✅ Заявка сохранена."})
+                    else:
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "⚠️ Ошибка сохранения. Заявка не записана."})
+                    continue
+
+                if "document" in msg:
+                    doc = msg["document"]
+                    fname = doc.get("file_name", "")
+                    if not fname.lower().endswith(".pdf"):
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Отправьте PDF-файл чека."})
+                        continue
+                    tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Скачиваю чек..."})
+                    try:
+                        fp = tg_get_file_path(token, doc["file_id"])
+                        pdf_data = tg_get_file(token, fp)
+                    except Exception as e:
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"❌ Ошибка загрузки: {e}"})
+                        continue
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                        tf.write(pdf_data)
+                        path = tf.name
+                    old = USER_STATE.get(uid, {})
+                    if "file_path" in old and old["file_path"] != path:
+                        try:
+                            os.unlink(old["file_path"])
+                        except OSError:
+                            pass
+                    USER_STATE[uid] = {"file_path": path, "file_name": fname}
+                    tg_request(token, "sendMessage", {
+                        "chat_id": msg["chat"]["id"],
+                        "text": "📎 Чек получен. Выберите банк:",
+                        "reply_markup": json.dumps({
+                            "inline_keyboard": [
+                                [
+                                    {"text": "🏦 Альфа-Банк", "callback_data": "bank_alfa"},
+                                    {"text": "🏛 ВТБ", "callback_data": "bank_vtb"},
+                                ],
+                                [{"text": "🔍 Авто", "callback_data": "bank_auto"}],
+                                [{"text": "❌ Отмена", "callback_data": "cancel"}],
+                            ],
+                        }),
+                    })
+                    continue
+
+                # ВТБ «Все поля»: пошаговый ввод
+                if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("vtb_"):
+                    _handle_vtb_full_input(token, uid, chat_id, text, msg, tg_request)
+                    continue
+
+                if uid in USER_STATE and "bank" in USER_STATE[uid]:
+                    parsed = parse_amounts(text)
+                    if not parsed:
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Неверный формат. Введите две суммы, например: 10 5000"})
+                        continue
+                    amount_from, amount_to = parsed
+                    if amount_from <= 0 or amount_to <= 0:
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Суммы должны быть больше 0."})
+                        continue
+                    chat_id = msg["chat"]["id"]
+                    tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+                    try:
+                        print(f"  Патч {amount_from}→{amount_to} ({bank})...", end=" ", flush=True)
+                        state = USER_STATE[uid]
+                        inp = state["file_path"]
+                        bank = state["bank"]
+                        out_name = Path(state["file_name"]).stem + f"_{format_amount_display(amount_to).replace(' ', '_')}.pdf"
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                            out_path = tf.name
+                        ok, err = patch_pdf_file(inp, out_path, amount_from, amount_to, bank=bank)
+                        try:
+                            os.unlink(inp)
+                        except OSError:
+                            pass
+                        del USER_STATE[uid]
+                        if not ok:
+                            print("не найден")
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
+                            try:
+                                os.unlink(out_path)
+                            except OSError:
+                                pass
+                            continue
+                        with open(out_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        try:
+                            os.unlink(out_path)
+                        except OSError:
+                            pass
+                        print("отправляю...", end=" ", flush=True)
+                        caption = f"✅ Готово: {format_amount_display(amount_from)} ₽ → {format_amount_display(amount_to)} ₽"
+                        tg_request(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
+                        print("готово")
+                        USER_STATE[uid] = {
+                            "awaiting": "report_choice",
+                            "amount_from": amount_from,
+                            "amount_to": amount_to,
+                            "bank": bank,
+                            "pdf_name": out_name,
+                        }
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": "📋 Отчёт:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [{"text": "Тест", "callback_data": "report_test"}],
+                                    [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                                ],
+                            }),
+                        })
+                    except Exception as e:
+                        print("ошибка:", e)
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново."})
+                    continue
+
+                if uid in USER_STATE:
+                    tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Сначала выберите банк (кнопками выше)."})
+                else:
+                    tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Сначала отправьте чек и выберите банк."})
+
+            elif "callback_query" in upd:
+                q = upd["callback_query"]
+                uid = q["from"]["id"]
+                tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"]})
+                if _ALLOWED_IDS and uid not in _ALLOWED_IDS:
+                    tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
+                    continue
+                if q["data"] == "main_new":
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": (
+                            "📄 Новый чек\n\n"
+                            "1. Отправьте PDF-чек\n"
+                            "2. Выберите банк (Альфа-Банк или ВТБ)\n"
+                            "3. Введите сумму: с какой на какую (например: 10 5000)"
+                        ),
+                        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
+                    })
+                    continue
+                if q["data"] == "main_back":
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": (
+                            "👋 Главная\n\n"
+                            "📄 Отправьте PDF-чек — чтобы изменить сумму.\n"
+                            "📋 Заявки — просмотр и смена статусов."
+                        ),
+                        "reply_markup": json.dumps({
+                            "inline_keyboard": [
+                                [{"text": "📄 Новый чек", "callback_data": "main_new"}],
+                                [{"text": "📋 Заявки", "callback_data": "main_zayavki"}],
+                            ],
+                        }),
+                    })
+                    continue
+                if q["data"] == "main_zayavki":
+                    try:
+                        txt, km = build_zayavki_list()
+                        kb = json.loads(km)
+                        kb["inline_keyboard"].append([{"text": "🔄 Обновить", "callback_data": "main_zayavki"}, {"text": "⬅️ Назад", "callback_data": "main_back"}])
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": txt,
+                            "reply_markup": json.dumps(kb),
+                        })
+                    except Exception as e:
+                        print(f"  ⚠️ main_zayavki: {e}")
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "⚠️ Ошибка обновления. Попробуйте ещё раз.",
+                        })
+                    continue
+                if q["data"].startswith("v_"):
+                    try:
+                        zid = q["data"][2:] if len(q["data"]) > 2 else ""
+                        if zid and (detail := build_zayavka_detail(zid)):
+                            txt, km = detail
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": txt,
+                                "reply_markup": km,
+                            })
+                        else:
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "⚠️ Заявка не найдена"})
+                    except Exception as e:
+                        print(f"  ⚠️ v_ callback: {e}")
+                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "⚠️ Ошибка"})
+                    continue
+                if q["data"].startswith("st_"):
+                    try:
+                        parts = q["data"].split("_")
+                        if len(parts) >= 3:
+                            zid = "_".join(parts[1:-1])
+                            short = parts[-1]
+                            new_st = STATUS_SHORT.get(short)
+                            if new_st and update_zayavka_status(zid, new_st):
+                                if detail := build_zayavka_detail(zid):
+                                    txt, km = detail
+                                    tg_request(token, "editMessageText", {
+                                        "chat_id": q["message"]["chat"]["id"],
+                                        "message_id": q["message"]["message_id"],
+                                        "text": txt,
+                                        "reply_markup": km,
+                                    })
+                                else:
+                                    txt, km = build_zayavki_list()
+                                    kb = json.loads(km)
+                                    kb["inline_keyboard"].append([{"text": "⬅️ Назад", "callback_data": "main_back"}])
+                                    tg_request(token, "editMessageText", {
+                                        "chat_id": q["message"]["chat"]["id"],
+                                        "message_id": q["message"]["message_id"],
+                                        "text": txt,
+                                        "reply_markup": json.dumps(kb),
+                                    })
+                            else:
+                                tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "⚠️ Не удалось"})
+                    except Exception as e:
+                        print(f"  ⚠️ st_ callback: {e}")
+                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "⚠️ Ошибка"})
+                    continue
+                if q["data"] == "cancel":
+                    if uid in USER_STATE and "file_path" in USER_STATE[uid]:
+                        try:
+                            os.unlink(USER_STATE[uid]["file_path"])
+                        except OSError:
+                            pass
+                        del USER_STATE[uid]
+                    main_text = (
+                        "👋 Главное меню.\n\n"
+                        "📋 Отправьте PDF-чек или /start для начала."
+                    )
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": main_text,
+                        "reply_markup": json.dumps({"inline_keyboard": []}),
+                    })
+                    continue
+                if q["data"] == "report_test":
+                    if uid in USER_STATE:
+                        del USER_STATE[uid]
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "📋 Отчёт: Тест (ничего не сохранено)",
+                        "reply_markup": json.dumps({"inline_keyboard": []}),
+                    })
+                    continue
+                if q["data"] == "report_zayavka":
+                    if uid not in USER_STATE:
+                        tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Сессия истекла. Отправьте чек заново."})
+                        continue
+                    USER_STATE[uid]["awaiting"] = "zayavka_description"
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "📝 Опишите заявку:\nссылка на платеж / казино / обменник",
+                        "reply_markup": json.dumps({"inline_keyboard": []}),
+                    })
+                    continue
+                if q["data"] == "vtb_mode_amount":
+                    if uid not in USER_STATE:
+                        tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                        continue
+                    USER_STATE[uid]["vtb_mode"] = "amount"
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "💰 Введите сумму: с какой на какую менять\nНапример: 10 5000 или 50 10000",
+                    })
+                    continue
+                if q["data"] == "vtb_mode_full":
+                    if uid not in USER_STATE:
+                        tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                        continue
+                    USER_STATE[uid]["vtb_mode"] = "full"
+                    USER_STATE[uid]["awaiting"] = "vtb_amount"
+                    txt = (
+                        "📋 Режим «Все поля»\n\n"
+                        f"{VTB_UNSUPPORTED_NOTICE}\n\n"
+                        "1️⃣ Сумма: с какой на какую менять (например: 10 1000 или 50 50000)"
+                    )
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": txt,
+                    })
+                    continue
+                if q["data"] in ("vtb_keep_payer", "vtb_keep_recipient", "vtb_keep_phone", "vtb_keep_bank"):
+                    if uid not in USER_STATE:
+                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Сессия истекла"})
+                        continue
+                    state = USER_STATE[uid]
+                    cid, mid = q["message"]["chat"]["id"], q["message"]["message_id"]
+                    keep_map = {
+                        "vtb_keep_payer": ("vtb_payer", "vtb_recipient", "4️⃣ Получатель (ФИО):"),
+                        "vtb_keep_recipient": ("vtb_recipient", "vtb_phone", "5️⃣ Телефон получателя:"),
+                        "vtb_keep_phone": ("vtb_phone", "vtb_bank", "6️⃣ Банк получателя:"),
+                        "vtb_keep_bank": ("vtb_bank", None, ""),
+                    }
+                    field_key, next_aw, _ = keep_map[q["data"]]
+                    state[field_key] = None
+                    tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "✅ Оставлено текущим"})
+                    if next_aw:
+                        _vtb_full_send_next(state, next_aw, "", cid, token, tg_request)
+                    else:
+                        tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
+                        _run_vtb_full_patch(token, uid, cid, state, tg_request)
+                    continue
+                if uid not in USER_STATE:
+                    tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                    continue
+                bank_map = {"bank_alfa": "alfa", "bank_vtb": "vtb", "bank_auto": "auto"}
+                bank = bank_map.get(q["data"], "auto")
+                bank_name = {"alfa": "Альфа-Банк", "vtb": "ВТБ", "auto": "Авто"}[bank]
+                USER_STATE[uid]["bank"] = bank
+                if bank == "vtb":
+                    scan_tip = ""
+                    try:
+                        bad = scan_vtb_unsupported_chars(USER_STATE[uid]["file_path"])
+                        if bad:
+                            tips = [f"«{c}» → «{FALLBACK_TIPS.get(c, '?')}»" if c in FALLBACK_TIPS else f"«{c}»" for c in sorted(bad)]
+                            scan_tip = f"\n\n⚠️ В чеке найдены буквы для замены: {', '.join(tips)}"
+                    except Exception:
+                        pass
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": f"✅ Банк: {bank_name}{scan_tip}\n\nВыберите режим:",
+                        "reply_markup": json.dumps({
+                            "inline_keyboard": [
+                                [{"text": "💰 Только сумма", "callback_data": "vtb_mode_amount"}],
+                                [{"text": "📋 Все поля (дата, ФИО, телефон, банк)", "callback_data": "vtb_mode_full"}],
+                                [{"text": "⬅️ Назад", "callback_data": "cancel"}],
+                            ],
+                        }),
+                    })
+                else:
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": f"✅ Банк: {bank_name}\n\n💰 Введите сумму: с какой на какую менять\nНапример: 10 5000 или 50 10000",
+                    })
+                continue
+
+
+def main() -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        print("Задайте TELEGRAM_BOT_TOKEN (в .env или export)")
+        return
+    if _proxy_url:
+        _masked = _proxy_url.split("@")[-1] if "@" in _proxy_url else _proxy_url[:50]
+        print("🔒 Прокси:", _masked)
+    # Проверка токена и сброс webhook (иначе getUpdates даёт 400)
+    try:
+        r = tg_request(token, "getMe")
+        if r.get("ok"):
+            print("✅ Бот:", r["result"].get("username", "?"))
+            if _ALLOWED_IDS:
+                print("🔐 Доступ: только", len(_ALLOWED_IDS), "пользовател(ей)")
+            dw = tg_request(token, "deleteWebhook", {"drop_pending_updates": True})
+            if not dw.get("ok"):
+                print("⚠️ deleteWebhook:", dw.get("description", dw))
+            run_bot(token)
+        else:
+            print("❌ Токен неверный:", r.get("description"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("❌ Токен неверный (401). Сделай в @BotFather:")
+            print("   /mybots → выбери бота → API Token → Revoke current token")
+            print("   Обнови .env с новым токеном")
+        else:
+            print("❌ Ошибка HTTP:", e.code, e.reason)
+
+
+if __name__ == "__main__":
+    main()
