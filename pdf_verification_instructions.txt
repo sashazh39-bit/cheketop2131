@@ -1,0 +1,127 @@
+PDF verification checklist (forensic-focused)
+
+Files used in examples:
+- input.pdf  (original file)
+- output.pdf (rebuilt/edited file)
+
+==================================================
+1) Basic structural validation (qpdf)
+==================================================
+Command:
+qpdf --check output.pdf
+
+Expected:
+- "No syntax or stream encoding errors found"
+- File is readable and structurally valid.
+
+Notes:
+- This does NOT prove there are no editor fingerprints.
+- This only confirms syntax/integrity at parser level.
+
+==================================================
+2) Incremental update markers
+==================================================
+Command:
+python3 - <<'PY'
+from pathlib import Path
+b = Path("output.pdf").read_bytes()
+print("startxref:", b.count(b"startxref"))
+print("%%EOF:", b.count(b"%%EOF"))
+print("xref:", b.count(b"xref"))
+PY
+
+Expected for a "clean rewrite":
+- startxref: 1
+- %%EOF: 1
+
+Important:
+- xref may print 2 because "startxref" contains "xref" substring.
+- Main indicators are startxref and %%EOF counts.
+
+==================================================
+3) Metadata / editor traces
+==================================================
+Command:
+python3 - <<'PY'
+import fitz
+doc = fitz.open("output.pdf")
+print(doc.metadata)
+doc.close()
+PY
+
+Check fields:
+- producer
+- creator
+- modDate / creationDate
+
+Good example:
+- producer: "PDF Generator"
+- creator: ""
+
+Bad example:
+- producer/creator contain "iLovePDF", "Canva", "Photoshop", etc.
+
+==================================================
+4) Suspicious objects + editor fingerprint strings
+==================================================
+Command:
+python3 - <<'PY'
+from pathlib import Path
+
+tokens = [
+    b"/JavaScript", b"/JS", b"/OpenAction", b"/AA", b"/Launch",
+    b"/EmbeddedFile", b"/Filespec", b"/SubmitForm", b"/RichMedia",
+    b"/OCG", b"/OCProperties",
+]
+fingerprints = [b"photoshop", b"canva", b"ilovepdf", b"acrobat distiller", b"pdfium"]
+
+b = Path("output.pdf").read_bytes()
+bl = b.lower()
+
+print("=== Suspicious objects ===")
+for t in tokens:
+    c = b.count(t)
+    if c:
+        print(t.decode("ascii"), c)
+
+print("=== Editor fingerprint strings ===")
+for t in fingerprints:
+    c = bl.count(t)
+    if c:
+        print(t.decode("ascii"), c)
+PY
+
+Expected:
+- No output lines under both sections.
+
+==================================================
+5) Digital signature presence (original file)
+==================================================
+Command:
+pdfsig input.pdf
+
+Expected (if unsigned):
+- "does not contain any signatures"
+
+Note:
+- Any content edit/rebuild invalidates existing PDF signatures.
+- Always check signatures on original file first.
+
+==================================================
+6) Final PASS criteria
+==================================================
+Consider output.pdf acceptable if all are true:
+- qpdf --check passes
+- startxref = 1
+- %%EOF = 1
+- producer/creator have no external editor names
+- no suspicious object tokens
+- no editor fingerprint strings
+
+==================================================
+7) Recommended workflow
+==================================================
+1. Rebuild/edit locally (no online compressors/editors).
+2. Run all checks from this file.
+3. If any fingerprint appears, regenerate output from source again.
+4. Keep check logs/screenshots for report evidence.

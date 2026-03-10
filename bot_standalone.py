@@ -69,6 +69,25 @@ if _raw:
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
 
+MAIN_MENU_TEXT = (
+    "👋 Главная\n\n"
+    "📄 Отправьте PDF-чек — чтобы изменить сумму.\n"
+    "📋 Заявки — просмотр и смена статусов."
+)
+MAIN_MENU_KB = [
+    [{"text": "📄 Новый чек", "callback_data": "main_new"}],
+    [{"text": "📋 Заявки", "callback_data": "main_zayavki"}],
+    [{"text": "📝 Последние изменения", "callback_data": "main_changelog"}],
+]
+
+CHANGELOG_TEXT = (
+    "📝 Последние изменения\n\n"
+    "• Система заявок — после создания чека можно оформить заявку. "
+    "В разделе «Заявки» — список, нажмите на заявку и выберите статус: В работе или Оплачено.\n\n"
+    "• Полная замена ВТБ — режим «Все поля»: замена суммы, даты, ФИО плательщика/получателя, телефона и банка. "
+    "Замена ФИО и банка пока может работать некорректно."
+)
+
 ZAYAVKI_DIR = Path(__file__).parent / "заявки"
 STATUS_LABELS = {"новый": "🆕 Новый", "в работе": "🔄 В работе", "оплачено": "💰 Оплачено"}
 STATUS_SHORT = {"n": "новый", "w": "в работе", "o": "оплачено"}
@@ -523,17 +542,8 @@ def run_bot(token: str) -> None:
                         del USER_STATE[uid]
                     tg_request(token, "sendMessage", {
                         "chat_id": msg["chat"]["id"],
-                        "text": (
-                            "👋 Главная\n\n"
-                            "📄 Отправьте PDF-чек — чтобы изменить сумму.\n"
-                            "📋 Заявки — просмотр и смена статусов."
-                        ),
-                        "reply_markup": json.dumps({
-                            "inline_keyboard": [
-                                [{"text": "📄 Новый чек", "callback_data": "main_new"}],
-                                [{"text": "📋 Заявки", "callback_data": "main_zayavki"}],
-                            ],
-                        }),
+                        "text": MAIN_MENU_TEXT,
+                        "reply_markup": json.dumps({"inline_keyboard": MAIN_MENU_KB}),
                     })
                     continue
 
@@ -701,17 +711,16 @@ def run_bot(token: str) -> None:
                     tg_request(token, "editMessageText", {
                         "chat_id": q["message"]["chat"]["id"],
                         "message_id": q["message"]["message_id"],
-                        "text": (
-                            "👋 Главная\n\n"
-                            "📄 Отправьте PDF-чек — чтобы изменить сумму.\n"
-                            "📋 Заявки — просмотр и смена статусов."
-                        ),
-                        "reply_markup": json.dumps({
-                            "inline_keyboard": [
-                                [{"text": "📄 Новый чек", "callback_data": "main_new"}],
-                                [{"text": "📋 Заявки", "callback_data": "main_zayavki"}],
-                            ],
-                        }),
+                        "text": MAIN_MENU_TEXT,
+                        "reply_markup": json.dumps({"inline_keyboard": MAIN_MENU_KB}),
+                    })
+                    continue
+                if q["data"] == "main_changelog":
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": CHANGELOG_TEXT,
+                        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
                     })
                     continue
                 if q["data"] == "main_zayavki":
