@@ -137,6 +137,21 @@ def suggest_replacement(text: str) -> str | None:
     return "".join(result)
 
 
+# Latin A,B для ID операции (совпадают с кириллическими А, Б по начертанию)
+_CID_OPID = {"A": "021C", "B": "021D"}
+
+
+def operation_id_to_cids(text: str) -> list[str] | None:
+    """ID операции (B606...) → CID. Поддерживает 0-9, A, B."""
+    result = []
+    for c in text.upper():
+        cid = _CID_DIGIT.get(c) or _CID_OPID.get(c)
+        if cid is None:
+            return None
+        result.append(cid)
+    return result
+
+
 def text_to_cids(text: str) -> list[str] | None:
     """Текст → список CID hex. None если символ не найден."""
     result = []

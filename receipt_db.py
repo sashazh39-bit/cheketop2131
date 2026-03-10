@@ -56,6 +56,33 @@ def get_receipt_amount(pdf_path: str | Path) -> int | None:
         return None
 
 
+def get_operation_id_from_pdf(pdf_path: str | Path | bytes) -> str | None:
+    """Извлечь ID операции (B606.../A606...) из чека. Для отображения при копировании."""
+    import re
+    text = ""
+    if isinstance(pdf_path, bytes):
+        if fitz is None:
+            return None
+        try:
+            doc = fitz.open(stream=pdf_path, filetype="pdf")
+            text = "".join(page.get_text() for page in doc)
+            doc.close()
+        except Exception:
+            return None
+    else:
+        path = Path(pdf_path)
+        if not path.exists() or fitz is None:
+            return None
+        try:
+            doc = fitz.open(path)
+            text = "".join(page.get_text() for page in doc)
+            doc.close()
+        except Exception:
+            return None
+    m = re.search(r"[AB]606[\dA-Fa-f]{18,30}", text)
+    return m.group(0) if m else None
+
+
 def get_receipt_chars(pdf_path: str | Path) -> set[str]:
     """Извлечь множество символов, которые есть в чеке (подмножество шрифта).
     Возвращает пустой set если PyMuPDF недоступен или ошибка."""
@@ -87,14 +114,22 @@ def index_receipt(pdf_path: str | Path, bank: str) -> set[str]:
     return get_receipt_chars(pdf_path)
 
 
+VTB_SUBTYPES = {"vtb_sbp": "СБП", "vtb_vtb_vtb": "ВТБ на ВТБ"}
+
+
 def load_index() -> dict:
     """Загрузить индекс из JSON."""
+    default = {"vtb_sbp": {}, "vtb_vtb_vtb": {}, "vtb": {}, "alfa": {}}
     if not INDEX_PATH.exists():
-        return {"vtb": {}, "alfa": {}}
+        return default
     try:
-        return json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+        data = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+        for k in default:
+            if k not in data:
+                data[k] = {}
+        return data
     except (json.JSONDecodeError, OSError):
-        return {"vtb": {}, "alfa": {}}
+        return default
 
 
 def save_index(index: dict) -> None:
@@ -104,21 +139,33 @@ def save_index(index: dict) -> None:
 
 
 def build_index(base_folder: str | Path | None = None) -> dict:
-    """Построить индекс: обойти vtb/ и alfa/ в base_folder."""
+    """Построить индекс: vtb/СБП, vtb/ВТБ на ВТБ, alfa."""
     base = Path(base_folder or RECEIPT_BASE)
-    index = {"vtb": {}, "alfa": {}}
+    index = {"vtb_sbp": {}, "vtb_vtb_vtb": {}, "vtb": {}, "alfa": {}}
     if not base.exists():
         return index
-    for bank in ("vtb", "alfa"):
-        folder = base / bank
+    for subtype, subfolder in [("vtb_sbp", "СБП"), ("vtb_vtb_vtb", "ВТБ на ВТБ")]:
+        folder = base / "vtb" / subfolder
         if not folder.is_dir():
             continue
-        for path in folder.glob("*.pdf"):
+        for path in folder.glob("**/*.pdf"):
             chars = get_receipt_chars(path)
             if chars:
                 key = str(path.relative_to(base))
                 amount = get_receipt_amount(path)
-                index[bank][key] = {"chars": sorted(chars), "amount": amount}
+                index[subtype][key] = {"chars": sorted(chars), "amount": amount}
+    for path in (base / "vtb").glob("*.pdf"):
+        chars = get_receipt_chars(path)
+        if chars:
+            key = str(path.relative_to(base))
+            index["vtb"][key] = {"chars": sorted(chars), "amount": get_receipt_amount(path)}
+    folder = base / "alfa"
+    if folder.is_dir():
+        for path in folder.glob("*.pdf"):
+            chars = get_receipt_chars(path)
+            if chars:
+                key = str(path.relative_to(base))
+                index["alfa"][key] = {"chars": sorted(chars), "amount": get_receipt_amount(path)}
     return index
 
 
@@ -192,8 +239,8 @@ def find_donor(required_chars: set[str], bank: str, index: dict | None = None) -
     return None, None
 
 
-def add_receipt_to_index(pdf_path: str | Path, bank: str) -> bool:
-    """Добавить чек в индекс. Возвращает True если успешно."""
+def add_receipt_to_index(pdf_path: str | Path, bank: str, subtype: str | None = None) -> bool:
+    """Добавить чек в индекс. bank: vtb_sbp | vtb_vtb_vtb | vtb | alfa."""
     path = Path(pdf_path)
     if not path.exists():
         return False
@@ -201,13 +248,20 @@ def add_receipt_to_index(pdf_path: str | Path, bank: str) -> bool:
     if not chars:
         return False
     index = load_index()
-    target_dir = RECEIPT_BASE / bank
+    if bank in ("vtb_sbp", "vtb_vtb_vtb"):
+        subfolder = VTB_SUBTYPES[bank]
+        target_dir = RECEIPT_BASE / "vtb" / subfolder
+    else:
+        target_dir = RECEIPT_BASE / bank
     target_dir.mkdir(parents=True, exist_ok=True)
     dest = target_dir / path.name
     if path.resolve() != dest.resolve():
         import shutil
         shutil.copy2(path, dest)
-    key = f"{bank}/{path.name}"
+    if bank in ("vtb_sbp", "vtb_vtb_vtb"):
+        key = f"vtb/{VTB_SUBTYPES[bank]}/{path.name}"
+    else:
+        key = f"{bank}/{path.name}"
     amount = get_receipt_amount(dest if dest.exists() else path)
     index.setdefault(bank, {})[key] = {"chars": sorted(chars), "amount": amount}
     save_index(index)
@@ -231,12 +285,11 @@ if __name__ == "__main__":
     if cmd == "build":
         base = sys.argv[2] if len(sys.argv) > 2 else RECEIPT_BASE
         idx = build_and_save(base)
-        total = sum(len(v) for v in idx.values())
-        print(f"[OK] Индекс: {len(idx.get('vtb', {}))} ВТБ, {len(idx.get('alfa', {}))} Альфа")
+        print(f"[OK] Индекс: СБП {len(idx.get('vtb_sbp', {}))}, ВТБ на ВТБ {len(idx.get('vtb_vtb_vtb', {}))}, Альфа {len(idx.get('alfa', {}))}")
     elif cmd == "add" and len(sys.argv) >= 4:
         path, bank = sys.argv[2], sys.argv[3].lower()
-        if bank not in ("vtb", "alfa"):
-            print("[ERROR] bank должен быть vtb или alfa")
+        if bank not in ("vtb_sbp", "vtb_vtb_vtb", "vtb", "alfa"):
+            print("[ERROR] bank: vtb_sbp | vtb_vtb_vtb | vtb | alfa")
             sys.exit(1)
         if add_receipt_to_index(path, bank):
             print(f"[OK] Добавлен {path} в {bank}")

@@ -106,6 +106,8 @@ def get_vtb_per_field_params(pdf_path: str | Path) -> dict:
         "pts_payer": 4.66,
         "pts_recipient": 4.66,
         "pts_amount": FALLBACK_PTS_AMOUNT,
+        "pts_phone": 4.57,
+        "pts_bank": 5.09,
     }
     if fitz is None:
         return result
@@ -159,6 +161,12 @@ def get_vtb_per_field_params(pdf_path: str | Path) -> dict:
             result["pts_recipient"] = pts
         if pts := find_pts(["1 000", "000 ₽", "₽"]):
             result["pts_amount"] = pts
+        if pts := find_pts(["+7 (906)", "236-86", "236‑86"]):
+            result["pts_phone"] = pts
+        if pts := find_pts(["Сбербанк", "Альфа", "ВТБ"]):
+            result["pts_bank"] = pts
+        if pts := find_pts(["B606", "A606"]):
+            result["pts_opid"] = pts
     except Exception:
         pass
     return result

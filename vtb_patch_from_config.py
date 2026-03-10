@@ -20,7 +20,7 @@ from vtb_test_generator import (
     tm_x_touch_wall,
 )
 from vtb_sber_reference import get_vtb_per_field_params
-from vtb_cmap import text_to_cids, format_amount
+from vtb_cmap import text_to_cids, format_amount, operation_id_to_cids
 
 
 def build_amount_tj(amount: int) -> bytes:
@@ -51,13 +51,14 @@ def patch_from_values(
     phone: str | None = None,
     bank: str | None = None,
     amount: int | None = None,
+    operation_id: str | None = None,
     keep_metadata: bool = False,
 ) -> bytes:
     """Патч с кастомными значениями. Использует OLD из 09-03-26_03-47."""
     params = get_vtb_per_field_params(pdf_path)
     wall = params["wall"]
     pts = dict(PTS_CALIBRATION)
-    for k, pk in [("date", "pts_date"), ("payer", "pts_payer"), ("recipient", "pts_recipient"), ("amount", "pts_amount")]:
+    for k, pk in [("date", "pts_date"), ("payer", "pts_payer"), ("recipient", "pts_recipient"), ("amount", "pts_amount"), ("phone", "pts_phone"), ("bank", "pts_bank"), ("opid", "pts_opid")]:
         if params.get(pk) is not None:
             pts[k] = params[pk]
 
@@ -79,6 +80,10 @@ def patch_from_values(
     new_phone_tj = build_text_tj(phone, wrap=True) if phone else None
     new_bank_tj = build_text_tj(bank, wrap=True) if bank else None
     new_amount_tj = build_amount_tj(amount) if amount else None
+    new_opid_tj = None
+    if operation_id and operation_id_to_cids(operation_id.replace(" ", "").replace("\n", "")):
+        cids = operation_id_to_cids(operation_id.replace(" ", "").replace("\n", ""))
+        new_opid_tj = b"[" + build_tj(cids, kern="-16.66667") + b"]"
 
     # OLD patterns (из 09-03-26_03-47)
     OLD_DATE = (
@@ -132,38 +137,58 @@ def patch_from_values(
 
         new_dec = dec
 
-        if new_date_tj and OLD_DATE in new_dec:
-            new_dec = new_dec.replace(OLD_DATE, new_date_tj)
-            n = n_glyphs(new_date_tj)
-            tm_date_m = re.search(rb"(1 0 0 1 )([\d.]+)( 275\.25 Tm)", new_dec)
-            if tm_date_m and float(tm_date_m.group(2)) > 100:
-                # Сохраняем оригинальную X, если кол-во глифов не изменилось (дата/время того же формата)
-                if n != n_glyphs(OLD_DATE):
-                    new_x = tm_x_touch_wall(wall, n, pts["date"])
-                    new_dec = new_dec.replace(tm_date_m.group(0), tm_date_m.group(1) + f"{new_x:.5f}".encode() + tm_date_m.group(3))
+        def replace_field_by_y(dec: bytes, y_vals: list[str], new_tj: bytes, pts_key: str) -> bytes:
+            """Заменить поле по y-координате Tm. y_vals — варианты y (напр. 275.25, 275.2)."""
+            for y_val in y_vals:
+                pat = rb"(1 0 0 1 )([\d.]+)( " + y_val.encode() + rb" Tm)\s*\[([^\]]*)\](\s*TJ)"
+                mt = re.search(pat, dec)
+                if mt:
+                    new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
+                    n = n_glyphs(b"[" + new_content + b"]")
+                    new_x = tm_x_touch_wall(wall, n, pts.get(pts_key, PTS_CALIBRATION.get(pts_key, 4.5)))
+                    repl = mt.group(1) + f"{new_x:.5f}".encode() + mt.group(3) + b" [" + new_content + b"]" + mt.group(5)
+                    return dec.replace(mt.group(0), repl)
+            return dec
 
-        if new_payer_tj and OLD_PAYER in new_dec:
-            new_dec = new_dec.replace(OLD_PAYER, new_payer_tj)
-            n = n_glyphs(new_payer_tj)
-            new_x = tm_x_touch_wall(wall, n, pts["payer"])
-            tm_payer_m = re.search(rb"(1 0 0 1 )([\d.]+)( 227\.25 Tm)", new_dec)
-            if tm_payer_m and float(tm_payer_m.group(2)) > 50:
-                new_dec = new_dec.replace(tm_payer_m.group(0), tm_payer_m.group(1) + f"{new_x:.5f}".encode() + tm_payer_m.group(3))
+        if new_date_tj:
+            out = replace_field_by_y(new_dec, ["275.25", "275.2"], new_date_tj, "date")
+            if out == new_dec and OLD_DATE in new_dec:
+                new_dec = new_dec.replace(OLD_DATE, new_date_tj)
+                n = n_glyphs(new_date_tj)
+                if n != n_glyphs(OLD_DATE):
+                    tm_date_m = re.search(rb"(1 0 0 1 )([\d.]+)( 275\.25 Tm)", new_dec)
+                    if tm_date_m and float(tm_date_m.group(2)) > 100:
+                        new_x = tm_x_touch_wall(wall, n, pts["date"])
+                        new_dec = new_dec.replace(tm_date_m.group(0), tm_date_m.group(1) + f"{new_x:.5f}".encode() + tm_date_m.group(3))
+            else:
+                new_dec = out
+
+        if new_payer_tj:
+            if OLD_PAYER in new_dec:
+                new_dec = new_dec.replace(OLD_PAYER, new_payer_tj)
+                n = n_glyphs(new_payer_tj)
+                new_x = tm_x_touch_wall(wall, n, pts["payer"])
+                tm_payer_m = re.search(rb"(1 0 0 1 )([\d.]+)( 227\.25 Tm)", new_dec)
+                if tm_payer_m and float(tm_payer_m.group(2)) > 50:
+                    new_dec = new_dec.replace(tm_payer_m.group(0), tm_payer_m.group(1) + f"{new_x:.5f}".encode() + tm_payer_m.group(3))
 
         if new_recipient_tj:
-            if OLD_RECIPIENT_16 in new_dec:
+            out = replace_field_by_y(new_dec, ["203.25", "203.2"], new_recipient_tj, "recipient")
+            if out != new_dec:
+                new_dec = out
+            elif OLD_RECIPIENT_16 in new_dec:
                 new_dec = new_dec.replace(OLD_RECIPIENT_16, new_recipient_tj)
                 n = n_glyphs(new_recipient_tj)
                 new_x = tm_x_touch_wall(wall, n, pts["recipient"])
                 tm_m = re.search(rb"(1 0 0 1 )([\d.]+)( 203\.25 Tm)", new_dec)
                 if tm_m and float(tm_m.group(2)) > 100:
                     new_dec = new_dec.replace(tm_m.group(0), tm_m.group(1) + f"{new_x:.5f}".encode() + tm_m.group(3))
-            if new_recipient_21 and OLD_RECIPIENT_21 in new_dec:
-                new_dec = new_dec.replace(OLD_RECIPIENT_21, new_recipient_21)
-                pts_h = pts["recipient"] * (10.5 / 9)
-                shift = (17 - n_glyphs(new_recipient_21)) * pts_h / 2
+            if new_recipient_21:
                 tm_m = re.search(rb"(1 0 0 1 )([\d.]+)( 327\.11249 Tm)", new_dec)
                 if tm_m and 90 < float(tm_m.group(2)) < 120:
+                    n = n_glyphs(new_recipient_21)
+                    pts_h = pts["recipient"] * (10.5 / 9)
+                    shift = (17 - n) * pts_h / 2
                     old_x = float(tm_m.group(2))
                     new_dec = new_dec.replace(tm_m.group(0), tm_m.group(1) + f"{old_x + shift:.5f}".encode() + tm_m.group(3))
 
@@ -180,22 +205,36 @@ def patch_from_values(
                     if tm_amt_m and float(tm_amt_m.group(2)) > 50:
                         new_dec = new_dec.replace(tm_amt_m.group(0), tm_amt_m.group(1) + f"{new_x:.5f}".encode() + tm_amt_m.group(3))
 
-        if new_phone_tj and OLD_PHONE in new_dec:
-            new_dec = new_dec.replace(OLD_PHONE, new_phone_tj)
-            n = n_glyphs(new_phone_tj)
-            if n != n_glyphs(OLD_PHONE):
-                new_x = tm_x_touch_wall(wall, n, pts.get("phone", 4.57))
-                tm_phone_m = re.search(rb"(1 0 0 1 )([\d.]+)( 179\.25 Tm)", new_dec)
-                if tm_phone_m and float(tm_phone_m.group(2)) > 50:
-                    new_dec = new_dec.replace(tm_phone_m.group(0), tm_phone_m.group(1) + f"{new_x:.5f}".encode() + tm_phone_m.group(3))
+        if new_phone_tj:
+            out = replace_field_by_y(new_dec, ["179.25", "179.2"], new_phone_tj, "phone")
+            if out != new_dec:
+                new_dec = out
+            elif OLD_PHONE in new_dec:
+                new_dec = new_dec.replace(OLD_PHONE, new_phone_tj)
+                n = n_glyphs(new_phone_tj)
+                if n != n_glyphs(OLD_PHONE):
+                    new_x = tm_x_touch_wall(wall, n, pts.get("phone", 4.57))
+                    tm_phone_m = re.search(rb"(1 0 0 1 )([\d.]+)( 179\.25 Tm)", new_dec)
+                    if tm_phone_m and float(tm_phone_m.group(2)) > 50:
+                        new_dec = new_dec.replace(tm_phone_m.group(0), tm_phone_m.group(1) + f"{new_x:.5f}".encode() + tm_phone_m.group(3))
 
-        if new_bank_tj and OLD_BANK in new_dec:
-            new_dec = new_dec.replace(OLD_BANK, new_bank_tj)
-            n = n_glyphs(new_bank_tj)
-            new_x = tm_x_touch_wall(wall, n, pts.get("bank", 5.09))
-            tm_bank_m = re.search(rb"(1 0 0 1 )([\d.]+)( 155\.25 Tm)", new_dec)
-            if tm_bank_m and float(tm_bank_m.group(2)) > 50:
-                new_dec = new_dec.replace(tm_bank_m.group(0), tm_bank_m.group(1) + f"{new_x:.5f}".encode() + tm_bank_m.group(3))
+        if new_bank_tj:
+            out = replace_field_by_y(new_dec, ["155.25", "155.2"], new_bank_tj, "bank")
+            if out != new_dec:
+                new_dec = out
+            elif OLD_BANK in new_dec:
+                new_dec = new_dec.replace(OLD_BANK, new_bank_tj)
+                n = n_glyphs(new_bank_tj)
+                new_x = tm_x_touch_wall(wall, n, pts.get("bank", 5.09))
+                tm_bank_m = re.search(rb"(1 0 0 1 )([\d.]+)( 155\.25 Tm)", new_dec)
+                if tm_bank_m and float(tm_bank_m.group(2)) > 50:
+                    new_dec = new_dec.replace(tm_bank_m.group(0), tm_bank_m.group(1) + f"{new_x:.5f}".encode() + tm_bank_m.group(3))
+
+        if new_opid_tj:
+            pts["opid"] = pts.get("opid", 5.25)
+            out = replace_field_by_y(new_dec, ["297.43", "297.25", "297.4"], new_opid_tj, "opid")
+            if out != new_dec:
+                new_dec = out
 
         if new_dec != dec:
             new_raw = __import__("zlib").compress(new_dec, 6)

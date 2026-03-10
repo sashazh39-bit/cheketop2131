@@ -101,6 +101,7 @@ PTS_CALIBRATION = {
     "phone": 4.34,
     "bank": 4.60,
     "amount": 5.95,
+    "opid": 5.25,
 }
 
 
