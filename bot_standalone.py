@@ -56,6 +56,7 @@ from receipt_db import (
     chars_from_text_fields,
     find_donor,
     get_bank_report,
+    get_bank_counts,
     load_index,
     add_receipt_to_index,
     get_operation_id_from_pdf,
@@ -454,9 +455,11 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
     donor_path, amount_from = find_donor(required_chars, bank_key)
     if not donor_path:
         missing, scanned, _ = get_bank_report(required_chars, bank_key)
+        idx = load_index()
         lines = [
             "❌ Имя недоступно. В базе нет чека с нужными буквами.",
             f"📂 Просмотрено чеков: {scanned}",
+            f"🔍 bank_key={bank_key}, в индексе: {list(idx.keys())}",
         ]
         if missing:
             missing_sorted = sorted(missing)
@@ -1072,10 +1075,8 @@ def run_bot(token: str) -> None:
                     })
                     continue
                 if q["data"] == "main_db":
-                    idx = load_index()
-                    n_sbp = len(idx.get("vtb_sbp", {}))
-                    n_vtb = len(idx.get("vtb_vtb_vtb", {}))
-                    n_alfa = len(idx.get("alfa", {}))
+                    counts = get_bank_counts()
+                    n_sbp, n_vtb, n_alfa = counts["vtb_sbp"], counts["vtb_vtb_vtb"], counts["alfa"]
                     tg_request(token, "editMessageText", {
                         "chat_id": q["message"]["chat"]["id"],
                         "message_id": q["message"]["message_id"],

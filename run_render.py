@@ -15,6 +15,12 @@ PORT = int(os.environ.get("PORT", 10000))
 
 def run_bot():
     try:
+        from receipt_db import build_and_save
+        try:
+            build_and_save()
+            print("receipt_index: build OK", flush=True)
+        except Exception as e:
+            print(f"receipt_index build: {e}", flush=True)
         from bot_standalone import run_bot as _run_bot
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:

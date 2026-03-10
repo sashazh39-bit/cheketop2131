@@ -198,11 +198,33 @@ def get_missing_chars_in_receipt(pdf_path: str | Path, required_chars: set[str])
 COMMON_AMOUNTS = [10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000]
 
 
+def get_bank_counts(index: dict | None = None) -> dict[str, int]:
+    """Число чеков по банкам (с fallback на старый индекс vtb)."""
+    idx = index or load_index()
+    return {
+        "vtb_sbp": len(_get_bank_data(idx, "vtb_sbp")),
+        "vtb_vtb_vtb": len(_get_bank_data(idx, "vtb_vtb_vtb")),
+        "alfa": len(idx.get("alfa", {})),
+    }
+
+
+def _get_bank_data(idx: dict, bank: str) -> dict:
+    """Получить данные банка. Fallback на старый индекс vtb с подпапками."""
+    data = idx.get(bank, {})
+    if data:
+        return data
+    if bank in ("vtb_sbp", "vtb_vtb_vtb"):
+        vtb_data = idx.get("vtb", {})
+        prefix = "vtb/СБП/" if bank == "vtb_sbp" else "vtb/ВТБ на ВТБ/"
+        return {k: v for k, v in vtb_data.items() if isinstance(k, str) and k.startswith(prefix)}
+    return {}
+
+
 def get_bank_report(required_chars: set[str], bank: str, index: dict | None = None) -> tuple[set[str], int, set[str]]:
     """Проверить, каких букв не хватает в базе.
     Возвращает (missing_chars, receipts_count, all_chars_in_db)."""
     idx = index or load_index()
-    bank_data = idx.get(bank, {})
+    bank_data = _get_bank_data(idx, bank)
     required = {_normalize_char(c) for c in required_chars}
     all_chars = set()
     for key, val in bank_data.items():
@@ -219,7 +241,7 @@ def find_donor(required_chars: set[str], bank: str, index: dict | None = None) -
     """Найти чек, где required_chars ⊆ chars чека.
     Возвращает (Path к PDF, amount_from в чеке) или (None, None)."""
     idx = index or load_index()
-    bank_data = idx.get(bank, {})
+    bank_data = _get_bank_data(idx, bank)
     required = {_normalize_char(c) for c in required_chars}
     for key, val in bank_data.items():
         if isinstance(val, dict):

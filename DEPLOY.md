@@ -2,6 +2,46 @@
 
 Бот использует **long polling** (getUpdates), работает на чистом Python (почти без внешних зависимостей). Подходят любые хостинги с Python 3.10+.
 
+---
+
+## Деплой после новой сборки (обновление кода)
+
+После изменений в коде нужно задеплоить новую версию. Порядок зависит от хостинга.
+
+### Git-based (Render, Bothost, Railway, Koyeb)
+
+```bash
+cd /путь/к/чекетоп
+
+# Добавить изменённые файлы
+git add bot_standalone.py receipt_db.py pdf_patcher.py vtb_patch_from_config.py
+git add база_чеков/ receipt_index.json   # если менялись
+
+# Закоммитить
+git commit -m "Описание изменений"
+
+# Отправить на GitHub
+git push origin main
+```
+
+После `git push` деплой обычно запускается автоматически. Если нет — нажмите **Deploy** / **Redeploy** в панели хостинга.
+
+### VPS / SSH (вручную)
+
+1. Загрузите обновлённые файлы на сервер (scp, rsync, git pull).
+2. Пересоберите индекс и перезапустите бота:
+
+```bash
+python3 receipt_db.py build
+pkill -f bot_standalone.py
+nohup python3 bot_standalone.py > bot.log 2>&1 &
+```
+
+### Важно
+
+- Изменения в коде **не подхватываются** до перезапуска. Должен быть новый деплой или перезапуск процесса.
+- Для режима «Сгенерировать» нужны `receipt_db.py` и папка `база_чеков/` (vtb/СБП, vtb/ВТБ на ВТБ). Индекс пересобирается при старте (`run_render.py`) или выполните `python3 receipt_db.py build` вручную.
+
 ## Переменные окружения
 
 | Переменная | Описание |
@@ -19,7 +59,7 @@ Background Workers на Render платные. Но **Web Service бесплат
 1. [render.com](https://render.com) → New → **Web Service**
 2. Подключите `https://github.com/sashazh39-bit/cheketop2131`
 3. **Build Command:** `pip install -r requirements-bot.txt || true`
-4. **Start Command:** `python3 run_render.py`
+4. **Start Command:** `python3 run_render.py` (при старте пересобирает индекс из `база_чеков/`)
 5. В **Environment** добавьте `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS`
 6. Deploy
 
@@ -33,7 +73,7 @@ Background Workers на Render платные. Но **Web Service бесплат
 
 1. Регистрация на bothost.ru
 2. Создайте бота, подключите репозиторий GitHub
-3. Укажите: `python3 bot_standalone.py` или используйте их интерфейс
+3. Укажите: `python3 receipt_db.py build; python3 bot_standalone.py` (или `bot_standalone.py`, если индекс уже в репо)
 4. Добавьте переменные окружения
 
 ---
@@ -71,7 +111,7 @@ Background Workers на Render платные. Но **Web Service бесплат
 
 1. [koyeb.com](https://www.koyeb.com) → Create App
 2. Docker или Git deploy
-3. Для Git: укажите репозиторий, **Run command:** `pip install -r requirements-bot.txt 2>/dev/null; python3 bot_standalone.py`
+3. Для Git: укажите репозиторий, **Run command:** `pip install -r requirements-bot.txt 2>/dev/null; python3 receipt_db.py build; python3 bot_standalone.py`
 4. Secrets → добавьте `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS`
 
 **Бесплатно:** 2 сервиса на free tier.
@@ -100,13 +140,16 @@ Background Workers на Render платные. Но **Web Service бесплат
 Минимальный набор:
 ```
 bot_standalone.py
+receipt_db.py           # база чеков, режим «Сгенерировать»
 pdf_patcher.py
 vtb_patch_from_config.py
 vtb_cmap.py
 vtb_sber_reference.py
 vtb_test_generator.py
-vtb_config.json     # если есть
+vtb_config.json         # если есть
 requirements-bot.txt
+база_чеков/             # папка: vtb/, alfa/
+receipt_index.json      # или выполнить: python3 receipt_db.py build
 ```
 
 Файл `cid_patch_amount.py` нужен для режима Альфа-Банк (fallback).
