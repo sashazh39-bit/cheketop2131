@@ -141,7 +141,31 @@ def receipt_supports_chars(pdf_path: str | Path, required_chars: set[str]) -> bo
     return rc <= receipt_chars
 
 
+def get_missing_chars_in_receipt(pdf_path: str | Path, required_chars: set[str]) -> set[str]:
+    """Каких букв не хватает в конкретном чеке. Пустой set = всё есть."""
+    rc = {_normalize_char(c) for c in required_chars}
+    receipt_chars = get_receipt_chars(pdf_path)
+    return rc - receipt_chars
+
+
 COMMON_AMOUNTS = [10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000]
+
+
+def get_bank_report(required_chars: set[str], bank: str, index: dict | None = None) -> tuple[set[str], int, set[str]]:
+    """Проверить, каких букв не хватает в базе.
+    Возвращает (missing_chars, receipts_count, all_chars_in_db)."""
+    idx = index or load_index()
+    bank_data = idx.get(bank, {})
+    required = {_normalize_char(c) for c in required_chars}
+    all_chars = set()
+    for key, val in bank_data.items():
+        if isinstance(val, dict):
+            chars_list = val.get("chars", [])
+        else:
+            chars_list = val if isinstance(val, list) else []
+        all_chars.update(chars_list)
+    missing = required - all_chars
+    return missing, len(bank_data), all_chars
 
 
 def find_donor(required_chars: set[str], bank: str, index: dict | None = None) -> tuple[Path | None, int | None]:

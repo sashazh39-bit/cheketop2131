@@ -52,8 +52,10 @@ from vtb_cmap import get_unsupported_chars, format_unsupported_error, suggest_re
 from vtb_sber_reference import scan_vtb_unsupported_chars
 from receipt_db import (
     receipt_supports_chars,
+    get_missing_chars_in_receipt,
     chars_from_text_fields,
     find_donor,
+    get_bank_report,
     load_index,
     add_receipt_to_index,
     COMMON_AMOUNTS,
@@ -338,7 +340,9 @@ def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req)
         state.get("vtb_bank") or "",
     )
     if required_chars and not receipt_supports_chars(inp, required_chars):
-        send("❌ Имя недоступно. В вашем чеке отсутствуют нужные буквы. Попробуйте «Сгенерировать» — бот найдёт чек с подходящими символами.")
+        missing = get_missing_chars_in_receipt(inp, required_chars)
+        miss_txt = f"Не хватает букв: «{'» «'.join(sorted(missing))}»" if missing else ""
+        send(f"❌ Имя недоступно. В вашем чеке отсутствуют нужные буквы.\n{miss_txt}\nПопробуйте «Сгенерировать» — бот найдёт чек с подходящими символами.")
         return
 
     try:
@@ -446,7 +450,16 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
     bank = state.get("gen_bank_type", "vtb")
     donor_path, amount_from = find_donor(required_chars, bank)
     if not donor_path:
-        send("❌ Имя недоступно. В базе нет чека с нужными буквами. Добавьте чеки в «Проверка базы».")
+        missing, scanned, _ = get_bank_report(required_chars, bank)
+        lines = [
+            "❌ Имя недоступно. В базе нет чека с нужными буквами.",
+            f"📂 Просмотрено чеков: {scanned}",
+        ]
+        if missing:
+            missing_sorted = sorted(missing)
+            lines.append(f"❌ Не хватает букв ({len(missing)}): «{'» «'.join(missing_sorted)}»")
+        lines.append("Добавьте чеки в «Проверка базы» или замените буквы (ё→е, ‑→-).")
+        send("\n".join(lines))
         del USER_STATE[uid]
         return
 
