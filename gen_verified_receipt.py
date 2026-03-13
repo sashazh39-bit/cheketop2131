@@ -22,6 +22,7 @@ BASE = Path(__file__).parent
 
 # Доноры только в база_чеков/vtb/СБП
 DONORS_DIR = BASE / "база_чеков" / "vtb" / "СБП"
+UNIVERSAL_DONOR = BASE / "universal_donor.pdf"  # См. build_universal_donor.py
 
 
 def change_one_char_in_id(data: bytearray) -> None:
@@ -66,11 +67,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Генерация чека по критериям CHECK_VERIFICATION_RULES.md")
     ap.add_argument("output", nargs="?", default="receipt_verified.pdf", help="Выходной PDF")
     ap.add_argument("--donor", "-d", help="Явный путь к донору")
+    ap.add_argument("--template", "-t", help="Проходящий чек как шаблон (то же что --donor, приоритет над universal)")
     ap.add_argument("--payer", "-p", default="Алексей Евгеньевич А.", help="ФИО получателя")
     ap.add_argument("--recipient", "-r", default="Роман Алексеевич А.", help="ФИО отправителя")
     ap.add_argument("--phone", default="+7 (992) 494-94-95", help="Телефон")
     ap.add_argument("--amount", "-a", type=int, default=14600, help="Сумма")
     ap.add_argument("--date", default=None, help="Дата DD.MM.YYYY, HH:MM или 'now'")
+    ap.add_argument("--operation-id", "-o", help="ID операции СБП (по умолчанию — из шаблона)")
+    ap.add_argument("--keep-id", action="store_true", help="Не менять Document ID (для теста: оставить как в шаблоне)")
     ap.add_argument("--report", action="store_true", help="Вывести отчёт выравнивания")
     args = ap.parse_args()
 
@@ -87,26 +91,66 @@ def main() -> int:
 
     meta_date = datetime.strptime(date_str, "%d.%m.%Y, %H:%M").strftime("D:%Y%m%d%H%M00+03'00'")
 
-    if args.donor:
+    donor_path = None
+    if args.template:
+        donor_path = Path(args.template).expanduser().resolve()
+        if not donor_path.exists():
+            print(f"[ERROR] Шаблон не найден: {donor_path}", file=sys.stderr)
+            return 1
+    elif args.donor:
         donor_path = Path(args.donor).expanduser()
         if not donor_path.is_absolute() and not donor_path.exists():
             donor_path = DONORS_DIR / donor_path.name
         if not donor_path.exists():
+            donor_path = BASE / donor_path.name
+        if not donor_path.exists():
             print(f"[ERROR] Донор не найден: {donor_path}", file=sys.stderr)
             return 1
-    else:
-        try:
-            from receipt_db import chars_from_text_fields
-            required = chars_from_text_fields(args.payer, args.recipient, args.phone, "")
-            donor_path = find_donor_with_chars(required)
-        except Exception:
+    if donor_path is None:
+        # Сначала пробуем универсальный донор (если есть)
+        if UNIVERSAL_DONOR.exists():
+            try:
+                from receipt_db import chars_from_text_fields, get_receipt_chars, _normalize_char
+                required = chars_from_text_fields(args.payer, args.recipient, args.phone, "")
+                req = {_normalize_char(c) for c in required}
+                univ_chars = get_receipt_chars(UNIVERSAL_DONOR)
+                if req <= univ_chars:
+                    donor_path = UNIVERSAL_DONOR
+                else:
+                    donor_path = None
+            except Exception:
+                donor_path = None
+        else:
             donor_path = None
+        if not donor_path:
+            try:
+                from receipt_db import chars_from_text_fields
+                required = chars_from_text_fields(args.payer, args.recipient, args.phone, "")
+                donor_path = find_donor_with_chars(required)
+            except Exception:
+                donor_path = None
         if not donor_path:
             donors = get_donors_from_base()
             donor_path = donors[0] if donors else None
         if not donor_path or not donor_path.exists():
-            print("[ERROR] Нет донора в база_чеков/vtb/СБП. Добавьте --donor имя.pdf", file=sys.stderr)
+            msg = "[ERROR] Нет донора с нужными буквами."
+            if not UNIVERSAL_DONOR.exists():
+                msg += " Запустите: python3 build_universal_donor.py"
+            msg += " Или добавьте --donor путь.pdf"
+            print(msg, file=sys.stderr)
             return 1
+
+    # Проверка: донор должен содержать все буквы ФИО
+    try:
+        from receipt_db import chars_from_text_fields, get_missing_chars_in_receipt
+        required = chars_from_text_fields(args.payer, args.recipient, args.phone, "")
+        missing = get_missing_chars_in_receipt(donor_path, required)
+        if missing:
+            print(f"[ERROR] В доноре нет букв: {''.join(sorted(missing))}", file=sys.stderr)
+            print("Используйте ё→е, Ё→Е или другой донор. См. python3 build_universal_donor.py --list", file=sys.stderr)
+            return 1
+    except Exception:
+        pass
 
     print(f"[INFO] Донор: {donor_path.name}")
 
@@ -120,6 +164,7 @@ def main() -> int:
             recipient=args.recipient,
             phone=args.phone,
             amount=args.amount,
+            operation_id=args.operation_id if args.operation_id else None,
             keep_metadata=True,
         )
     except ValueError as e:
@@ -128,7 +173,8 @@ def main() -> int:
 
     out_arr = bytearray(out)
     update_creation_date(out_arr, meta_date)
-    change_one_char_in_id(out_arr)
+    if not args.keep_id:
+        change_one_char_in_id(out_arr)
 
     out_path.write_bytes(out_arr)
     print("✅ Сгенерирован:", out_path)
@@ -137,7 +183,7 @@ def main() -> int:
     print(f"   Телефон: {args.phone}")
     print(f"   Сумма: {args.amount:,} ₽".replace(",", " "))
     print(f"   Дата: {date_str}")
-    print("   /ID: 1 символ изменён")
+    print("   /ID:", "без изменений" if args.keep_id else "1 символ изменён")
     print("   CreationDate: синхронизирован с чеком")
 
     if args.report:

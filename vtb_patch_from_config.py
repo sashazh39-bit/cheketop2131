@@ -22,7 +22,7 @@ from pathlib import Path
 
 from vtb_test_generator import build_tj, build_date_tj, tm_x_touch_wall
 from vtb_sber_reference import get_vtb_per_field_params, get_field_align_raw
-from vtb_cmap import text_to_cids, format_amount, operation_id_to_cids
+from vtb_cmap import text_to_cids, format_amount, operation_id_to_cids, _FALLBACK
 from vtb_sbp_layout import get_layout_values
 
 
@@ -176,9 +176,37 @@ def patch_amount_only(data: bytearray, pdf_path: Path, amount: int) -> bytes:
     raise ValueError("Блок суммы (kern -11.11111) не найден")
 
 
-def build_text_tj(text: str, kern: str = "-16.66667", wrap: bool = True) -> bytes:
-    """Текст (ФИО) → TJ. wrap=True для recipient (в [ ]), False для payer (без [ ])."""
-    cids = text_to_cids(text)
+def _parse_donor_tounicode(pdf_bytes: bytes) -> dict[int, str] | None:
+    """ToUnicode CMap из PDF: Unicode codepoint → CID hex."""
+    try:
+        from sbp_full_toolkit import parse_tounicode
+        return parse_tounicode(pdf_bytes)
+    except Exception:
+        return None
+
+
+def _text_to_cids_donor(text: str, uni_to_cid: dict[int, str]) -> list[str] | None:
+    """Текст → CID через ToUnicode донора (сохраняет регистр: И≠и, О≠о)."""
+    result = []
+    for c in text:
+        c = _FALLBACK.get(c, c)
+        ucp = ord(c)
+        cid = uni_to_cid.get(ucp)
+        if cid is None:
+            fallback = text_to_cids(c)
+            cid = fallback[0] if fallback else None
+        if cid is None:
+            return None
+        result.append(cid)
+    return result
+
+
+def build_text_tj(text: str, kern: str = "-16.66667", wrap: bool = True, uni_to_cid: dict[int, str] | None = None) -> bytes:
+    """Текст (ФИО) → TJ. wrap=True для recipient. uni_to_cid — ToUnicode донора (для И/О в верх. регистре)."""
+    if uni_to_cid:
+        cids = _text_to_cids_donor(text, uni_to_cid)
+    else:
+        cids = text_to_cids(text)
     if not cids:
         raise ValueError(f"Символ не найден в CMap: {text}")
     tj = build_tj(cids, kern=kern)
@@ -201,10 +229,12 @@ def patch_from_values(
     keep_date: bool = False,
 ) -> bytes:
     """Патч: wall и pts из донора; pts из блока при замене по Y."""
+    pdf_bytes = pdf_path.read_bytes()
     params = get_vtb_per_field_params(pdf_path)
     layout = get_layout_values()
     raw = get_field_align_raw(pdf_path)
-    cid_widths = _parse_cid_widths(pdf_path.read_bytes())
+    cid_widths = _parse_cid_widths(pdf_bytes)
+    uni_to_cid = _parse_donor_tounicode(pdf_bytes)
     wall = params.get("wall") or layout["wall"]
     center_heading = params.get("center_heading") or layout["center_heading"]
     ly = layout["y"]
@@ -233,12 +263,14 @@ def patch_from_values(
             except ValueError:
                 dt = datetime.now()
         new_date_tj = build_date_tj(dt)
-    new_payer_tj = build_text_tj(payer, wrap=False) if payer else None
-    new_recipient_tj = build_text_tj(recipient, wrap=True) if recipient else None
-    new_recipient_21 = build_text_tj(recipient, kern="-21.42857", wrap=True) if recipient else None
-    new_phone_tj = build_text_tj(phone, wrap=True) if phone else None
-    new_bank_tj = build_text_tj(bank, wrap=True) if bank else None
-    new_account_tj = build_text_tj(account, wrap=True) if account else None
+    def _build(text: str, wrap: bool = True, kern: str = "-16.66667") -> bytes:
+        return build_text_tj(text, kern=kern, wrap=wrap, uni_to_cid=uni_to_cid)
+    new_payer_tj = _build(payer, wrap=False) if payer else None
+    new_recipient_tj = _build(recipient) if recipient else None
+    new_recipient_21 = _build(recipient, kern="-21.42857") if recipient else None
+    new_phone_tj = _build(phone) if phone else None
+    new_bank_tj = _build(bank) if bank else None
+    new_account_tj = _build(account) if account else None
     new_amount_tj = build_amount_tj(amount) if amount else None
     new_opid_tj = None
     if operation_id and operation_id_to_cids(operation_id.replace(" ", "").replace("\n", "")):
