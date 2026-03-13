@@ -5,10 +5,14 @@
 __pycache__/
 *.pyc
 *.pyo
+.env
+.venv/
+venv/
 
 # macOS
 .DS_Store
 
 # Временные файлы
-.temp_*.ttf
-*_test*.pdf
+*.tmp
+.temp_*
+receipt_test_*.pdf
