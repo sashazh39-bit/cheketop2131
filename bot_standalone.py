@@ -396,6 +396,7 @@ def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req)
                 "inline_keyboard": [
                     [{"text": "Тест", "callback_data": "report_test"}],
                     [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
                 ],
             }),
         })
@@ -529,6 +530,7 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
                 "inline_keyboard": [
                     [{"text": "Тест", "callback_data": "report_test"}],
                     [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
                 ],
             }),
         })
@@ -1017,6 +1019,7 @@ def run_bot(token: str) -> None:
                                 "inline_keyboard": [
                                     [{"text": "Тест", "callback_data": "report_test"}],
                                     [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
                                 ],
                             }),
                         })
