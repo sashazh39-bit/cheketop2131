@@ -1,2 +1,14 @@
 # Заявки бота (данные пользователей)
 заявки/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Временные файлы
+.temp_*.ttf
+*_test*.pdf
