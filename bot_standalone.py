@@ -371,7 +371,7 @@ def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req)
             phone=state.get("vtb_phone"),
             bank=state.get("vtb_bank"),
             amount=None,
-            account="*9483",
+            account=None,
         )
         out_name = Path(state["file_name"]).stem + f"_{format_amount_display(state['vtb_amount']).replace(' ', '_')}.pdf"
         try:
@@ -506,7 +506,7 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
             bank=state.get("gen_bank"),
             amount=None,
             operation_id=state.get("gen_operation_id"),
-            account="*9483",
+            account=None,
         )
         out_name = donor_path.stem + f"_{format_amount_display(amount_to).replace(' ', '_')}.pdf"
         del USER_STATE[uid]
