@@ -225,6 +225,7 @@ def patch_from_values(
     amount: int | None = None,
     operation_id: str | None = None,
     account: str | None = None,
+    message: str | None = None,
     keep_metadata: bool = False,
     keep_date: bool = False,
 ) -> bytes:
@@ -271,6 +272,7 @@ def patch_from_values(
     new_phone_tj = _build(phone) if phone else None
     new_bank_tj = _build(bank) if bank else None
     new_account_tj = _build(account) if account else None
+    new_message_tj = _build(message, wrap=True) if message else None
     new_amount_tj = build_amount_tj(amount) if amount else None
     new_opid_tj = None
     if operation_id and operation_id_to_cids(operation_id.replace(" ", "").replace("\n", "")):
@@ -537,6 +539,43 @@ def patch_from_values(
                 repl = amt_m.group(1) + f"{new_x_amt:.5f}".encode() + amt_m.group(3) + between + b"[" + new_content + b"] TJ"
                 new_dec = new_dec.replace(amt_m.group(0), repl)
                 break
+
+        if new_message_tj:
+            # Всегда использовать полный список Y из layout (не raw), чтобы заменить обе строки
+            ys_message = list(ly.get("message", ())) if isinstance(ly.get("message"), (list, tuple)) else []
+            tol_message = 2.0
+            if ys_message:
+                # Найти все TJ-блоки в области сообщения, отсортировать по Y (сверху вниз)
+                tol_m = max(y_tol, tol_message)
+                pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)\s*\[([^\]]*)\](\s*TJ)"
+                matches = []
+                for mt in re.finditer(pat, new_dec):
+                    tm_x = float(mt.group(2))
+                    y = float(mt.group(4))
+                    if tm_x < 50:
+                        continue
+                    if not any(abs(y - vy) < tol_m for vy in ys_message):
+                        continue
+                    n_old = n_glyphs(b"[" + mt.group(5) + b"]")
+                    if n_old <= 0 or not (5 <= n_old <= 60):
+                        continue
+                    matches.append((y, mt))
+                matches.sort(key=lambda t: -t[0])  # Y по убыванию (первая строка сверху)
+                for i, (y, mt) in enumerate(matches):
+                    new_tj = new_message_tj if i == 0 else _build(" ", wrap=True)
+                    new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
+                    old_content = mt.group(5)
+                    old_units = _tj_advance_units(old_content, cid_widths)
+                    new_units = _tj_advance_units(new_content, cid_widths)
+                    tm_x = float(mt.group(2))
+                    if old_units > 0 and new_units > 0:
+                        scale = (wall - tm_x) / old_units
+                        new_x = wall - new_units * scale
+                    else:
+                        n_new = n_glyphs(b"[" + new_content + b"]")
+                        new_x = tm_x_touch_wall(wall, n_new, _fallback_pts(new_tj))
+                    repl = mt.group(1) + f"{new_x:.5f}".encode() + mt.group(3) + b" [" + new_content + b"]" + mt.group(6)
+                    new_dec = new_dec.replace(mt.group(0), repl)
 
         if new_account_tj:
             ys_account, tol_account = _y_list("account")

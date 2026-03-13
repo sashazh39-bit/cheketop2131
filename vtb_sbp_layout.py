@@ -81,6 +81,7 @@ Y_DATE = (275.25, 275.2, 274.5, 275.0)
 Y_ACCOUNT = (251.25, 251.2, 250.5, 251.0)
 Y_PAYER = (227.25, 227.2, 226.5, 227.0)
 Y_RECIPIENT = (203.25, 203.2, 202.5, 203.0)
+Y_MESSAGE = (263.25, 251.25, 237.75)  # Сообщение (если есть)
 Y_PHONE = (179.25, 179.2, 178.5, 179.0)
 Y_BANK = (155.25, 155.2, 154.5, 155.0)
 Y_AMOUNT = 72.37499
@@ -135,6 +136,7 @@ def get_layout_values() -> dict:
         "account": _to_tuple(y_cfg.get("account"), Y_ACCOUNT),
         "payer": _to_tuple(y_cfg.get("payer"), Y_PAYER),
         "recipient": _to_tuple(y_cfg.get("recipient"), Y_RECIPIENT),
+        "message": _to_tuple(y_cfg.get("message"), Y_MESSAGE),
         "phone": _to_tuple(y_cfg.get("phone"), Y_PHONE),
         "bank": _to_tuple(y_cfg.get("bank"), Y_BANK),
         "opid": _to_tuple(y_cfg.get("opid"), Y_OPID),

@@ -978,13 +978,66 @@ def run_bot(token: str) -> None:
                         tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Суммы должны быть больше 0."})
                         continue
                     chat_id = msg["chat"]["id"]
+                    state = USER_STATE[uid]
+                    inp = state["file_path"]
+                    bank = state["bank"]
+                    out_name = Path(state["file_name"]).stem + f"_{format_amount_display(amount_to).replace(' ', '_')}.pdf"
+
+                    # ВТБ «Только сумма»: patch_amount_only выравнивает по wall.
+                    # pdf_patcher не пересчитывает Tm для kern -11.11111 → сумма смещается вправо.
+                    if bank == "vtb" and state.get("vtb_mode") == "amount":
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+                        try:
+                            print(f"  Патч ВТБ (только сумма) {amount_from}→{amount_to}...", end=" ", flush=True)
+                            data = bytearray(Path(inp).read_bytes())
+                            try:
+                                out_bytes = bytes(patch_amount_only(data, Path(inp), amount_to))
+                            except Exception:
+                                ok_sum, err_sum, new_data = pdf_patch_amount(data, amount_from, amount_to, bank="vtb")
+                                if not ok_sum or new_data is None:
+                                    del USER_STATE[uid]
+                                    try:
+                                        os.unlink(inp)
+                                    except OSError:
+                                        pass
+                                    tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Сумма не найдена. В чеке должна быть {format_amount_display(amount_from)} ₽. {err_sum or ''}"})
+                                    continue
+                                out_bytes = new_data
+                            try:
+                                os.unlink(inp)
+                            except OSError:
+                                pass
+                            del USER_STATE[uid]
+                            print("отправляю...", end=" ", flush=True)
+                            caption = f"✅ Готово: {format_amount_display(amount_from)} ₽ → {format_amount_display(amount_to)} ₽"
+                            tg_request(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+                            print("готово")
+                            USER_STATE[uid] = {
+                                "awaiting": "report_choice",
+                                "amount_from": amount_from,
+                                "amount_to": amount_to,
+                                "bank": bank,
+                                "pdf_name": out_name,
+                            }
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": "📋 Отчёт:",
+                                "reply_markup": json.dumps({
+                                    "inline_keyboard": [
+                                        [{"text": "Тест", "callback_data": "report_test"}],
+                                        [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                                        [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+                                    ],
+                                }),
+                            })
+                        except Exception as e:
+                            print("ошибка:", e)
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново."})
+                        continue
+
                     tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
                     try:
                         print(f"  Патч {amount_from}→{amount_to} ({bank})...", end=" ", flush=True)
-                        state = USER_STATE[uid]
-                        inp = state["file_path"]
-                        bank = state["bank"]
-                        out_name = Path(state["file_name"]).stem + f"_{format_amount_display(amount_to).replace(' ', '_')}.pdf"
                         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
                             out_path = tf.name
                         ok, err = patch_pdf_file(inp, out_path, amount_from, amount_to, bank=bank)

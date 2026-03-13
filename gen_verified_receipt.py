@@ -72,6 +72,7 @@ def main() -> int:
     ap.add_argument("--recipient", "-r", default="Роман Алексеевич А.", help="ФИО отправителя")
     ap.add_argument("--phone", default="+7 (992) 494-94-95", help="Телефон")
     ap.add_argument("--amount", "-a", type=int, default=14600, help="Сумма")
+    ap.add_argument("--message", "-m", help="Сообщение получателю (заменит тестовый текст)")
     ap.add_argument("--date", default=None, help="Дата DD.MM.YYYY, HH:MM или 'now'")
     ap.add_argument("--operation-id", "-o", help="ID операции СБП (по умолчанию — из шаблона)")
     ap.add_argument("--keep-id", action="store_true", help="Не менять Document ID (для теста: оставить как в шаблоне)")
@@ -111,7 +112,7 @@ def main() -> int:
         if UNIVERSAL_DONOR.exists():
             try:
                 from receipt_db import chars_from_text_fields, get_receipt_chars, _normalize_char
-                required = chars_from_text_fields(args.payer, args.recipient, args.phone, "")
+                required = chars_from_text_fields(args.payer, args.recipient, args.phone, args.message or "")
                 req = {_normalize_char(c) for c in required}
                 univ_chars = get_receipt_chars(UNIVERSAL_DONOR)
                 if req <= univ_chars:
@@ -125,7 +126,7 @@ def main() -> int:
         if not donor_path:
             try:
                 from receipt_db import chars_from_text_fields
-                required = chars_from_text_fields(args.payer, args.recipient, args.phone, "")
+                required = chars_from_text_fields(args.payer, args.recipient, args.phone, args.message or "")
                 donor_path = find_donor_with_chars(required)
             except Exception:
                 donor_path = None
@@ -143,7 +144,7 @@ def main() -> int:
     # Проверка: донор должен содержать все буквы ФИО
     try:
         from receipt_db import chars_from_text_fields, get_missing_chars_in_receipt
-        required = chars_from_text_fields(args.payer, args.recipient, args.phone, "")
+        required = chars_from_text_fields(args.payer, args.recipient, args.phone, args.message or "")
         missing = get_missing_chars_in_receipt(donor_path, required)
         if missing:
             print(f"[ERROR] В доноре нет букв: {''.join(sorted(missing))}", file=sys.stderr)
@@ -164,6 +165,7 @@ def main() -> int:
             recipient=args.recipient,
             phone=args.phone,
             amount=args.amount,
+            message=args.message,
             operation_id=args.operation_id if args.operation_id else None,
             keep_metadata=True,
         )

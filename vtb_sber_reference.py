@@ -352,6 +352,7 @@ def get_field_align_raw(pdf_path: str | Path) -> dict:
         for name, words in [
             ("amount", ["1 000", "000 ₽", "₽", "10 000", "100 ₽", "180 ₽"]),
             ("bank", ["Сбербанк", "Альфа", "ВТБ", "Т‑Банк", "Т-Банк", "Совкомбанк"]),
+            ("message", ["ЙЦУКЕ", "Перевод денежных", "СМИТЬЪБЮ"]),
         ]:
             x1, pts, y = find_x1_pts_y(words)
             if pts is not None:
