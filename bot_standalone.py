@@ -47,7 +47,7 @@ except Exception:
     pass
 
 from pdf_patcher import patch_pdf_file, patch_amount as pdf_patch_amount, format_amount_display
-from vtb_patch_from_config import patch_from_values
+from vtb_patch_from_config import patch_from_values, patch_amount_only
 from vtb_cmap import get_unsupported_chars, format_unsupported_error, suggest_replacement, FALLBACK_TIPS
 from vtb_sber_reference import scan_vtb_unsupported_chars
 from receipt_db import (
@@ -355,12 +355,15 @@ def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req)
 
     try:
         data = bytearray(Path(inp).read_bytes())
-        # Сначала замена суммы (работает с любой суммой в чеке)
-        ok_sum, err_sum, new_data = pdf_patch_amount(data, amount_from, amount_to, bank="vtb")
-        if not ok_sum or new_data is None:
-            send(f"❌ Сумма не найдена.\nПроверь: в чеке должна быть сумма {format_amount_display(amount_from)} ₽. {err_sum or ''}")
-            return
-        data = bytearray(new_data)
+        # Для ВТБ сначала используем точное выравнивание суммы по wall из patch_amount_only.
+        try:
+            data = bytearray(patch_amount_only(data, Path(inp), amount_to))
+        except Exception:
+            ok_sum, err_sum, new_data = pdf_patch_amount(data, amount_from, amount_to, bank="vtb")
+            if not ok_sum or new_data is None:
+                send(f"❌ Сумма не найдена.\nПроверь: в чеке должна быть сумма {format_amount_display(amount_from)} ₽. {err_sum or ''}")
+                return
+            data = bytearray(new_data)
         # Остальные поля (дата, ФИО, телефон, банк) — amount=None, сумму уже поменяли
         out_bytes = patch_from_values(
             data,
@@ -487,16 +490,19 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
 
     try:
         data = bytearray(donor_path.read_bytes())
-        ok_sum, err_sum, new_data = False, None, None
-        for am in amounts_to_try:
-            ok_sum, err_sum, new_data = pdf_patch_amount(data, am, amount_to, bank="vtb")
-            if ok_sum and new_data is not None:
-                break
-        if not ok_sum or new_data is None:
-            send(f"❌ Сумма не найдена в доноре. {err_sum or ''}")
-            del USER_STATE[uid]
-            return
-        data = bytearray(new_data)
+        try:
+            data = bytearray(patch_amount_only(data, donor_path, amount_to))
+        except Exception:
+            ok_sum, err_sum, new_data = False, None, None
+            for am in amounts_to_try:
+                ok_sum, err_sum, new_data = pdf_patch_amount(data, am, amount_to, bank="vtb")
+                if ok_sum and new_data is not None:
+                    break
+            if not ok_sum or new_data is None:
+                send(f"❌ Сумма не найдена в доноре. {err_sum or ''}")
+                del USER_STATE[uid]
+                return
+            data = bytearray(new_data)
         out_bytes = patch_from_values(
             data,
             donor_path,
