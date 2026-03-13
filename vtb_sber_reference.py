@@ -77,6 +77,60 @@ def _scan_stream_blocks(data: bytes) -> list[dict]:
     return blocks
 
 
+def get_vtb_params_from_stream(pdf_path: str | Path) -> dict:
+    """Извлечь wall и pts_text из PDF: эталон Выполнено/*9426, блоки из stream.
+
+    Возвращает: wall, pts_text (единый для даты/payer/recipient/phone/bank), stream_blocks.
+    """
+    result = {
+        "wall": FALLBACK_WALL,
+        "pts_text": 5.08,
+        "stream_blocks": [],
+    }
+    if fitz is None:
+        return result
+    path = Path(pdf_path)
+    if not path.exists():
+        return result
+    try:
+        data = path.read_bytes()
+        stream_blocks = _scan_stream_blocks(data)
+        result["stream_blocks"] = stream_blocks
+
+        doc = fitz.open(path)
+        page = doc[0]
+        page_height = page.rect.y1 - page.rect.y0
+        dt = page.get_text("dict")
+        doc.close()
+
+        spans = _spans_with_bbox(dt)
+        import re as _re
+        def _is_ref(t):
+            if "Выполнено" in t:
+                return True
+            if _re.search(r"\*\d{4}", t):
+                return True  # *9426, *9483 и т.д.
+            return False
+        ref_spans = [s for s in spans if _is_ref(s["text"])]
+        if not ref_spans:
+            return result
+        wall = max(s["x1"] for s in ref_spans)
+        result["wall"] = wall
+
+        Y_TOL = 8.0
+        for ref in ref_spans:
+            pdf_y = page_height - ref["y"]
+            for sb in stream_blocks:
+                if abs(sb["y"] - pdf_y) < Y_TOL and sb["n"] > 0:
+                    pts = (wall - sb["tm_x"]) / sb["n"]
+                    if 4.0 < pts < 7.0:
+                        result["pts_text"] = pts
+                        return result
+    except Exception:
+        pass
+    return result
+
+
 def _spans_with_bbox(dt: dict) -> list[dict]:
     """Список span с (text, x1, y_center) для правой колонки."""
     out = []
@@ -102,6 +156,7 @@ def get_vtb_per_field_params(pdf_path: str | Path) -> dict:
     """
     result = {
         "wall": FALLBACK_WALL,
+        "center_heading": (50 + FALLBACK_WALL) / 2,
         "pts_date": 4.55,
         "pts_payer": 4.66,
         "pts_recipient": 4.66,
@@ -149,24 +204,182 @@ def get_vtb_per_field_params(pdf_path: str | Path) -> dict:
                 return (span["x1"] - best["tm_x"]) / best["n"]
             return None
 
-        # Собираем x1 для WALL
-        x1_list = [s["x1"] for s in spans]
-        result["wall"] = max(x1_list)
+        # WALL = правый край эталонных полей (Выполнено, *XXXX)
+        def _is_ref(t):
+            if "Выполнено" in t:
+                return True
+            if re.search(r"\*\d{4}", t):
+                return True
+            return False
+        ref_x1 = [s["x1"] for s in spans if _is_ref(s["text"])]
+        result["wall"] = max(ref_x1) if ref_x1 else max(s["x1"] for s in spans)
+        # Центр заголовка "Исходящий перевод СБП" для ФИО под ним
+        all_spans = []
+        for block in dt.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    bb = span.get("bbox")
+                    if bb and span.get("text"):
+                        all_spans.append({"text": span["text"], "bbox": bb})
+        for s in all_spans:
+            if "Исходящий" in s["text"] or "перевод СБП" in s["text"]:
+                result["center_heading"] = (s["bbox"][0] + s["bbox"][2]) / 2
+                break
+        else:
+            result["center_heading"] = (50 + result["wall"]) / 2  # fallback
 
-        if pts := find_pts(["04:47", "09.03", "03.202"]):
+        if pts := find_pts(["04:47", "09.03", "03.202", "08:52", "21:36"]):
             result["pts_date"] = pts
-        if pts := find_pts(["Александр", "Евгеньевич"]):
+        if pts := find_pts(["Александр", "Евгений", "Евгеньевич", "Юрьевич", "Константинович", "Даниил"]):
             result["pts_payer"] = pts
-        if pts := find_pts(["Ефим", "Антонович"]):
+        if pts := find_pts(["Ефим", "Антонович", "Юлия", "Константиновна", "Алла", "Дмитриевна"]):
             result["pts_recipient"] = pts
         if pts := find_pts(["1 000", "000 ₽", "₽"]):
             result["pts_amount"] = pts
-        if pts := find_pts(["+7 (906)", "236-86", "236‑86"]):
+        if pts := find_pts(["+7 (906)", "+7 (903)", "+7 (935)", "236-86", "236‑86", "903-66", "247-22"]):
             result["pts_phone"] = pts
         if pts := find_pts(["Сбербанк", "Альфа", "ВТБ"]):
             result["pts_bank"] = pts
         if pts := find_pts(["B606", "A606"]):
             result["pts_opid"] = pts
+        stream_params = get_vtb_params_from_stream(path)
+        result["pts_text"] = stream_params.get("pts_text", 5.08)
+    except Exception:
+        pass
+    return result
+
+
+def get_field_align_raw(pdf_path: str | Path) -> dict:
+    """Сырые данные для alignment: x1 и pts по полям.
+    date, account, phone — статичные поля; payer, recipient — ФИО.
+    """
+    result = {"path": str(pdf_path), "x1": {}, "pts": {}}
+    if fitz is None:
+        return result
+    path = Path(pdf_path)
+    if not path.exists():
+        return result
+    try:
+        data = path.read_bytes()
+        stream_blocks = _scan_stream_blocks(data)
+        doc = fitz.open(path)
+        page = doc[0]
+        page_height = page.rect.y1 - page.rect.y0
+        dt = page.get_text("dict")
+        spans = _spans_with_bbox(dt)
+        doc.close()
+
+        Y_TOL = 5.0
+
+        def find_x1_pts_y(search_words: list[str], x1_min: float = 200.0) -> tuple[float | None, float | None, float | None]:
+            """Только правый столбец: x1 > x1_min (иначе ловит левые подписи «Банк ВТБ»)."""
+            span = None
+            for s in spans:
+                if s.get("x1", 0) < x1_min:
+                    continue
+                if any(w in s["text"] for w in search_words):
+                    span = s
+                    break
+            if not span:
+                return None, None, None
+            x1 = span["x1"]
+            pdf_y = page_height - span["y"]
+            best = None
+            best_dy = 999
+            for sb in stream_blocks:
+                dy = abs(sb["y"] - pdf_y)
+                if dy < best_dy and dy < Y_TOL:
+                    best_dy = dy
+                    best = sb
+            if best and best["n"] > 0:
+                return x1, (x1 - best["tm_x"]) / best["n"], best["y"]
+            return x1, None, best["y"] if best else None
+
+        def find_by_regex(pat: str, x1_min: float = 200.0) -> tuple[float | None, float | None, float | None]:
+            for s in spans:
+                if s.get("x1", 0) < x1_min:
+                    continue
+                if re.search(pat, s["text"]):
+                    x1 = s["x1"]
+                    pdf_y = page_height - s["y"]
+                    best = None
+                    best_dy = 999
+                    for sb in stream_blocks:
+                        dy = abs(sb["y"] - pdf_y)
+                        if dy < best_dy and dy < Y_TOL:
+                            best_dy = dy
+                            best = sb
+                    if best and best["n"] > 0:
+                        return x1, (x1 - best["tm_x"]) / best["n"], best["y"]
+                    return x1, None, best["y"] if best else None
+            return None, None, None
+
+        result["y"] = {}
+        result["center_heading"] = None
+
+        for name, words in [
+            ("date", ["04:47", "09.03", "03.202", "08:52", "21:36", "02.202", "01.202", "16:44", "09.2025", "03.2026"]),
+            ("phone", ["+7 (906)", "+7 (903)", "+7 (935)", "+7 (931)", "+7 (994)", "236-86", "236‑86", "605‑91"]),
+        ]:
+            x1, pts, y = find_x1_pts_y(words)
+            if x1 is not None:
+                result["x1"][name] = x1
+            if pts is not None:
+                result["pts"][name] = pts
+            if y is not None:
+                result["y"][name] = y
+
+        x1_acc, pts_acc, y_acc = find_by_regex(r"\*\d{4}")
+        if x1_acc is not None:
+            result["x1"]["account"] = x1_acc
+        if pts_acc is not None:
+            result["pts"]["account"] = pts_acc
+        if y_acc is not None:
+            result["y"]["account"] = y_acc
+
+        for name, words in [
+            ("payer", ["Александр", "Евгений", "Евгеньевич", "Юрьевич", "Константинович", "Даниил", "Юлия", "Елена", "Арман", "Алан", "Петрович"]),
+            ("recipient", ["Анна", "Петрова", "Артем", "Егорович", "Ефим", "Антонович", "Юлия", "Константиновна", "Алла", "Дмитриевна", "Максим", "Андреевич", "Дмитрий", "Сергеевич"]),
+        ]:
+            x1, pts, y = find_x1_pts_y(words)
+            if x1 is not None:
+                result["x1"][name] = x1
+            if pts is not None:
+                result["pts"][name] = pts
+            if y is not None:
+                result["y"][name] = y
+
+        for name, words in [
+            ("amount", ["1 000", "000 ₽", "₽", "10 000", "100 ₽", "180 ₽"]),
+            ("bank", ["Сбербанк", "Альфа", "ВТБ", "Т‑Банк", "Т-Банк", "Совкомбанк"]),
+        ]:
+            x1, pts, y = find_x1_pts_y(words)
+            if pts is not None:
+                result["pts"][name] = pts
+            if y is not None:
+                result["y"][name] = y
+
+        x1_op, pts_op, y_op = find_by_regex(r"[AB]\d{4}[0-9A-Fa-f]{10,}")
+        if pts_op is not None:
+            result["pts"]["opid"] = pts_op
+        if y_op is not None:
+            result["y"]["opid"] = y_op
+
+        x1_done, _, y_done = find_x1_pts_y(["Выполнено"], x1_min=200.0)
+        if y_done is not None:
+            result["y"]["done"] = y_done
+
+        all_spans = []
+        for block in dt.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    bb = span.get("bbox")
+                    if bb and span.get("text"):
+                        all_spans.append({"text": span["text"], "bbox": bb})
+        for s in all_spans:
+            if "Исходящий" in s["text"] or "перевод СБП" in s["text"]:
+                result["center_heading"] = (s["bbox"][0] + s["bbox"][2]) / 2
+                break
     except Exception:
         pass
     return result

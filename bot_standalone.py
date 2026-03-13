@@ -59,6 +59,7 @@ from receipt_db import (
     get_bank_counts,
     load_index,
     add_receipt_to_index,
+    build_and_save,
     get_operation_id_from_pdf,
     COMMON_AMOUNTS,
     VTB_SUBTYPES,
@@ -102,7 +103,9 @@ CHANGELOG_TEXT = (
     "• Система заявок — после создания чека можно оформить заявку. "
     "В разделе «Заявки» — список, нажмите на заявку и выберите статус: В работе или Оплачено.\n\n"
     "• Полная замена ВТБ — режим «Все поля»: замена суммы, даты, ФИО плательщика/получателя, телефона и банка. "
-    "Замена ФИО и банка пока может работать некорректно."
+    "Замена ФИО и банка пока может работать некорректно.\n\n"
+    "• Автозамена ё→е, ‑→- — при вводе ФИО/телефона/банка символы заменяются автоматически, если structurally всё ок.\n\n"
+    "• Проверка базы — кнопка «Обновить индекс» для пересборки после ручного добавления чеков."
 )
 
 ZAYAVKI_DIR = Path(__file__).parent / "заявки"
@@ -319,12 +322,14 @@ def parse_amounts(text: str) -> tuple[int, int] | None:
     return None
 
 
-def _vtb_full_validate_text(text: str, field_name: str) -> str | None:
-    """Валидация текста. Вернуть None если ок, иначе сообщение об ошибке."""
+def _vtb_full_validate_text(text: str, field_name: str) -> tuple[str | None, str | None]:
+    """Валидация текста. Вернуть (None, None) если ок; (err_msg, suggested) при ошибке.
+    suggested — вариант с заменой ё→е, ‑→- (если применим)."""
     bad = get_unsupported_chars(text)
     if not bad:
-        return None
-    return format_unsupported_error(bad, field_name)
+        return None, None
+    suggested = suggest_replacement(text)
+    return format_unsupported_error(bad, field_name), suggested
 
 
 def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
@@ -366,6 +371,7 @@ def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req)
             phone=state.get("vtb_phone"),
             bank=state.get("vtb_bank"),
             amount=None,
+            account="*9483",
         )
         out_name = Path(state["file_name"]).stem + f"_{format_amount_display(state['vtb_amount']).replace(' ', '_')}.pdf"
         try:
@@ -500,6 +506,7 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
             bank=state.get("gen_bank"),
             amount=None,
             operation_id=state.get("gen_operation_id"),
+            account="*9483",
         )
         out_name = donor_path.stem + f"_{format_amount_display(amount_to).replace(' ', '_')}.pdf"
         del USER_STATE[uid]
@@ -577,12 +584,18 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             next_step("gen_recipient", "4️⃣ Получатель (ФИО):")
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Плательщик")
+        err, suggested = _vtb_full_validate_text(t, "Плательщик")
         if err:
-            send(err + (f"\n\n✅ Вариант: {suggest_replacement(t)}" if suggest_replacement(t) else ""))
-            return
-        state["gen_payer"] = t
-        next_step("gen_recipient", "4️⃣ Получатель (ФИО):")
+            if suggested:
+                state["gen_payer"] = suggested
+                send(f"✅ Применена замена (ё→е): {suggested}")
+                next_step("gen_recipient", "4️⃣ Получатель (ФИО):")
+            else:
+                send(err)
+                return
+        else:
+            state["gen_payer"] = t
+            next_step("gen_recipient", "4️⃣ Получатель (ФИО):")
 
     elif awaiting == "gen_recipient":
         t = text.strip().lower()
@@ -591,12 +604,18 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             next_step("gen_phone", "5️⃣ Телефон получателя:")
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Получатель")
+        err, suggested = _vtb_full_validate_text(t, "Получатель")
         if err:
-            send(err + (f"\n\n✅ Вариант: {suggest_replacement(t)}" if suggest_replacement(t) else ""))
-            return
-        state["gen_recipient"] = t
-        next_step("gen_phone", "5️⃣ Телефон получателя:")
+            if suggested:
+                state["gen_recipient"] = suggested
+                send(f"✅ Применена замена (ё→е): {suggested}")
+                next_step("gen_phone", "5️⃣ Телефон получателя:")
+            else:
+                send(err)
+                return
+        else:
+            state["gen_recipient"] = t
+            next_step("gen_phone", "5️⃣ Телефон получателя:")
 
     elif awaiting == "gen_operation_id":
         t = text.strip().replace(" ", "").replace("\n", "")
@@ -619,12 +638,18 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             next_step("gen_bank", "6️⃣ Банк получателя:")
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Телефон")
+        err, suggested = _vtb_full_validate_text(t, "Телефон")
         if err:
-            send(err + (f"\n\n✅ Вариант: {suggest_replacement(t)}" if suggest_replacement(t) else ""))
-            return
-        state["gen_phone"] = t
-        next_step("gen_bank", "6️⃣ Банк получателя:")
+            if suggested:
+                state["gen_phone"] = suggested
+                send(f"✅ Применена замена: {suggested}")
+                next_step("gen_bank", "6️⃣ Банк получателя:")
+            else:
+                send(err)
+                return
+        else:
+            state["gen_phone"] = t
+            next_step("gen_bank", "6️⃣ Банк получателя:")
 
     elif awaiting == "gen_bank":
         t = text.strip().lower()
@@ -633,12 +658,18 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Банк")
+        err, suggested = _vtb_full_validate_text(t, "Банк")
         if err:
-            send(err + (f"\n\n✅ Вариант: {suggest_replacement(t)}" if suggest_replacement(t) else ""))
-            return
-        state["gen_bank"] = t
-        next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
+            if suggested:
+                state["gen_bank"] = suggested
+                send(f"✅ Применена замена: {suggested}")
+                next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
+            else:
+                send(err)
+                return
+        else:
+            state["gen_bank"] = t
+            next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
 
 
 def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
@@ -681,13 +712,18 @@ def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: d
             next_step("vtb_recipient", "4️⃣ Получатель (ФИО):")
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Плательщик")
+        err, suggested = _vtb_full_validate_text(t, "Плательщик")
         if err:
-            suggested = suggest_replacement(t)
-            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
-            return
-        state["vtb_payer"] = t
-        next_step("vtb_recipient", "4️⃣ Получатель (ФИО):")
+            if suggested:
+                state["vtb_payer"] = suggested
+                send(f"✅ Применена замена (ё→е): {suggested}")
+                next_step("vtb_recipient", "4️⃣ Получатель (ФИО):")
+            else:
+                send(err)
+                return
+        else:
+            state["vtb_payer"] = t
+            next_step("vtb_recipient", "4️⃣ Получатель (ФИО):")
 
     elif awaiting == "vtb_recipient":
         t = text.strip().lower()
@@ -696,13 +732,18 @@ def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: d
             next_step("vtb_phone", "5️⃣ Телефон получателя:")
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Получатель")
+        err, suggested = _vtb_full_validate_text(t, "Получатель")
         if err:
-            suggested = suggest_replacement(t)
-            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
-            return
-        state["vtb_recipient"] = t
-        next_step("vtb_phone", "5️⃣ Телефон получателя:")
+            if suggested:
+                state["vtb_recipient"] = suggested
+                send(f"✅ Применена замена (ё→е): {suggested}")
+                next_step("vtb_phone", "5️⃣ Телефон получателя:")
+            else:
+                send(err)
+                return
+        else:
+            state["vtb_recipient"] = t
+            next_step("vtb_phone", "5️⃣ Телефон получателя:")
 
     elif awaiting == "vtb_phone":
         t = text.strip().lower()
@@ -711,13 +752,18 @@ def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: d
             next_step("vtb_bank", "6️⃣ Банк получателя:")
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Телефон")
+        err, suggested = _vtb_full_validate_text(t, "Телефон")
         if err:
-            suggested = suggest_replacement(t)
-            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
-            return
-        state["vtb_phone"] = t
-        next_step("vtb_bank", "6️⃣ Банк получателя:")
+            if suggested:
+                state["vtb_phone"] = suggested
+                send(f"✅ Применена замена: {suggested}")
+                next_step("vtb_bank", "6️⃣ Банк получателя:")
+            else:
+                send(err)
+                return
+        else:
+            state["vtb_phone"] = t
+            next_step("vtb_bank", "6️⃣ Банк получателя:")
 
     elif awaiting == "vtb_bank":
         t = text.strip().lower()
@@ -727,10 +773,14 @@ def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: d
             _run_vtb_full_patch(token, uid, chat_id, state, tg_req)
             return
         t = text.strip()
-        err = _vtb_full_validate_text(t, "Банк")
+        err, suggested = _vtb_full_validate_text(t, "Банк")
         if err:
-            suggested = suggest_replacement(t)
-            send(err + (f"\n\n✅ Вариант с заменой: {suggested}" if suggested else ""))
+            if suggested:
+                state["vtb_bank"] = suggested
+                send(f"✅ Применена замена: {suggested}\n⏳ Обрабатываю чек...")
+                _run_vtb_full_patch(token, uid, chat_id, state, tg_req)
+                return
+            send(err)
             return
         state["vtb_bank"] = t
         send("⏳ Обрабатываю чек...")
@@ -1083,17 +1133,39 @@ def run_bot(token: str) -> None:
                         "text": (
                             f"📂 Проверка базы\n\n"
                             f"СБП: {n_sbp} | ВТБ на ВТБ: {n_vtb} | Альфа: {n_alfa}\n\n"
-                            "Чтобы добавить чек: выберите тип, затем загрузите PDF."
+                            "Чтобы добавить чек: выберите тип, затем загрузите PDF.\n"
+                            "Если добавили файлы вручную — нажмите «Обновить индекс»."
                         ),
                         "reply_markup": json.dumps({
                             "inline_keyboard": [
                                 [{"text": "📋 СБП", "callback_data": "db_list_vtb_sbp"}, {"text": "➕ СБП", "callback_data": "db_add_vtb_sbp"}],
                                 [{"text": "📋 ВТБ→ВТБ", "callback_data": "db_list_vtb_vtb"}, {"text": "➕ ВТБ→ВТБ", "callback_data": "db_add_vtb_vtb"}],
                                 [{"text": "📋 Альфа", "callback_data": "db_list_alfa"}, {"text": "➕ Альфа", "callback_data": "db_add_alfa"}],
+                                [{"text": "🔄 Обновить индекс", "callback_data": "db_rebuild"}],
                                 [{"text": "⬅️ Назад", "callback_data": "main_back"}],
                             ],
                         }),
                     })
+                    continue
+                if q["data"] == "db_rebuild":
+                    try:
+                        idx = build_and_save()
+                        n_sbp = len(idx.get("vtb_sbp", {}))
+                        n_vtb = len(idx.get("vtb_vtb_vtb", {}))
+                        n_alfa = len(idx.get("alfa", {}))
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": f"✅ Индекс обновлён\n\nСБП: {n_sbp} | ВТБ на ВТБ: {n_vtb} | Альфа: {n_alfa}",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ К базе", "callback_data": "main_db"}]]}),
+                        })
+                    except Exception as e:
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": f"⚠️ Ошибка: {e}",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_db"}]]}),
+                        })
                     continue
                 if q["data"] in ("db_add_vtb_sbp", "db_add_vtb_vtb", "db_add_alfa"):
                     if "vtb_sbp" in q["data"]:

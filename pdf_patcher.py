@@ -93,9 +93,10 @@ def count_glyphs(tj: bytes) -> int:
     return 1 + tj.count(b"-11.11111") + tj.count(b"-16.66667")
 
 
-# Ширина глифа для выравнивания: рубль (₽) должен оставаться на месте, сумма уходит влево
-# VTB 50→5000: delta 19.6 для 3 глифов ≈ 6.5 pts; 8.5 даёт перекос влево
+# Ширина глифа: kern -11.11111 (VTB) ≈ 9 pts, -16.66667 ≈ 6.5 pts
+# Скан 09-03-26_03-47: '1 000 ₽' pts=9.025
 PTS_PER_GLYPH = 6.5
+PTS_PER_GLYPH_VTB = 9.0  # сумма ВТБ: правый край на уровне «Выполнено»
 
 
 def compute_tm_shift(old_glyphs: int, new_glyphs: int, pts_per_glyph: float = PTS_PER_GLYPH) -> float:
@@ -173,24 +174,25 @@ def patch_amount(
         if not content_changed:
             continue
 
-        # Tm: сдвиг влево при удлинении суммы
-        old_glyphs = count_glyphs(matched_old)
-        new_glyphs = count_glyphs(matched_new)
-        for pattern in (rb"1 0 0 1 ([\d.]+) (72\.37499) Tm", rb"1 0 0 1 ([\d.]+) (120\.74999) Tm"):
-            match = re.search(pattern, dec)
-            if match:
-                try:
-                    x = float(match.group(1))
-                except ValueError:
-                    continue
-                y_part = match.group(2).decode()
-                shift = compute_tm_shift(old_glyphs, new_glyphs)
-                new_x = x - shift
-                new_tm = f"1 0 0 1 {new_x:.5f} {y_part} Tm".encode()
-                old_tm = match.group(0)
-                if abs(new_x - x) > 0.01:
-                    dec = dec.replace(old_tm, new_tm, 1)
-                break
+        # Tm: для ВТБ (-11.11111) не меняем — patch_from_values выровняет по wall
+        if b"-11.11111" not in matched_old:
+            old_glyphs = count_glyphs(matched_old)
+            new_glyphs = count_glyphs(matched_new)
+            for pattern in (rb"1 0 0 1 ([\d.]+) (72\.37499) Tm", rb"1 0 0 1 ([\d.]+) (120\.74999) Tm"):
+                match = re.search(pattern, dec)
+                if match:
+                    try:
+                        x = float(match.group(1))
+                    except ValueError:
+                        continue
+                    y_part = match.group(2).decode()
+                    shift = compute_tm_shift(old_glyphs, new_glyphs)
+                    new_x = x - shift
+                    new_tm = f"1 0 0 1 {new_x:.5f} {y_part} Tm".encode()
+                    old_tm = match.group(0)
+                    if abs(new_x - x) > 0.01:
+                        dec = dec.replace(old_tm, new_tm, 1)
+                    break
 
         new_raw = zlib.compress(dec, zlib_level)
         delta = len(new_raw) - stream_len

@@ -237,12 +237,13 @@ def get_bank_report(required_chars: set[str], bank: str, index: dict | None = No
     return missing, len(bank_data), all_chars
 
 
-def find_donor(required_chars: set[str], bank: str, index: dict | None = None) -> tuple[Path | None, int | None]:
-    """Найти чек, где required_chars ⊆ chars чека.
-    Возвращает (Path к PDF, amount_from в чеке) или (None, None)."""
+def find_all_donors(required_chars: set[str], bank: str, index: dict | None = None) -> list[tuple[Path, int | None]]:
+    """Найти все чеки, где required_chars ⊆ chars чека.
+    Возвращает список (Path, amount_from)."""
     idx = index or load_index()
     bank_data = _get_bank_data(idx, bank)
     required = {_normalize_char(c) for c in required_chars}
+    result = []
     for key, val in bank_data.items():
         if isinstance(val, dict):
             chars_list = val.get("chars", [])
@@ -257,8 +258,15 @@ def find_donor(required_chars: set[str], bank: str, index: dict | None = None) -
                 path = BASE_DIR / key
             if path.exists():
                 am = amount if amount is not None else get_receipt_amount(path)
-                return path, am
-    return None, None
+                result.append((path, am))
+    return result
+
+
+def find_donor(required_chars: set[str], bank: str, index: dict | None = None) -> tuple[Path | None, int | None]:
+    """Найти чек, где required_chars ⊆ chars чека.
+    Возвращает (Path к PDF, amount_from в чеке) или (None, None)."""
+    donors = find_all_donors(required_chars, bank, index)
+    return (donors[0][0], donors[0][1]) if donors else (None, None)
 
 
 def add_receipt_to_index(pdf_path: str | Path, bank: str, subtype: str | None = None) -> bool:

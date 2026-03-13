@@ -3,6 +3,13 @@
 
 Меняй значения в vtb_config.json — выравнивание сохранится.
 
+СИСТЕМА КООРДИНАТ (зафиксирована):
+- Правый столбец: последняя буква на wall. tm_x = wall - real_text_width.
+- real_text_width — из /W CIDFontType2 + кернинга TJ.
+- Шапка (ФИО под «Исходящий перевод СБП»): центрирование по center_heading.
+- Сумма: font-size 13.5 → new_x = wall - new_units * (13.5/1000).
+- Fallback: tm_x_touch_wall(wall, n_glyphs, pts).
+
 Использование:
   python3 vtb_patch_from_config.py [input.pdf]
   python3 vtb_patch_from_config.py --config vtb_config.json input.pdf
@@ -13,14 +20,76 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from vtb_test_generator import (
-    PTS_CALIBRATION,
-    build_tj,
-    build_date_tj,
-    tm_x_touch_wall,
-)
-from vtb_sber_reference import get_vtb_per_field_params
+from vtb_test_generator import build_tj, build_date_tj, tm_x_touch_wall
+from vtb_sber_reference import get_vtb_per_field_params, get_field_align_raw
 from vtb_cmap import text_to_cids, format_amount, operation_id_to_cids
+from vtb_sbp_layout import get_layout_values
+
+
+def _parse_cid_widths(pdf_bytes: bytes) -> dict[int, int]:
+    """Парсит /W массива CIDFontType2: CID -> width."""
+    m = re.search(rb"/W\s*\[(.*?)\]\s*/CIDToGIDMap", pdf_bytes, re.DOTALL)
+    if not m:
+        return {}
+    tokens = re.findall(rb"\[|\]|\d+", m.group(1))
+    widths: dict[int, int] = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in (b"[", b"]"):
+            i += 1
+            continue
+        start = int(tok)
+        if i + 1 < len(tokens) and tokens[i + 1] == b"[":
+            i += 2
+            cid = start
+            while i < len(tokens) and tokens[i] != b"]":
+                widths[cid] = int(tokens[i])
+                cid += 1
+                i += 1
+            i += 1
+            continue
+        i += 1
+    return widths
+
+
+def _tj_advance_units(tj_content: bytes, cid_widths: dict[int, int]) -> float:
+    """Ширина TJ в units: sum(widths[cid]) - sum(kern)."""
+    total = 0.0
+
+    def _unescape_pdf_literal(raw: bytes) -> bytes:
+        out = bytearray()
+        i = 0
+        while i < len(raw):
+            b = raw[i]
+            if b == 0x5C and i + 1 < len(raw):  # backslash
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            out.append(b)
+            i += 1
+        return bytes(out)
+
+    for string_part, kern_part in re.findall(rb"\((.*?)\)|(-?\d+(?:\.\d+)?)", tj_content):
+        if string_part:
+            vals = list(_unescape_pdf_literal(string_part))
+            if len(vals) % 2 != 0:
+                continue
+            for i in range(0, len(vals), 2):
+                cid = (vals[i] << 8) + vals[i + 1]
+                total += cid_widths.get(cid, 0)
+        elif kern_part:
+            total -= float(kern_part)
+    return total
+
+
+def _fallback_pts(tj: bytes) -> float:
+    """Fallback pts по керну: один параметр на тип кернинга."""
+    if b"-11.11111" in tj:
+        return 6.75
+    if b"-21.42857" in tj:
+        return 4.5   # центрированный получатель: было 4.2, съезжал вправо
+    return 4.5       # ФИО и др.: было 4.6, съезжали влево
 
 
 def build_amount_tj(amount: int) -> bytes:
@@ -30,6 +99,81 @@ def build_amount_tj(amount: int) -> bytes:
     if not cids:
         raise ValueError(f"Не удалось закодировать сумму: {s}")
     return b"[" + build_tj(cids, kern="-11.11111") + b"]"
+
+
+def patch_amount_only(data: bytearray, pdf_path: Path, amount: int) -> bytes:
+    """Замена только суммы. Остальное не трогает, /ID не меняет."""
+    params = get_vtb_per_field_params(pdf_path)
+    layout = get_layout_values()
+    raw_y = layout.get("y", {}).get("amount")
+    y_amount = raw_y if isinstance(raw_y, (int, float)) else (raw_y[0] if raw_y else 72.375)
+    y_tol = max(layout.get("y_tolerance", 0.15), 1.0)
+    wall = params.get("wall") or layout.get("wall", 257.08)
+    cid_widths = _parse_cid_widths(pdf_path.read_bytes())
+    new_amount_tj = build_amount_tj(amount)
+    new_content = new_amount_tj[1:-1]
+
+    for m in re.finditer(rb"<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n", data, re.DOTALL):
+        stream_len = int(m.group(2))
+        stream_start = m.end()
+        len_num_start = m.start(2)
+        if stream_start + stream_len > len(data):
+            continue
+        try:
+            dec = __import__("zlib").decompress(bytes(data[stream_start : stream_start + stream_len]))
+        except Exception:
+            continue
+        if b"BT" not in dec:
+            continue
+
+        amt_pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)(\s*\r?\n[^\[]*)?\[([^\]]+)\]\s*TJ"
+        for amt_m in re.finditer(amt_pat, dec):
+            if abs(float(amt_m.group(4)) - y_amount) > y_tol:
+                continue
+            tm_x = float(amt_m.group(2))
+            if tm_x < 100:
+                continue
+            tj_content = amt_m.group(6)
+            if b"-11.11111" not in tj_content:
+                continue
+
+            new_units = _tj_advance_units(new_content, cid_widths)
+            if new_units > 0:
+                new_x_amt = wall - new_units * (13.5 / 1000.0)
+            else:
+                n_amt = 1 + tj_content.count(b"-11.11111")
+                pts_amt = (wall - float(amt_m.group(2))) / n_amt if n_amt > 0 else 6.75
+                if pts_amt <= 0 or pts_amt > 15:
+                    pts_amt = 6.75
+                new_x_amt = tm_x_touch_wall(wall, n_amt, pts_amt)
+
+            between = amt_m.group(5) or b"\n"
+            repl = amt_m.group(1) + f"{new_x_amt:.5f}".encode() + amt_m.group(3) + between + b"[" + new_content + b"] TJ"
+            new_dec = dec.replace(amt_m.group(0), repl)
+            new_raw = __import__("zlib").compress(new_dec, 6)
+            delta = len(new_raw) - stream_len
+            data = bytearray(data[:stream_start] + new_raw + data[stream_start + stream_len :])
+            old_len_str = str(stream_len).encode()
+            new_len_str = str(len(new_raw)).encode()
+            num_end = len_num_start + len(old_len_str)
+            data = data[:len_num_start] + new_len_str + data[num_end:]
+            if len(new_len_str) != len(old_len_str):
+                delta += len(new_len_str) - len(old_len_str)
+            xref_m = re.search(rb"xref\r?\n(\d+)\s+(\d+)\r?\n((?:\d{10}\s+\d{5}\s+[nf]\s*\r?\n)+)", data)
+            if xref_m:
+                entries = bytearray(xref_m.group(3))
+                for em in re.finditer(rb"(\d{10})(\s+\d{5}\s+[nf]\s*\r?\n)", entries):
+                    offset = int(em.group(1))
+                    if offset > stream_start:
+                        entries[em.start(1) : em.start(1) + 10] = f"{offset + delta:010d}".encode()
+                data[xref_m.start(3) : xref_m.end(3)] = bytes(entries)
+            startxref_m = re.search(rb"startxref\r?\n(\d+)\r?\n", data)
+            if startxref_m and delta != 0:
+                pos = startxref_m.start(1)
+                old_pos = int(startxref_m.group(1))
+                data[pos : pos + len(str(old_pos))] = str(old_pos + delta).encode()
+            return bytes(data)
+    raise ValueError("Блок суммы (kern -11.11111) не найден")
 
 
 def build_text_tj(text: str, kern: str = "-16.66667", wrap: bool = True) -> bytes:
@@ -52,33 +196,49 @@ def patch_from_values(
     bank: str | None = None,
     amount: int | None = None,
     operation_id: str | None = None,
+    account: str | None = None,
     keep_metadata: bool = False,
+    keep_date: bool = False,
 ) -> bytes:
-    """Патч с кастомными значениями. Использует OLD из 09-03-26_03-47."""
+    """Патч: wall и pts из донора; pts из блока при замене по Y."""
     params = get_vtb_per_field_params(pdf_path)
-    wall = params["wall"]
-    pts = dict(PTS_CALIBRATION)
-    for k, pk in [("date", "pts_date"), ("payer", "pts_payer"), ("recipient", "pts_recipient"), ("amount", "pts_amount"), ("phone", "pts_phone"), ("bank", "pts_bank"), ("opid", "pts_opid")]:
-        if params.get(pk) is not None:
-            pts[k] = params[pk]
+    layout = get_layout_values()
+    raw = get_field_align_raw(pdf_path)
+    cid_widths = _parse_cid_widths(pdf_path.read_bytes())
+    wall = params.get("wall") or layout["wall"]
+    center_heading = params.get("center_heading") or layout["center_heading"]
+    ly = layout["y"]
+    y_tol = layout["y_tolerance"]
 
-    # Парсим дату
-    if date_str == "now" or date_str is None:
-        dt = datetime.now()
-    elif isinstance(date_str, datetime):
-        dt = date_str
+    def _y_list(field: str) -> tuple[list[float], float]:
+        """Y для сопоставления: из донора если есть, иначе layout. tol: 0.5 для донора, 2.0 для layout."""
+        raw_y = raw.get("y", {}).get(field)
+        v = ly.get(field)
+        layout_ys = list(v) if isinstance(v, (list, tuple)) else [v]
+        if raw_y is not None:
+            return [raw_y], 0.5
+        return layout_ys, 2.0
+
+    # Парсим дату (keep_date=True — не трогать дату, минимум изменений)
+    if keep_date:
+        new_date_tj = None
     else:
-        try:
-            dt = datetime.strptime(date_str.strip(), "%d.%m.%Y, %H:%M")
-        except ValueError:
+        if date_str == "now" or date_str is None:
             dt = datetime.now()
-
-    new_date_tj = build_date_tj(dt)
+        elif isinstance(date_str, datetime):
+            dt = date_str
+        else:
+            try:
+                dt = datetime.strptime(date_str.strip(), "%d.%m.%Y, %H:%M")
+            except ValueError:
+                dt = datetime.now()
+        new_date_tj = build_date_tj(dt)
     new_payer_tj = build_text_tj(payer, wrap=False) if payer else None
     new_recipient_tj = build_text_tj(recipient, wrap=True) if recipient else None
     new_recipient_21 = build_text_tj(recipient, kern="-21.42857", wrap=True) if recipient else None
     new_phone_tj = build_text_tj(phone, wrap=True) if phone else None
     new_bank_tj = build_text_tj(bank, wrap=True) if bank else None
+    new_account_tj = build_text_tj(account, wrap=True) if account else None
     new_amount_tj = build_amount_tj(amount) if amount else None
     new_opid_tj = None
     if operation_id and operation_id_to_cids(operation_id.replace(" ", "").replace("\n", "")):
@@ -137,98 +297,272 @@ def patch_from_values(
 
         new_dec = dec
 
-        def replace_field_by_y(dec: bytes, y_vals: list[str], new_tj: bytes, pts_key: str) -> bytes:
-            """Заменить поле по y-координате Tm. y_vals — варианты y (напр. 275.25, 275.2)."""
-            for y_val in y_vals:
-                pat = rb"(1 0 0 1 )([\d.]+)( " + y_val.encode() + rb" Tm)\s*\[([^\]]*)\](\s*TJ)"
-                mt = re.search(pat, dec)
-                if mt:
-                    new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
-                    n = n_glyphs(b"[" + new_content + b"]")
-                    new_x = tm_x_touch_wall(wall, n, pts.get(pts_key, PTS_CALIBRATION.get(pts_key, 4.5)))
-                    repl = mt.group(1) + f"{new_x:.5f}".encode() + mt.group(3) + b" [" + new_content + b"]" + mt.group(5)
-                    return dec.replace(mt.group(0), repl)
+        def replace_field_by_y(
+            dec: bytes, y_list: list[float], new_tj: bytes,
+            n_min: int = 0, n_max: int = 999, tol: float = 0.15,
+            exclude_y_list: list[float] | None = None,
+        ) -> bytes:
+            """Последний символ = wall. Ширина TJ считается по /W и кернингу."""
+            exclude_y = exclude_y_list or []
+            pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)\s*\[([^\]]*)\](\s*TJ)"
+            for mt in re.finditer(pat, dec):
+                tm_x = float(mt.group(2))
+                y = float(mt.group(4))
+                if tm_x < 50:
+                    continue
+                if exclude_y and any(abs(y - ey) < 2.0 for ey in exclude_y):
+                    continue
+                if not any(abs(y - vy) < tol for vy in y_list):
+                    continue
+                old_content = mt.group(5)
+                n_old = n_glyphs(b"[" + old_content + b"]")
+                if n_old <= 0 or not (n_min <= n_old <= n_max):
+                    continue
+                new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
+                old_units = _tj_advance_units(old_content, cid_widths)
+                new_units = _tj_advance_units(new_content, cid_widths)
+                if old_units > 0 and new_units > 0:
+                    scale = (wall - tm_x) / old_units
+                    new_x = wall - new_units * scale
+                else:
+                    p = (wall - tm_x) / n_old
+                    if p <= 0 or p > 15:
+                        p = _fallback_pts(new_tj)
+                    n_new = n_glyphs(b"[" + new_content + b"]")
+                    new_x = tm_x_touch_wall(wall, n_new, p)
+                repl = mt.group(1) + f"{new_x:.5f}".encode() + mt.group(3) + b" [" + new_content + b"]" + mt.group(6)
+                return dec.replace(mt.group(0), repl)
+            return dec
+
+        def find_tm_by_y(dec: bytes, y_list: list[float], tol: float):
+            """Найти Tm+TJ по Y с допуском. Возвращает re.Match или None."""
+            pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)\s*\[([^\]]*)\](\s*TJ)"
+            for m in re.finditer(pat, dec):
+                y = float(m.group(4))
+                if any(abs(y - vy) < tol for vy in y_list):
+                    return m
+            return None
+
+        def replace_field_keep_tm(dec: bytes, y_list: list[float], new_tj: bytes, n_min: int = 0, n_max: int = 999, tol: float = 0.15) -> bytes:
+            """Заменить только TJ, Tm не трогать (для телефона: формат +7 (XXX) XXX-XX-XX фиксирован)."""
+            new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
+            n_new = n_glyphs(b"[" + new_content + b"]")
+            if not (n_min <= n_new <= n_max):
+                return dec
+            pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)\s*\[([^\]]*)\](\s*TJ)"
+            for mt in re.finditer(pat, dec):
+                y = float(mt.group(4))
+                if not any(abs(y - vy) < tol for vy in y_list):
+                    continue
+                old_content = mt.group(5)
+                n_old = n_glyphs(b"[" + old_content + b"]")
+                if n_old <= 0 or not (n_min <= n_old <= n_max):
+                    continue
+                repl = mt.group(0).replace(b"[" + old_content + b"]", b"[" + new_content + b"]")
+                return dec.replace(mt.group(0), repl)
+            return dec
+
+        def replace_field_by_y_centered(dec: bytes, y_list: list[float], new_tj: bytes) -> bytes:
+            """Центрирование под «Исходящий перевод СБП» по реальной ширине TJ."""
+            pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)\s*\[([^\]]*)\](\s*TJ)"
+            for mt in re.finditer(pat, dec):
+                tm_x = float(mt.group(2))
+                y = float(mt.group(4))
+                if tm_x < 50 or tm_x > 180:
+                    continue
+                if not any(abs(y - vy) < y_tol for vy in y_list):
+                    continue
+                old_content = mt.group(5)
+                n_old = n_glyphs(b"[" + old_content + b"]")
+                if n_old <= 0:
+                    continue
+                new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
+                old_units = _tj_advance_units(old_content, cid_widths)
+                new_units = _tj_advance_units(new_content, cid_widths)
+                if old_units > 0 and new_units > 0:
+                    scale = 2 * (center_heading - tm_x) / old_units
+                    new_x = center_heading - (new_units * scale) / 2
+                else:
+                    p = 2 * (center_heading - tm_x) / n_old if n_old > 0 else _fallback_pts(new_tj)
+                    if p <= 0 or p > 15:
+                        p = _fallback_pts(new_tj)
+                    n_new = n_glyphs(b"[" + new_content + b"]")
+                    new_x = center_heading - (n_new * p) / 2
+                repl = mt.group(1) + f"{new_x:.5f}".encode() + mt.group(3) + b" [" + new_content + b"]" + mt.group(6)
+                return dec.replace(mt.group(0), repl)
             return dec
 
         if new_date_tj:
-            out = replace_field_by_y(new_dec, ["275.25", "275.2"], new_date_tj, "date")
-            if out == new_dec and OLD_DATE in new_dec:
+            ys_date, tol_date = _y_list("date")
+            out = replace_field_by_y(new_dec, ys_date, new_date_tj, tol=max(y_tol, tol_date))
+            if out != new_dec:
+                new_dec = out
+            elif OLD_DATE in new_dec:
+                tm_date_m = find_tm_by_y(new_dec, ys_date, max(y_tol, tol_date))
                 new_dec = new_dec.replace(OLD_DATE, new_date_tj)
                 n = n_glyphs(new_date_tj)
-                if n != n_glyphs(OLD_DATE):
-                    tm_date_m = re.search(rb"(1 0 0 1 )([\d.]+)( 275\.25 Tm)", new_dec)
-                    if tm_date_m and float(tm_date_m.group(2)) > 100:
-                        new_x = tm_x_touch_wall(wall, n, pts["date"])
-                        new_dec = new_dec.replace(tm_date_m.group(0), tm_date_m.group(1) + f"{new_x:.5f}".encode() + tm_date_m.group(3))
-            else:
-                new_dec = out
+                if n != n_glyphs(OLD_DATE) and tm_date_m and float(tm_date_m.group(2)) > 100:
+                    old_units = _tj_advance_units(tm_date_m.group(5), cid_widths)
+                    new_units = _tj_advance_units(new_date_tj[1:-1], cid_widths)
+                    if old_units > 0 and new_units > 0:
+                        scale = (wall - float(tm_date_m.group(2))) / old_units
+                        new_x = wall - new_units * scale
+                    else:
+                        n_old = n_glyphs(b"[" + tm_date_m.group(5) + b"]")
+                        pts = (wall - float(tm_date_m.group(2))) / n_old if n_old > 0 else _fallback_pts(new_date_tj)
+                        if pts <= 0 or pts > 15:
+                            pts = _fallback_pts(new_date_tj)
+                        new_x = tm_x_touch_wall(wall, n, pts)
+                    tm_date_m2 = find_tm_by_y(new_dec, ys_date, max(y_tol, tol_date))
+                    if tm_date_m2:
+                        repl = tm_date_m2.group(1) + f"{new_x:.5f}".encode() + tm_date_m2.group(3) + b" [" + tm_date_m2.group(5) + b"]" + tm_date_m2.group(6)
+                        new_dec = new_dec.replace(tm_date_m2.group(0), repl)
 
         if new_payer_tj:
-            if OLD_PAYER in new_dec:
+            ys_payer, tol_payer = _y_list("payer")
+            exclude_rec = _y_list("recipient")[0]
+            out = replace_field_by_y(new_dec, ys_payer, new_payer_tj, tol=max(y_tol, tol_payer), exclude_y_list=exclude_rec)
+            if out != new_dec:
+                new_dec = out
+            elif OLD_PAYER in new_dec:
+                tm_payer_m = find_tm_by_y(new_dec, ys_payer, max(y_tol, tol_payer))
                 new_dec = new_dec.replace(OLD_PAYER, new_payer_tj)
                 n = n_glyphs(new_payer_tj)
-                new_x = tm_x_touch_wall(wall, n, pts["payer"])
-                tm_payer_m = re.search(rb"(1 0 0 1 )([\d.]+)( 227\.25 Tm)", new_dec)
                 if tm_payer_m and float(tm_payer_m.group(2)) > 50:
-                    new_dec = new_dec.replace(tm_payer_m.group(0), tm_payer_m.group(1) + f"{new_x:.5f}".encode() + tm_payer_m.group(3))
+                    old_units = _tj_advance_units(tm_payer_m.group(5), cid_widths)
+                    new_units = _tj_advance_units(new_payer_tj, cid_widths)
+                    if old_units > 0 and new_units > 0:
+                        scale = (wall - float(tm_payer_m.group(2))) / old_units
+                        new_x = wall - new_units * scale
+                    else:
+                        n_old = n_glyphs(b"[" + tm_payer_m.group(5) + b"]")
+                        pts = (wall - float(tm_payer_m.group(2))) / n_old if n_old > 0 else _fallback_pts(new_payer_tj)
+                        if pts <= 0 or pts > 15:
+                            pts = _fallback_pts(new_payer_tj)
+                        new_x = tm_x_touch_wall(wall, n, pts)
+                    tm_payer_m2 = find_tm_by_y(new_dec, ys_payer, max(y_tol, tol_payer))
+                    if tm_payer_m2:
+                        repl = tm_payer_m2.group(1) + f"{new_x:.5f}".encode() + tm_payer_m2.group(3) + b" [" + tm_payer_m2.group(5) + b"]" + tm_payer_m2.group(6)
+                        new_dec = new_dec.replace(tm_payer_m2.group(0), repl)
 
         if new_recipient_tj:
-            out = replace_field_by_y(new_dec, ["203.25", "203.2"], new_recipient_tj, "recipient")
+            ys_recipient, tol_recipient = _y_list("recipient")
+            exclude_pay = _y_list("payer")[0]
+            out = replace_field_by_y(new_dec, ys_recipient, new_recipient_tj, tol=max(y_tol, tol_recipient), exclude_y_list=exclude_pay)
             if out != new_dec:
                 new_dec = out
             elif OLD_RECIPIENT_16 in new_dec:
+                tm_rec_m = find_tm_by_y(new_dec, ys_recipient, max(y_tol, tol_recipient))
                 new_dec = new_dec.replace(OLD_RECIPIENT_16, new_recipient_tj)
                 n = n_glyphs(new_recipient_tj)
-                new_x = tm_x_touch_wall(wall, n, pts["recipient"])
-                tm_m = re.search(rb"(1 0 0 1 )([\d.]+)( 203\.25 Tm)", new_dec)
-                if tm_m and float(tm_m.group(2)) > 100:
-                    new_dec = new_dec.replace(tm_m.group(0), tm_m.group(1) + f"{new_x:.5f}".encode() + tm_m.group(3))
+                if tm_rec_m and float(tm_rec_m.group(2)) > 100:
+                    old_units = _tj_advance_units(tm_rec_m.group(5), cid_widths)
+                    new_units = _tj_advance_units(new_recipient_tj[1:-1], cid_widths)
+                    if old_units > 0 and new_units > 0:
+                        scale = (wall - float(tm_rec_m.group(2))) / old_units
+                        new_x = wall - new_units * scale
+                    else:
+                        n_old = n_glyphs(b"[" + tm_rec_m.group(5) + b"]")
+                        pts = (wall - float(tm_rec_m.group(2))) / n_old if n_old > 0 else _fallback_pts(new_recipient_tj)
+                        if pts <= 0 or pts > 15:
+                            pts = _fallback_pts(new_recipient_tj)
+                        new_x = tm_x_touch_wall(wall, n, pts)
+                    tm_rec_m2 = find_tm_by_y(new_dec, ys_recipient, max(y_tol, tol_recipient))
+                    if tm_rec_m2:
+                        repl = tm_rec_m2.group(1) + f"{new_x:.5f}".encode() + tm_rec_m2.group(3) + b" [" + tm_rec_m2.group(5) + b"]" + tm_rec_m2.group(6)
+                        new_dec = new_dec.replace(tm_rec_m2.group(0), repl)
             if new_recipient_21:
-                out327 = replace_field_by_y(new_dec, ["327.11249", "327.11", "327.2", "327.25", "327.43"], new_recipient_21, "recipient")
+                ys_centered, tol_centered = _y_list("centered")
+                out327 = replace_field_by_y_centered(new_dec, ys_centered, new_recipient_21)
                 if out327 != new_dec:
                     new_dec = out327
 
         if new_amount_tj:
-            if OLD_AMOUNT in new_dec:
-                new_dec = new_dec.replace(OLD_AMOUNT, new_amount_tj)
-            if new_amount_tj in new_dec:
-                n = n_glyphs(new_amount_tj)
-                new_x = tm_x_touch_wall(wall, n, pts["amount"])
-                if OLD_TM_AMOUNT in new_dec:
-                    new_dec = new_dec.replace(OLD_TM_AMOUNT, f"1 0 0 1 {new_x:.5f} 72.37499 Tm".encode())
+            pass
+
+        # Сумма: реальная ширина TJ из /W и кернинга. Только правый столбец (tm_x>100), не подпись «Сумма операции».
+        y_amount = _y_list("amount")[0][0]
+        amt_pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)(\s*\r?\n[^\[]*)?\[([^\]]+)\]\s*TJ"
+        for amt_m in re.finditer(amt_pat, new_dec):
+            if abs(float(amt_m.group(4)) - y_amount) > 0.1:
+                continue
+            if float(amt_m.group(2)) < 100:
+                continue
+            between = amt_m.group(5) or b"\n"
+            tj_content = amt_m.group(6)
+            if b"-11.11111" in tj_content:
+                new_content = new_amount_tj[1:-1] if new_amount_tj else tj_content
+                new_units = _tj_advance_units(new_content, cid_widths)
+                if new_units > 0:
+                    # Сумма в ВТБ всегда в font-size 13.5pt, поэтому можно считать напрямую.
+                    new_x_amt = wall - new_units * (13.5 / 1000.0)
                 else:
-                    tm_amt_m = re.search(rb"(1 0 0 1 )([\d.]+)( 72\.37499 Tm)", new_dec)
-                    if tm_amt_m and float(tm_amt_m.group(2)) > 50:
-                        new_dec = new_dec.replace(tm_amt_m.group(0), tm_amt_m.group(1) + f"{new_x:.5f}".encode() + tm_amt_m.group(3))
+                    n_amt = 1 + tj_content.count(b"-11.11111")
+                    pts_amt = (wall - float(amt_m.group(2))) / n_amt if n_amt > 0 else 6.75
+                    if pts_amt <= 0 or pts_amt > 15:
+                        pts_amt = 6.75
+                    new_x_amt = tm_x_touch_wall(wall, n_amt, pts_amt)
+                repl = amt_m.group(1) + f"{new_x_amt:.5f}".encode() + amt_m.group(3) + between + b"[" + new_content + b"] TJ"
+                new_dec = new_dec.replace(amt_m.group(0), repl)
+                break
+
+        if new_account_tj:
+            ys_account, tol_account = _y_list("account")
+            exclude_done = [raw["y"]["done"]] if raw.get("y", {}).get("done") is not None else []
+            out = replace_field_by_y(new_dec, ys_account, new_account_tj, n_min=4, n_max=6, tol=max(y_tol, tol_account), exclude_y_list=exclude_done)
+            if out != new_dec:
+                new_dec = out
 
         if new_phone_tj:
-            out = replace_field_by_y(new_dec, ["179.25", "179.2"], new_phone_tj, "phone")
+            ys_phone, tol_phone = _y_list("phone")
+            out = replace_field_by_y(new_dec, ys_phone, new_phone_tj, n_min=10, n_max=28, tol=max(y_tol, tol_phone))
             if out != new_dec:
                 new_dec = out
             elif OLD_PHONE in new_dec:
+                tm_phone_m = find_tm_by_y(new_dec, ys_phone, max(y_tol, tol_phone))
                 new_dec = new_dec.replace(OLD_PHONE, new_phone_tj)
-                n = n_glyphs(new_phone_tj)
-                if n != n_glyphs(OLD_PHONE):
-                    new_x = tm_x_touch_wall(wall, n, pts.get("phone", 4.57))
-                    tm_phone_m = re.search(rb"(1 0 0 1 )([\d.]+)( 179\.25 Tm)", new_dec)
-                    if tm_phone_m and float(tm_phone_m.group(2)) > 50:
-                        new_dec = new_dec.replace(tm_phone_m.group(0), tm_phone_m.group(1) + f"{new_x:.5f}".encode() + tm_phone_m.group(3))
+                if tm_phone_m and float(tm_phone_m.group(2)) > 50:
+                    old_units = _tj_advance_units(tm_phone_m.group(5), cid_widths)
+                    new_units = _tj_advance_units(new_phone_tj[1:-1], cid_widths)
+                    if old_units > 0 and new_units > 0:
+                        scale = (wall - float(tm_phone_m.group(2))) / old_units
+                        new_x = wall - new_units * scale
+                    else:
+                        n_old = n_glyphs(b"[" + tm_phone_m.group(5) + b"]")
+                        n = n_glyphs(new_phone_tj)
+                        pts = (wall - float(tm_phone_m.group(2))) / n_old if n_old > 0 else _fallback_pts(new_phone_tj)
+                        if pts <= 0 or pts > 15:
+                            pts = _fallback_pts(new_phone_tj)
+                        new_x = tm_x_touch_wall(wall, n, pts)
+                    tm_phone_m2 = find_tm_by_y(new_dec, ys_phone, max(y_tol, tol_phone))
+                    if tm_phone_m2:
+                        repl = tm_phone_m2.group(1) + f"{new_x:.5f}".encode() + tm_phone_m2.group(3) + b" [" + tm_phone_m2.group(5) + b"]" + tm_phone_m2.group(6)
+                        new_dec = new_dec.replace(tm_phone_m2.group(0), repl)
 
         if new_bank_tj:
-            out = replace_field_by_y(new_dec, ["155.25", "155.2"], new_bank_tj, "bank")
+            ys_bank, tol_bank = _y_list("bank")
+            out = replace_field_by_y(new_dec, ys_bank, new_bank_tj, n_min=7, n_max=16, tol=max(y_tol, tol_bank))
             if out != new_dec:
                 new_dec = out
             elif OLD_BANK in new_dec:
+                tm_bank_m = find_tm_by_y(new_dec, ys_bank, max(y_tol, tol_bank))
                 new_dec = new_dec.replace(OLD_BANK, new_bank_tj)
                 n = n_glyphs(new_bank_tj)
-                new_x = tm_x_touch_wall(wall, n, pts.get("bank", 5.09))
-                tm_bank_m = re.search(rb"(1 0 0 1 )([\d.]+)( 155\.25 Tm)", new_dec)
                 if tm_bank_m and float(tm_bank_m.group(2)) > 50:
-                    new_dec = new_dec.replace(tm_bank_m.group(0), tm_bank_m.group(1) + f"{new_x:.5f}".encode() + tm_bank_m.group(3))
+                    n_old = n_glyphs(b"[" + tm_bank_m.group(5) + b"]")
+                    pts = (wall - float(tm_bank_m.group(2))) / n_old if n_old > 0 else _fallback_pts(new_bank_tj)
+                    if pts <= 0 or pts > 15:
+                        pts = _fallback_pts(new_bank_tj)
+                    new_x = tm_x_touch_wall(wall, n, pts)
+                    tm_bank_m2 = find_tm_by_y(new_dec, ys_bank, max(y_tol, tol_bank))
+                    if tm_bank_m2:
+                        repl = tm_bank_m2.group(1) + f"{new_x:.5f}".encode() + tm_bank_m2.group(3) + b" [" + tm_bank_m2.group(5) + b"]" + tm_bank_m2.group(6)
+                        new_dec = new_dec.replace(tm_bank_m2.group(0), repl)
 
         if new_opid_tj:
-            pts["opid"] = pts.get("opid", 5.25)
-            out = replace_field_by_y(new_dec, ["297.43", "297.25", "297.4"], new_opid_tj, "opid")
+            ys_opid, tol_opid = _y_list("opid")
+            exclude_done = [raw["y"]["done"]] if raw.get("y", {}).get("done") is not None else []
+            out = replace_field_by_y(new_dec, ys_opid, new_opid_tj, n_min=15, tol=max(y_tol, tol_opid), exclude_y_list=exclude_done)
             if out != new_dec:
                 new_dec = out
 
@@ -237,9 +571,11 @@ def patch_from_values(
             delta = len(new_raw) - stream_len
             old_len_str = str(stream_len).encode()
             new_len_str = str(len(new_raw)).encode()
+            if len(new_len_str) != len(old_len_str):
+                delta += len(new_len_str) - len(old_len_str)
             data = bytearray(data[:stream_start] + new_raw + data[stream_start + stream_len :])
             num_end = len_num_start + len(old_len_str)
-            data[len_num_start:num_end] = new_len_str.ljust(len(old_len_str))[: len(old_len_str)]
+            data = data[:len_num_start] + new_len_str + data[num_end:]
             xref_m = re.search(rb"xref\r?\n(\d+)\s+(\d+)\r?\n((?:\d{10}\s+\d{5}\s+[nf]\s*\r?\n)+)", data)
             if xref_m:
                 entries = bytearray(xref_m.group(3))
@@ -278,11 +614,18 @@ def main():
     with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)
 
-    inp = Path(sys.argv[-1]) if sys.argv and not sys.argv[-1].startswith("-") else Path("/Users/aleksandrzerebatav/Downloads/09-03-26_03-47.pdf")
-    if not inp.exists():
-        inp = base / "Тест ВТБ" / "09-03-26_03-47_1.pdf"
-    if not inp.exists():
-        print(f"[ERROR] Файл не найден: {inp}")
+    pdf_args = [a for a in sys.argv[1:] if not a.startswith("-") and a != "--config" and not a.endswith(".json") and a.lower().endswith(".pdf")]
+    inp = Path(pdf_args[-1]) if pdf_args and Path(pdf_args[-1]).exists() else None
+    for fallback in [
+        Path("/Users/aleksandrzerebatav/Downloads/09-03-26_03-47.pdf"),
+        base / "Тест ВТБ" / "09-03-26_03-47_1.pdf",
+        *(list((base / "база_чеков" / "vtb" / "СБП").glob("*.pdf")) if (base / "база_чеков" / "vtb" / "СБП").exists() else []),
+    ]:
+        if not inp and fallback.exists() and str(fallback).lower().endswith(".pdf"):
+            inp = fallback
+            break
+    if not inp or not inp.exists():
+        print("[ERROR] Файл не найден. Укажите PDF: python3 vtb_patch_from_config.py donor.pdf")
         sys.exit(1)
 
     out_dir = base / cfg.get("output_folder", "10.03")
@@ -299,6 +642,8 @@ def main():
             phone=cfg.get("phone"),
             bank=cfg.get("bank"),
             amount=cfg.get("amount"),
+            operation_id=cfg.get("operation_id"),
+            account=cfg.get("account", "*9483"),
             keep_metadata=not cfg.get("update_id", True),
         )
     except ValueError as e:

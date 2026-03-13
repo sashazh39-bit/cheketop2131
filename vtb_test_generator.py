@@ -56,14 +56,23 @@ def update_creation_date(data: bytearray, new_date: str) -> bool:
 
 
 def build_tj(cids: list[str], kern: str = "-16.66667") -> bytes:
-    """Собрать TJ из CID hex-кодов. Последний элемент без пробела после керна."""
+    """Собрать TJ из CID hex-кодов. Формат как у донора: керн между глифами, НЕ после последнего."""
     kern_b = kern.encode()
     parts = []
+
+    def _pdf_literal_byte(b: int) -> bytes:
+        if b in (0x28, 0x29, 0x5C):  # (, ), backslash
+            return b"\\" + bytes([b])
+        return bytes([b])
+
     for i, cid_hex in enumerate(cids):
         cid = int(cid_hex, 16)
         h, l = cid >> 8, cid & 0xFF
-        s = bytes([0x28, h, l, 0x29])
-        parts.append(s + kern_b + (b" " if i < len(cids) - 1 else b""))
+        s = b"(" + _pdf_literal_byte(h) + _pdf_literal_byte(l) + b")"
+        if i < len(cids) - 1:
+            parts.append(s + kern_b + b" ")
+        else:
+            parts.append(s)
     return b"".join(parts)
 
 
@@ -91,17 +100,16 @@ def tm_x_touch_wall(wall: float, n_glyphs: int, pts: float) -> float:
     return wall - n_glyphs * pts
 
 
-# Калибровка для конкретных заменяемых строк (ширина глифов отличается от исходных).
-# Подобрано по результату: правый край всех полей = WALL.
-# Калибровка: правый край всех полей ≈ 257.1
+# Эталон: дата и телефон идеальны. Все последние символы на одной вертикали wall.
 PTS_CALIBRATION = {
     "date": 4.12,
-    "payer": 4.32,
-    "recipient": 4.20,
+    "payer": 4.08,
+    "recipient": 4.28,   # 4.20 уезжало вправо (столбец) и по центру
     "phone": 4.34,
     "bank": 4.60,
-    "amount": 5.95,
+    "amount": 5.92,      # 6.05 слишком вправо (50 000 ₽)
     "opid": 5.25,
+    "account": 5.25,
 }
 
 
