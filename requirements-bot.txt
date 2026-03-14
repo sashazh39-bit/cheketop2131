@@ -1,3 +1,3 @@
-# Минимум для bot_standalone.py (работает без этих, только stdlib)
-# PyMuPDF — опционально, для сканирования PDF на неподдерживаемые буквы
+# bot.py (python-telegram-bot) + bot_standalone.py (fallback)
+python-telegram-bot>=20.0
 PyMuPDF>=1.23.0

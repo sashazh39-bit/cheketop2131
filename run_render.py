@@ -14,6 +14,10 @@ PORT = int(os.environ.get("PORT", 10000))
 
 
 def run_bot():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        print("TELEGRAM_BOT_TOKEN не задан", flush=True)
+        return
     try:
         from receipt_db import build_and_save
         try:
@@ -21,12 +25,16 @@ def run_bot():
             print("receipt_index: build OK", flush=True)
         except Exception as e:
             print(f"receipt_index build: {e}", flush=True)
-        from bot_standalone import run_bot as _run_bot
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        if not token:
-            print("TELEGRAM_BOT_TOKEN не задан", flush=True)
-            return
-        _run_bot(token)
+        # bot.py — полный функционал, включая /create_statement (создание выписки)
+        from bot import main as bot_main
+        bot_main()
+    except ImportError as e:
+        print(f"bot.py недоступен ({e}), fallback на bot_standalone", flush=True)
+        try:
+            from bot_standalone import run_bot as _run_bot
+            _run_bot(token)
+        except Exception as e2:
+            print(f"Bot error: {e2}", flush=True)
     except Exception as e:
         print(f"Bot error: {e}", flush=True)
 
