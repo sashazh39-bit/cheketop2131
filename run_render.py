@@ -25,16 +25,8 @@ def run_bot():
             print("receipt_index: build OK", flush=True)
         except Exception as e:
             print(f"receipt_index build: {e}", flush=True)
-        # bot.py — полный функционал, включая /create_statement (создание выписки)
-        from bot import main as bot_main
-        bot_main()
-    except ImportError as e:
-        print(f"bot.py недоступен ({e}), fallback на bot_standalone", flush=True)
-        try:
-            from bot_standalone import run_bot as _run_bot
-            _run_bot(token)
-        except Exception as e2:
-            print(f"Bot error: {e2}", flush=True)
+        from bot_standalone import run_bot as _run_bot
+        _run_bot(token)
     except Exception as e:
         print(f"Bot error: {e}", flush=True)
 
@@ -52,15 +44,10 @@ if __name__ == "__main__":
         def log_message(self, format, *args):
             pass
 
-    # HTTP-сервер в фоне (health check для Render)
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-
-    def serve():
-        server.serve_forever()
-
-    http_thread = threading.Thread(target=serve, daemon=True)
-    http_thread.start()
     print(f"Listening on 0.0.0.0:{PORT}", flush=True)
 
-    # Бот в главном потоке — python-telegram-bot и asyncio требуют main thread
-    run_bot()
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    server.serve_forever()

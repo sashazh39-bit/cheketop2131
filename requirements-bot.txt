@@ -1,3 +1,2 @@
-# bot.py (python-telegram-bot) + bot_standalone.py (fallback)
-python-telegram-bot>=20.0
+# bot_standalone.py + vyписка_service, receipt_extractor
 PyMuPDF>=1.23.0

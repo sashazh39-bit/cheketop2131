@@ -87,12 +87,14 @@ MAIN_MENU_TEXT = (
     "👋 Главная\n\n"
     "📄 Загрузить чек — отправьте PDF и измените сумму/ФИО.\n"
     "✨ Сгенерировать — чек из базы без загрузки.\n"
+    "📋 Создать выписку — редактирование или по чеку.\n"
     "📂 Проверка базы — просмотр и добавление чеков-доноров.\n"
     "📋 Заявки — просмотр и смена статусов."
 )
 MAIN_MENU_KB = [
     [{"text": "📄 Загрузить чек", "callback_data": "main_new"}],
     [{"text": "✨ Сгенерировать", "callback_data": "main_generate"}],
+    [{"text": "📋 Создать выписку", "callback_data": "main_stmt"}],
     [{"text": "📂 Проверка базы", "callback_data": "main_db"}],
     [{"text": "📋 Заявки", "callback_data": "main_zayavki"}],
     [{"text": "📝 Последние изменения", "callback_data": "main_changelog"}],
@@ -319,6 +321,26 @@ def parse_amounts(text: str) -> tuple[int, int] | None:
     nums = re.findall(r"\d+", text.strip())
     if len(nums) >= 2:
         return int(nums[0]), int("".join(nums[1:]))
+    return None
+
+
+def parse_amount_pairs(text: str) -> list[tuple[int, int]]:
+    """Разбор '10 5000 50 1000' → [(10, 5000), (50, 1000)]."""
+    nums = re.findall(r"\d+", text.strip())
+    pairs = []
+    i = 0
+    while i + 1 < len(nums):
+        pairs.append((int(nums[i]), int(nums[i + 1])))
+        i += 2
+    return pairs
+
+
+def parse_custom_replacement(text: str) -> tuple[str, str] | None:
+    """Разбор 'поле=значение' → (поле, значение)."""
+    text = text.strip()
+    if "=" in text:
+        k, _, v = text.partition("=")
+        return (k.strip().lower(), v.strip()) if k.strip() and v.strip() else None
     return None
 
 
@@ -680,6 +702,113 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
 
 
+def _handle_stmt_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
+    """Обработка текста в режиме выписки."""
+    state = USER_STATE[uid]
+    mode = state.get("mode", "")
+    step = state.get("step", "")
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    if mode == "statement_edit":
+        if step == "amounts":
+            pairs = parse_amount_pairs(text)
+            if not pairs:
+                send("❌ Неверный формат. Введите: 10 10000 или 10 5000 50 1000")
+                return
+            try:
+                from vyписка_service import calculate_balance_and_expenses
+            except ImportError:
+                send("❌ Модуль выписки недоступен")
+                return
+            amounts = [(p[0], p[1]) for p in pairs]
+            USER_STATE[uid]["replacements"] = {"amounts": amounts}
+            USER_STATE[uid]["step"] = "confirm"
+            trans = list(state.get("transactions", []))
+            amount_map = {int(p[0]): p[1] for p in amounts}
+            trans_replaced = [float(amount_map.get(int(t), t)) for t in trans if t > 0]
+            balance_end, expenses = calculate_balance_and_expenses(trans_replaced, 55242.65)
+            kb = json.dumps({
+                "inline_keyboard": [
+                    [{"text": "⏭ Пропустить", "callback_data": "stmt_skip"}, {"text": "➡️ Далее", "callback_data": "stmt_next"}],
+                    [{"text": "➕ Свои замены", "callback_data": "stmt_custom"}],
+                ],
+            })
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"✅ Замены: {amounts}\n\n📊 Расходы: {expenses:.2f} ₽\n📊 Баланс на конец: {balance_end:.2f} ₽\n\nПропустить / Далее или + свои замены", "reply_markup": kb})
+            return
+        if step == "custom":
+            parsed = parse_custom_replacement(text)
+            if not parsed:
+                send("❌ Формат: поле=значение (ФИО=..., баланс_начало=..., телефон=...)")
+                return
+            key, value = parsed
+            repl = USER_STATE[uid].setdefault("replacements", {})
+            if key in ("fio", "фио"):
+                try:
+                    from vyписка_service import get_missing_chars
+                    fp = Path(USER_STATE[uid]["file_path"])
+                    missing = get_missing_chars(fp, value)
+                    if missing:
+                        kb = json.dumps({"inline_keyboard": [[{"text": "🔄 Повторить", "callback_data": "stmt_retry_fio"}, {"text": "⏭ Без замены ФИО", "callback_data": "stmt_skip_fio"}]]})
+                        send(f"⚠️ Недоступные символы: {''.join(missing)}\nПовторите или пропустите.")
+                        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "Выберите:", "reply_markup": kb})
+                        USER_STATE[uid]["pending_fio"] = value
+                        return
+                except ImportError:
+                    pass
+                repl["fio"] = value
+            elif key in ("баланс_начало", "balance_start", "balance"):
+                try:
+                    repl["balance_start"] = float(value.replace(",", "."))
+                except ValueError:
+                    send("❌ Введите число для баланса.")
+                    return
+            elif key in ("телефон", "phone"):
+                repl["phone"] = value
+            elif key in ("номер_заявки", "application_id"):
+                repl["application_id"] = value
+            send(f"✅ Добавлено: {key}={value}\nВведите ещё или нажмите Далее.")
+
+    elif mode == "statement_from_receipt" and step == "balance":
+        try:
+            balance_start = float(text.replace(",", ".").replace(" ", ""))
+        except ValueError:
+            send("❌ Введите число (баланс на начало).")
+            return
+        try:
+            from vyписка_service import BASE_STATEMENT, BASE_AMOUNT, BASE_OLD_FIO, patch_statement, calculate_balance_and_expenses
+            amount = USER_STATE[uid]["amount"]
+            balance_end, expenses = calculate_balance_and_expenses([float(amount)], balance_start)
+            repl = {"amounts": [(BASE_AMOUNT, amount)], "balance_end": balance_end, "expenses": expenses, "fio": USER_STATE[uid].get("generated_fio", "Иванов Иван Иванович"), "old_fio": BASE_OLD_FIO}
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as out_fp:
+                out_path = out_fp.name
+            ok, err = patch_statement(BASE_STATEMENT, Path(out_path), repl)
+            try:
+                os.unlink(USER_STATE[uid]["file_path"])
+            except OSError:
+                pass
+            del USER_STATE[uid]
+            if not ok:
+                send(f"❌ Ошибка: {err}")
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
+                return
+            with open(out_path, "rb") as f:
+                pdf_bytes = f.read()
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": f"✅ Выписка готова: {amount} ₽"}, files={"document": (f"выписка_{amount}.pdf", pdf_bytes)})
+        except ImportError as e:
+            send(f"❌ Модуль выписки недоступен: {e}")
+            if uid in USER_STATE:
+                del USER_STATE[uid]
+
+
 def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
     """Обработка пошагового ввода для ВТБ «Все поля»."""
     state = USER_STATE[uid]
@@ -795,6 +924,53 @@ def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: d
         _run_vtb_full_patch(token, uid, chat_id, state, tg_req)
 
 
+def _do_stmt_apply(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Применить патч выписки и отправить PDF."""
+    try:
+        from vyписка_service import patch_statement, calculate_balance_and_expenses, BASE_OLD_FIO
+    except ImportError as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Модуль выписки недоступен: {e}"})
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        return
+    fp = Path(state["file_path"])
+    repl = state.get("replacements", {}).copy()
+    trans = list(state.get("transactions", []))
+    amount_map = {}
+    for pair in repl.get("amounts", []):
+        if len(pair) >= 2:
+            amount_map[int(pair[0])] = pair[1]
+    trans_replaced = [float(amount_map.get(int(t), amount_map.get(t, t))) for t in trans if t > 0]
+    balance_start = repl.get("balance_start", 55242.65)
+    balance_end, expenses = calculate_balance_and_expenses(trans_replaced, balance_start)
+    repl["balance_end"] = balance_end
+    repl["expenses"] = expenses
+    repl.setdefault("old_fio", BASE_OLD_FIO)
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as out_fp:
+        out_path = out_fp.name
+    ok, err = patch_statement(fp, Path(out_path), repl)
+    try:
+        os.unlink(state["file_path"])
+    except OSError:
+        pass
+    del USER_STATE[uid]
+    if not ok:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        return
+    out_name = Path(state.get("file_name", "выписка.pdf")).stem + "_patched.pdf"
+    with open(out_path, "rb") as f:
+        pdf_bytes = f.read()
+    try:
+        os.unlink(out_path)
+    except OSError:
+        pass
+    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": "✅ Выписка готова"}, files={"document": (out_name, pdf_bytes)})
+
+
 def run_bot(token: str) -> None:
     offset = 0
     print("Бот запущен (без зависимостей)...")
@@ -886,9 +1062,73 @@ def run_bot(token: str) -> None:
                     doc = msg["document"]
                     fname = doc.get("file_name", "")
                     if not fname.lower().endswith(".pdf"):
-                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Отправьте PDF-файл чека."})
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Отправьте PDF-файл."})
                         continue
-                    aw = USER_STATE.get(uid, {}).get("awaiting", "")
+                    state = USER_STATE.get(uid, {})
+                    mode = state.get("mode", "")
+                    if mode == "statement_edit":
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Скачиваю выписку..."})
+                        try:
+                            fp = tg_get_file_path(token, doc["file_id"])
+                            pdf_data = tg_get_file(token, fp)
+                        except Exception as e:
+                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"❌ Ошибка: {e}"})
+                            continue
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                            tf.write(pdf_data)
+                            path = tf.name
+                        try:
+                            from vyписка_service import scan_statement_amounts, scan_statement_transactions
+                            amounts = scan_statement_amounts(Path(path))
+                            transactions = scan_statement_transactions(Path(path))
+                        except ImportError:
+                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Модуль выписки недоступен."})
+                            try:
+                                os.unlink(path)
+                            except OSError:
+                                pass
+                            continue
+                        USER_STATE[uid] = {"mode": "statement_edit", "step": "amounts", "file_path": path, "file_name": fname, "replacements": {}, "transactions": transactions}
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "✅ Выписка получена.\n\n💰 Введите замены сумм: с какой на какую\nНапример: 10 10000 или 10 5000 50 1000"})
+                        continue
+                    if mode == "statement_from_receipt":
+                        tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Скачиваю чек..."})
+                        try:
+                            fp = tg_get_file_path(token, doc["file_id"])
+                            pdf_data = tg_get_file(token, fp)
+                        except Exception as e:
+                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"❌ Ошибка: {e}"})
+                            continue
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                            tf.write(pdf_data)
+                            path = tf.name
+                        try:
+                            from receipt_extractor import extract_from_receipt, generate_fio_from_first_letter
+                            from vyписка_service import calculate_balance_and_expenses
+                            extracted = extract_from_receipt(Path(path))
+                            amount = extracted.get("amount")
+                            if not amount:
+                                tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Не удалось извлечь сумму из чека."})
+                                try:
+                                    os.unlink(path)
+                                except OSError:
+                                    pass
+                                del USER_STATE[uid]
+                                continue
+                            fio_r = extracted.get("fio_recipient", "") or extracted.get("fio_payer", "")
+                            first_letter = fio_r[0] if fio_r else "И"
+                            generated_fio = generate_fio_from_first_letter(first_letter)
+                            USER_STATE[uid] = {"mode": "statement_from_receipt", "step": "balance", "file_path": path, "file_name": fname, "amount": amount, "generated_fio": generated_fio}
+                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"✅ Чек получен.\n\n📊 Сумма: {amount} ₽\n👤 ФИО: {generated_fio}\n\n💰 Введите баланс на начало периода (число):"})
+                        except ImportError as e:
+                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"❌ Модуль недоступен: {e}"})
+                            try:
+                                os.unlink(path)
+                            except OSError:
+                                pass
+                            del USER_STATE[uid]
+                        continue
+                    aw = state.get("awaiting", "")
                     if aw.startswith("db_add_"):
                         bank = aw.replace("db_add_", "")
                         tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Скачиваю и добавляю в базу..."})
@@ -956,6 +1196,11 @@ def run_bot(token: str) -> None:
                             ],
                         }),
                     })
+                    continue
+
+                # Режим выписки: текст
+                if uid in USER_STATE and USER_STATE[uid].get("mode", "").startswith("statement_"):
+                    _handle_stmt_text(token, uid, chat_id, text, tg_request)
                     continue
 
                 # ВТБ «Все поля»: пошаговый ввод
@@ -1336,7 +1581,72 @@ def run_bot(token: str) -> None:
                         "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
                     })
                     continue
+                if q["data"] == "main_stmt":
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "📄 Создание выписки\n\nВыберите вариант:",
+                        "reply_markup": json.dumps({
+                            "inline_keyboard": [
+                                [{"text": "✏️ Редактирование своей выписки", "callback_data": "stmt_edit"}],
+                                [{"text": "📄 Выписка по чеку", "callback_data": "stmt_receipt"}],
+                                [{"text": "⬅️ Назад", "callback_data": "main_back"}],
+                            ],
+                        }),
+                    })
+                    continue
+                if q["data"] == "stmt_edit":
+                    USER_STATE[uid] = {"mode": "statement_edit", "step": "upload"}
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "✏️ Редактирование своей выписки\n\nОтправьте PDF-файл выписки.",
+                        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
+                    })
+                    continue
+                if q["data"] == "stmt_receipt":
+                    USER_STATE[uid] = {"mode": "statement_from_receipt", "step": "upload"}
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "📄 Выписка по чеку\n\nОтправьте PDF-файл чека.",
+                        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
+                    })
+                    continue
+                if q["data"] == "stmt_skip" or q["data"] == "stmt_next":
+                    if uid not in USER_STATE or USER_STATE[uid].get("mode") != "statement_edit":
+                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Сессия истекла"})
+                        continue
+                    _do_stmt_apply(token, uid, q["message"]["chat"]["id"], USER_STATE[uid], tg_request)
+                    continue
+                if q["data"] == "stmt_custom":
+                    if uid in USER_STATE:
+                        USER_STATE[uid]["step"] = "custom"
+                    tg_request(token, "editMessageText", {
+                        "chat_id": q["message"]["chat"]["id"],
+                        "message_id": q["message"]["message_id"],
+                        "text": "➕ Введите замены: поле=значение\nФИО=..., баланс_начало=..., телефон=..., номер_заявки=...\nПосле ввода нажмите Далее.",
+                        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "➡️ Далее", "callback_data": "stmt_next"}]]}),
+                    })
+                    continue
+                if q["data"] == "stmt_retry_fio":
+                    if uid in USER_STATE:
+                        USER_STATE[uid]["step"] = "custom"
+                    tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": "Введите ФИО заново (без недоступных символов):"})
+                    continue
+                if q["data"] == "stmt_skip_fio":
+                    if uid in USER_STATE:
+                        USER_STATE[uid].pop("pending_fio", None)
+                    tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": "ФИО не заменяется. Введите другие замены или Далее."})
+                    continue
                 if q["data"] == "main_back":
+                    if uid in USER_STATE and USER_STATE[uid].get("mode", "").startswith("statement_"):
+                        if "file_path" in USER_STATE[uid]:
+                            try:
+                                os.unlink(USER_STATE[uid]["file_path"])
+                            except OSError:
+                                pass
+                        del USER_STATE[uid]
                     tg_request(token, "editMessageText", {
                         "chat_id": q["message"]["chat"]["id"],
                         "message_id": q["message"]["message_id"],
