@@ -579,13 +579,22 @@ async def _do_stmt_apply(
         pass
 
 
+async def _post_init(app: Application) -> None:
+    """Сброс webhook перед polling — иначе getUpdates не получает обновления."""
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        print("Webhook сброшен, polling готов", flush=True)
+    except Exception as e:
+        print(f"Webhook: {e}", flush=True)
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         print("Задайте TELEGRAM_BOT_TOKEN")
         return
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("create_statement", cmd_create_statement))
