@@ -52,13 +52,15 @@ if __name__ == "__main__":
         def log_message(self, format, *args):
             pass
 
-    # Сразу биндим порт — Render проверяет это в первые секунды
+    # HTTP-сервер в фоне (health check для Render)
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+
+    def serve():
+        server.serve_forever()
+
+    http_thread = threading.Thread(target=serve, daemon=True)
+    http_thread.start()
     print(f"Listening on 0.0.0.0:{PORT}", flush=True)
 
-    # Бот в фоне
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
-    # serve_forever блокирует главный поток
-    server.serve_forever()
+    # Бот в главном потоке — python-telegram-bot и asyncio требуют main thread
+    run_bot()
