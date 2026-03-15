@@ -14,6 +14,7 @@ PORT = int(os.environ.get("PORT", 10000))
 
 
 def run_bot():
+    import time
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         print("TELEGRAM_BOT_TOKEN не задан", flush=True)
@@ -26,9 +27,15 @@ def run_bot():
         except Exception as e:
             print(f"receipt_index build: {e}", flush=True)
         from bot_standalone import run_bot as _run_bot
-        _run_bot(token)
     except Exception as e:
-        print(f"Bot error: {e}", flush=True)
+        print(f"Bot init error: {e}", flush=True)
+        return
+    while True:
+        try:
+            _run_bot(token)
+        except Exception as e:
+            print(f"Bot crashed: {e}. Перезапуск через 5 сек...", flush=True)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
