@@ -1359,6 +1359,8 @@ def main() -> int:
                 _sbp_dir / "15-03-26_00-00 7.pdf",
                 _sbp_dir / "15-03-26_22-51.pdf",
                 _sbp_dir / "15-03-26_22-52.pdf",
+                _sbp_dir / "15-03-26_21-39.pdf",
+                _sbp_dir / "15-03-26_21-41.pdf",
             ]
             # Оставляем только существующие файлы
             _valid_templates = [p for p in _valid_templates if p.exists()]
