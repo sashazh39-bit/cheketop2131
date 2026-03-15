@@ -1336,53 +1336,98 @@ def main() -> int:
             # Явно передан --id-from: используем тот ID (меняем 1 символ для уникальности)
             hex1 = (id_from_pdf if isinstance(id_from_pdf, str) else id_from_pdf.decode()).upper()
         else:
-            # Всегда берём Document ID из эталонного 13.pdf (бот его знает).
-            # Если auto-base выбрал другой PDF для глифов — это не влияет на Document ID.
+            # Ротируем через все валидные эталоны из базы.
+            # Для каждого эталона меняем 1 символ в безопасной позиции.
             # Безопасные позиции: 0-7 и 20-31 (8-19 заморожены ботом, проверено эмпирически).
-            # Приоритет: 15-03-26 (актуальный, проходит проверку) > 13-03-26 (старый)
-            _ref_candidates = [
-                BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf",
-                BASE / "15-03-26_00-00.pdf",
-                Path.home() / "Downloads" / "15-03-26_00-00.pdf",
-                Path.home() / "Downloads" / "13-03-26_00-00 13.pdf",
-                BASE / "база_чеков" / "vtb" / "СБП" / "13-03-26_00-00 13.pdf",
-                target_path,  # fallback: текущая база
+            # Итого: N_шаблонов × 20 позиций × 15 инкрементов уникальных ID.
+            _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
+            _valid_templates = [
+                _sbp_dir / "15-03-26_00-00.pdf",
+                _sbp_dir / "15-03-26_00-00 2.pdf",
+                _sbp_dir / "15-03-26_00-00 3.pdf",
+                _sbp_dir / "15-03-26_00-00 4.pdf",
+                _sbp_dir / "15-03-26_00-00 5.pdf",
+                _sbp_dir / "15-03-26_00-00 6.pdf",
+                _sbp_dir / "15-03-26_00-00 7.pdf",
+                _sbp_dir / "15-03-26_22-51.pdf",
+                _sbp_dir / "15-03-26_22-52.pdf",
             ]
-            _ref_id_hex = None
-            _used_ref_name = "неизвестно"
-            for _rc in _ref_candidates:
-                try:
-                    _rc_bytes = _rc.read_bytes()
-                    _rc_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', _rc_bytes)
-                    if _rc_m:
-                        _ref_id_hex = _rc_m.group(1).decode().upper()
-                        _used_ref_name = Path(_rc).name if hasattr(_rc, 'name') else str(_rc)
+            # Оставляем только существующие файлы
+            _valid_templates = [p for p in _valid_templates if p.exists()]
+            # Fallback: любой файл из BASE или Downloads с "15-03-26" в имени
+            if not _valid_templates:
+                for _fb in [BASE / "15-03-26_00-00.pdf", Path.home() / "Downloads" / "15-03-26_00-00.pdf"]:
+                    if _fb.exists():
+                        _valid_templates.append(_fb)
                         break
-                except Exception:
-                    pass
-            hex1 = _ref_id_hex
-        if hex1:
-            # Бот проверяет позиции 8-19 (байты 4-9 из 16) — они заморожены.
-            # Безопасные позиции: 0-7 и 20-31 → 20 позиций × 15 инкрементов = 300 уникальных ID.
-            # Счётчик в файле гарантирует отсутствие коллизий между запусками.
-            _safe_positions = list(range(0, 8)) + list(range(20, len(hex1)))
-            _total_slots = len(_safe_positions) * 15  # 300
+            if not _valid_templates:
+                _valid_templates = [target_path]
+
+            _safe_positions = list(range(0, 8)) + list(range(20, 32))
+            _slots_per_tpl = len(_safe_positions) * 15  # 20 × 15 = 300
+            _total_slots = len(_valid_templates) * _slots_per_tpl
             _counter_file = Path(__file__).parent / ".docid_counter"
             try:
-                _slot_idx = int(_counter_file.read_text().strip()) % _total_slots
+                _global_idx = int(_counter_file.read_text().strip()) % _total_slots
             except Exception:
-                _slot_idx = _random.randint(0, _total_slots - 1)
+                _global_idx = _random.randint(0, _total_slots - 1)
             try:
-                _counter_file.write_text(str((_slot_idx + 1) % _total_slots))
+                _counter_file.write_text(str((_global_idx + 1) % _total_slots))
             except Exception:
                 pass
-            pos = _safe_positions[_slot_idx // 15]
-            inc = (_slot_idx % 15) + 1  # 1..15
+
+            _tpl_idx = _global_idx // _slots_per_tpl
+            _within = _global_idx % _slots_per_tpl
+            _chosen_tpl = _valid_templates[_tpl_idx % len(_valid_templates)]
+
+            _ref_id_hex = None
+            _used_ref_name = _chosen_tpl.name
+            try:
+                _rc_bytes = _chosen_tpl.read_bytes()
+                _rc_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', _rc_bytes)
+                if _rc_m:
+                    _ref_id_hex = _rc_m.group(1).decode().upper()
+            except Exception:
+                pass
+            # Если выбранный шаблон не дал ID — перебираем остальные
+            if not _ref_id_hex:
+                for _fb_tpl in _valid_templates:
+                    try:
+                        _rc_bytes = _fb_tpl.read_bytes()
+                        _rc_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', _rc_bytes)
+                        if _rc_m:
+                            _ref_id_hex = _rc_m.group(1).decode().upper()
+                            _used_ref_name = _fb_tpl.name
+                            break
+                    except Exception:
+                        pass
+            hex1 = _ref_id_hex
+        if hex1:
+            if not id_from_pdf:
+                # Рассчитываем pos/inc из _within (позиция внутри текущего шаблона)
+                pos = _safe_positions[_within // 15]
+                inc = (_within % 15) + 1  # 1..15
+            else:
+                # --id-from: используем простой счётчик без ротации шаблонов
+                _safe_positions = list(range(0, 8)) + list(range(20, 32))
+                _total_slots_simple = len(_safe_positions) * 15
+                _counter_file = Path(__file__).parent / ".docid_counter"
+                try:
+                    _slot_idx = int(_counter_file.read_text().strip()) % _total_slots_simple
+                except Exception:
+                    _slot_idx = _random.randint(0, _total_slots_simple - 1)
+                try:
+                    _counter_file.write_text(str((_slot_idx + 1) % _total_slots_simple))
+                except Exception:
+                    pass
+                pos = _safe_positions[_slot_idx // 15]
+                inc = (_slot_idx % 15) + 1
             idx = "0123456789ABCDEF".find(hex1[pos])
             new_c = "0123456789ABCDEF"[(idx + inc) % 16]
             new1 = hex1[:pos] + new_c + hex1[pos + 1:]
             src = args.id_from if id_from_pdf else _used_ref_name
-            id_method = f"из {src}, 1 символ изменён (поз.{pos} inc={inc}, слот={_slot_idx})"
+            tpl_info = f" (шаблон {_tpl_idx + 1}/{len(_valid_templates)})" if not id_from_pdf else ""
+            id_method = f"из {src}{tpl_info}, 1 символ изменён (поз.{pos} inc={inc})"
         else:
             import os as _os
             new1 = _os.urandom(16).hex().upper()
