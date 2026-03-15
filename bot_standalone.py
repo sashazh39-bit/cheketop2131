@@ -27,12 +27,16 @@ _ur.install_opener(_ur.build_opener(*_handlers))
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+_BOT_DIR = Path(__file__).parent
+_ADD_GLYPHS_SCRIPT = _BOT_DIR / "add_glyphs_to_13_03.py"
 
 # Загрузка .env вручную (без python-dotenv)
 try:
@@ -344,6 +348,90 @@ def parse_custom_replacement(text: str) -> tuple[str, str] | None:
     return None
 
 
+def run_check_caps(payer: str, recipient: str) -> tuple[bool, str]:
+    """Проверка ФИО: получатся ли заглавные буквы. Возвращает (ok, output)."""
+    if not _ADD_GLYPHS_SCRIPT.exists():
+        return False, f"Скрипт не найден: {_ADD_GLYPHS_SCRIPT}"
+    try:
+        proc = subprocess.run(
+            [os.sys.executable, str(_ADD_GLYPHS_SCRIPT), "--check-caps", "--payer", payer or "", "--recipient", recipient or ""],
+            cwd=str(_BOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        full = out or err or proc.stderr.decode(errors="replace") if proc.stderr else ""
+        if proc.returncode != 0 and not full:
+            full = f"Код выхода: {proc.returncode}"
+        return proc.returncode == 0, full[:4000]  # лимит Telegram
+    except subprocess.TimeoutExpired:
+        return False, "Таймаут проверки (30 сек)"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+
+
+def run_sbp_generate(
+    payer: str,
+    recipient: str,
+    amount: int,
+    date_str: str,
+    bank: str = "Т-Банк",
+    account: str | None = None,
+    operation_id: str | None = None,
+) -> tuple[bool, bytes | None, str]:
+    """Генерация чека СБП через add_glyphs_to_13_03.py. Возвращает (ok, pdf_bytes, err).
+    date_str: "DD.MM.YYYY" или "DD.MM.YYYY, HH:MM" или "now"
+    """
+    if not _ADD_GLYPHS_SCRIPT.exists():
+        return False, None, f"Скрипт не найден: {_ADD_GLYPHS_SCRIPT}"
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir=str(_BOT_DIR)) as tf:
+        out_path = tf.name
+    try:
+        if not date_str or date_str.strip().lower() in ("now", "сейчас"):
+            dt = datetime.now()
+            date_part = dt.strftime("%d.%m.%Y")
+            time_part = dt.strftime("%H:%M")
+        else:
+            # "13.03.2026, 20:04" или "13.03.2026"
+            parts = date_str.strip().split(",")
+            date_part = parts[0].strip()
+            time_part = parts[1].strip() if len(parts) > 1 else datetime.now().strftime("%H:%M")
+        cmd = [
+            os.sys.executable, str(_ADD_GLYPHS_SCRIPT),
+            "--replace", "--hybrid-safe", "--auto-base",
+            "--payer", payer or "Иван Иванович И.",
+            "--recipient", recipient or "Иван Иванович И.",
+            "--bank", bank or "Т-Банк",
+            "--amount", str(amount),
+            "--date", date_part,
+            "--time", time_part,
+            "-o", out_path,
+        ]
+        if account and re.match(r"^\d{4}$", account):
+            cmd.extend(["--account", account])
+        if operation_id:
+            cmd.extend(["--operation-id", operation_id])
+        proc = subprocess.run(cmd, cwd=str(_BOT_DIR), capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()[:500]
+            return False, None, err or f"Код выхода: {proc.returncode}"
+        if not Path(out_path).exists():
+            return False, None, "PDF не создан"
+        pdf_bytes = Path(out_path).read_bytes()
+        return True, pdf_bytes, ""
+    except subprocess.TimeoutExpired:
+        return False, None, "Таймаут генерации (60 сек)"
+    except Exception as e:
+        return False, None, str(e)
+    finally:
+        try:
+            Path(out_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _vtb_full_validate_text(text: str, field_name: str) -> tuple[str | None, str | None]:
     """Валидация текста. Вернуть (None, None) если ок; (err_msg, suggested) при ошибке.
     suggested — вариант с заменой ё→е, ‑→- (если применим)."""
@@ -454,10 +542,11 @@ def _vtb_full_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: 
 def _gen_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: str, tg_req) -> None:
     """Следующий шаг режима «Сгенерировать»."""
     KEEP_PROMPTS = {
-        "gen_payer": ("3️⃣ Плательщик (ФИО):", "gen_keep_payer"),
-        "gen_recipient": ("4️⃣ Получатель (ФИО):", "gen_keep_recipient"),
+        "gen_payer": ("1️⃣ Плательщик (ФИО):", "gen_keep_payer"),
+        "gen_recipient": ("2️⃣ Получатель (ФИО):", "gen_keep_recipient"),
         "gen_phone": ("5️⃣ Телефон получателя:", "gen_keep_phone"),
         "gen_bank": ("6️⃣ Банк получателя:", "gen_keep_bank"),
+        "gen_account": ("6️⃣ Номер счёта (4 цифры, напр. 9426):", "gen_keep_account"),
         "gen_operation_id": ("7️⃣ ID операции (B606...):", "gen_keep_opid"),
     }
     state["awaiting"] = aw
@@ -470,6 +559,68 @@ def _gen_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: str, 
         })
     else:
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": prompt})
+
+
+def _do_gen_fio_check_and_continue(token: str, uid: int, chat_id: int, state: dict, send, next_step) -> None:
+    """Проверить ФИО (--check-caps), показать результат, перейти к настройке суммы."""
+    payer = state.get("gen_payer") or ""
+    recipient = state.get("gen_recipient") or ""
+    ok, output = run_check_caps(payer, recipient)
+    txt = "📋 Результат проверки ФИО:\n\n" + (output or "(пусто)")
+    send(txt[:4000])
+    next_step("gen_amount", "📝 Настройка.\n\n1️⃣ Сумма (например 10000):")
+
+
+def _gen_next_after_bank(state: dict, next_step) -> None:
+    """После ввода банка: для СБП — gen_account, для ВТБ на ВТБ — gen_operation_id."""
+    if state.get("gen_vtb_subtype") == "vtb_sbp":
+        next_step("gen_account", "6️⃣ Номер счёта (4 цифры, напр. 9426). Оставить пустым — из шаблона:")
+    else:
+        next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить или ввести:")
+
+
+def _run_sbp_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Сгенерировать чек СБП через add_glyphs_to_13_03.py."""
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    amount = state.get("gen_amount") or 0
+    date_str = state.get("gen_date") or "now"
+    ok, pdf_bytes, err = run_sbp_generate(
+        payer=state.get("gen_payer") or "Иван Иванович И.",
+        recipient=state.get("gen_recipient") or "Иван Иванович И.",
+        amount=amount,
+        date_str=date_str,
+        bank=state.get("gen_bank") or "Т-Банк",
+        account=state.get("gen_account"),
+        operation_id=state.get("gen_operation_id"),
+    )
+    if not ok:
+        send(f"❌ Ошибка генерации: {err}")
+        return
+    out_name = f"чек_{format_amount_display(amount).replace(' ', '_')}.pdf"
+    del USER_STATE[uid]
+    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": f"✅ Сгенерировано: {format_amount_display(amount)} ₽"}, files={"document": (out_name, pdf_bytes)})
+    USER_STATE[uid] = {"awaiting": "report_choice", "amount_from": 0, "amount_to": amount, "bank": "vtb", "pdf_name": out_name}
+    tg_req(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": "📋 Отчёт:",
+        "reply_markup": json.dumps({
+            "inline_keyboard": [
+                [{"text": "Тест", "callback_data": "report_test"}],
+                [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+            ],
+        }),
+    })
+
+
+def _gen_next_after_bank(state: dict, next_step) -> None:
+    """После gen_bank: для vtb_sbp → gen_account, иначе → gen_operation_id."""
+    if state.get("gen_vtb_subtype") == "vtb_sbp":
+        next_step("gen_account", "6️⃣ Номер счёта (4 цифры, напр. 9426). Или «оставить»:")
+    else:
+        next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
 
 
 def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
@@ -568,6 +719,66 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
             del USER_STATE[uid]
 
 
+def _do_gen_fio_check_and_continue(token: str, uid: int, chat_id: int, state: dict, send, next_step) -> None:
+    """Проверка ФИО (run_check_caps) и переход к настройке (gen_amount)."""
+    payer = state.get("gen_payer") or ""
+    recipient = state.get("gen_recipient") or ""
+    send("⏳ Проверяю буквы...")
+    ok, output = run_check_caps(payer, recipient)
+    send("📋 Результат проверки ФИО:\n\n" + (output or "(пусто)"))
+    next_step("gen_amount", "Настройка.\n\n1️⃣ Сумма (например 10000):")
+
+
+def _gen_next_after_bank(state: dict, next_step) -> None:
+    """После банка: для СБП — gen_account, для ВТБ на ВТБ — gen_operation_id."""
+    if state.get("gen_vtb_subtype") == "vtb_sbp":
+        next_step("gen_account", "6️⃣ Номер счёта (4 цифры, напр. 9426). Или оставить из шаблона:")
+    else:
+        next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить или ввести:")
+
+
+def _run_sbp_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Генерация чека СБП через add_glyphs_to_13_03.py."""
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+    ok, pdf_bytes, err = run_sbp_generate(
+        payer=state.get("gen_payer") or "Иван Иванович И.",
+        recipient=state.get("gen_recipient") or "Иван Иванович И.",
+        amount=state["gen_amount"],
+        date_str=state.get("gen_date", "now"),
+        bank=state.get("gen_bank") or "Т-Банк",
+        account=state.get("gen_account"),
+        operation_id=state.get("gen_operation_id"),
+    )
+    if not ok or not pdf_bytes:
+        send(f"❌ Ошибка генерации: {err or 'PDF не создан'}")
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        return
+    out_name = f"чек_{format_amount_display(state['gen_amount']).replace(' ', '_')}.pdf"
+    del USER_STATE[uid]
+    caption = f"✅ Сгенерировано: {format_amount_display(state['gen_amount'])} ₽"
+    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
+    USER_STATE[uid] = {
+        "awaiting": "report_choice",
+        "amount_from": 0,
+        "amount_to": state["gen_amount"],
+        "bank": "vtb",
+        "pdf_name": out_name,
+    }
+    tg_req(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": "📋 Отчёт:",
+        "reply_markup": json.dumps({
+            "inline_keyboard": [
+                [{"text": "Тест", "callback_data": "report_test"}],
+                [{"text": "Заявка", "callback_data": "report_zayavka"}],
+                [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+            ],
+        }),
+    })
+
+
 def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
     """Обработка пошагового ввода режима «Сгенерировать»."""
     state = USER_STATE[uid]
@@ -605,7 +816,10 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             state["gen_date"] = "now"
         else:
             state["gen_date"] = text.strip()
-        next_step("gen_payer", "3️⃣ Плательщик (ФИО):")
+        if state.get("gen_vtb_subtype") == "vtb_sbp":
+            next_step("gen_phone", "5️⃣ Телефон получателя:")
+        else:
+            next_step("gen_payer", "3️⃣ Плательщик (ФИО):")
 
     elif awaiting == "gen_payer":
         t = text.strip().lower()
@@ -631,7 +845,10 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
         t = text.strip().lower()
         if t in ("пропустить", "-", "=", "оставить пустым"):
             state["gen_recipient"] = None
-            next_step("gen_phone", "5️⃣ Телефон получателя:")
+            if state.get("gen_vtb_subtype") == "vtb_sbp":
+                _do_gen_fio_check_and_continue(token, uid, chat_id, state, send, next_step)
+            else:
+                next_step("gen_phone", "5️⃣ Телефон получателя:")
             return
         t = text.strip()
         err, suggested = _vtb_full_validate_text(t, "Получатель")
@@ -639,27 +856,39 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             if suggested:
                 state["gen_recipient"] = suggested
                 send(f"✅ Применена замена (ё→е): {suggested}")
-                next_step("gen_phone", "5️⃣ Телефон получателя:")
+                if state.get("gen_vtb_subtype") == "vtb_sbp":
+                    _do_gen_fio_check_and_continue(token, uid, chat_id, state, send, next_step)
+                else:
+                    next_step("gen_phone", "5️⃣ Телефон получателя:")
             else:
                 send(err)
                 return
         else:
             state["gen_recipient"] = t
-            next_step("gen_phone", "5️⃣ Телефон получателя:")
+            if state.get("gen_vtb_subtype") == "vtb_sbp":
+                _do_gen_fio_check_and_continue(token, uid, chat_id, state, send, next_step)
+            else:
+                next_step("gen_phone", "5️⃣ Телефон получателя:")
 
     elif awaiting == "gen_operation_id":
         t = text.strip().replace(" ", "").replace("\n", "")
         if not t or t.lower() in ("пропустить", "-", "=", "оставить", "оставить пустым"):
             state["gen_operation_id"] = None
-            send("⏳ Ищу донора и обрабатываю...")
-            _run_gen_patch(token, uid, chat_id, state, tg_req)
+            send("⏳ Генерирую чек...")
+            if state.get("gen_vtb_subtype") == "vtb_sbp":
+                _run_sbp_generate(token, uid, chat_id, state, tg_req)
+            else:
+                _run_gen_patch(token, uid, chat_id, state, tg_req)
             return
         if not re.match(r"^[AB]606[\dA-Fa-f]{15,30}$", t):
             send("❌ Формат: B606... или A606... (цифры и A-F, 20-32 символа)")
             return
         state["gen_operation_id"] = t
-        send("⏳ Ищу донора и обрабатываю...")
-        _run_gen_patch(token, uid, chat_id, state, tg_req)
+        send("⏳ Генерирую чек...")
+        if state.get("gen_vtb_subtype") == "vtb_sbp":
+            _run_sbp_generate(token, uid, chat_id, state, tg_req)
+        else:
+            _run_gen_patch(token, uid, chat_id, state, tg_req)
 
     elif awaiting == "gen_phone":
         t = text.strip().lower()
@@ -685,7 +914,7 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
         t = text.strip().lower()
         if t in ("пропустить", "-", "=", "оставить пустым"):
             state["gen_bank"] = None
-            next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
+            _gen_next_after_bank(state, next_step)
             return
         t = text.strip()
         err, suggested = _vtb_full_validate_text(t, "Банк")
@@ -693,13 +922,25 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             if suggested:
                 state["gen_bank"] = suggested
                 send(f"✅ Применена замена: {suggested}")
-                next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
+                _gen_next_after_bank(state, next_step)
             else:
                 send(err)
                 return
         else:
             state["gen_bank"] = t
-            next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
+            _gen_next_after_bank(state, next_step)
+
+    elif awaiting == "gen_account":
+        t = text.strip()
+        if t.lower() in ("пропустить", "-", "=", "оставить пустым"):
+            state["gen_account"] = None
+            next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить или ввести:")
+            return
+        if re.match(r"^\d{4}$", t):
+            state["gen_account"] = t
+            next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить или ввести:")
+        else:
+            send("❌ Номер счёта — 4 цифры (например 9426)")
 
 
 def _handle_stmt_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
@@ -1531,32 +1772,46 @@ def run_bot(token: str) -> None:
                     continue
                 if q["data"] == "gen_bank_vtb":
                     prev = USER_STATE.get(uid, {})
+                    subtype = prev.get("gen_vtb_subtype", "vtb_sbp")
                     USER_STATE[uid] = {
-                        "awaiting": "gen_amount",
+                        "awaiting": "gen_payer" if subtype == "vtb_sbp" else "gen_amount",
                         "gen_bank_type": "vtb",
                         "gen_transfer_type": prev.get("gen_transfer_type", "sbp"),
-                        "gen_vtb_subtype": prev.get("gen_vtb_subtype", "vtb_sbp"),
+                        "gen_vtb_subtype": subtype,
                     }
-                    tg_request(token, "editMessageText", {
-                        "chat_id": q["message"]["chat"]["id"],
-                        "message_id": q["message"]["message_id"],
-                        "text": (
-                            "✨ Сгенерировать (ВТБ)\n\n"
-                            "1️⃣ Сумма: с какой на какую (например: 10 1000) или одна сумма (50000)"
-                        ),
-                    })
+                    if subtype == "vtb_sbp":
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": (
+                                "✨ Сгенерировать чек СБП (ВТБ)\n\n"
+                                "📋 Сначала проверка ФИО.\n\n"
+                                "1️⃣ Плательщик (например: Артем Никитич К.):"
+                            ),
+                        })
+                    else:
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": (
+                                "✨ Сгенерировать (ВТБ)\n\n"
+                                "1️⃣ Сумма: с какой на какую (например: 10 1000) или одна сумма (50000)"
+                            ),
+                        })
                     continue
-                if q["data"] in ("gen_keep_payer", "gen_keep_recipient", "gen_keep_phone", "gen_keep_bank", "gen_keep_opid"):
+                if q["data"] in ("gen_keep_payer", "gen_keep_recipient", "gen_keep_phone", "gen_keep_bank", "gen_keep_account", "gen_keep_opid"):
                     if uid not in USER_STATE:
                         tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Сессия истекла"})
                         continue
                     state = USER_STATE[uid]
                     cid = q["message"]["chat"]["id"]
+                    subtype = state.get("gen_vtb_subtype", "vtb_sbp")
                     keep_map = {
                         "gen_keep_payer": ("gen_payer", "gen_recipient", "4️⃣ Получатель (ФИО):"),
-                        "gen_keep_recipient": ("gen_recipient", "gen_phone", "5️⃣ Телефон получателя:"),
+                        "gen_keep_recipient": ("gen_recipient", "gen_phone" if subtype != "vtb_sbp" else None, "5️⃣ Телефон:" if subtype != "vtb_sbp" else ""),
                         "gen_keep_phone": ("gen_phone", "gen_bank", "6️⃣ Банк получателя:"),
-                        "gen_keep_bank": ("gen_bank", "gen_operation_id", "7️⃣ ID операции (B606...). Оставить или ввести:"),
+                        "gen_keep_bank": ("gen_bank", "gen_account" if subtype == "vtb_sbp" else "gen_operation_id", "6️⃣ Счёт (4 цифры):" if subtype == "vtb_sbp" else "7️⃣ ID операции:"),
+                        "gen_keep_account": ("gen_account", "gen_operation_id", "7️⃣ ID операции (B606...). Оставить или ввести:"),
                         "gen_keep_opid": ("gen_operation_id", None, ""),
                     }
                     field_key, next_aw, _ = keep_map[q["data"]]
@@ -1565,8 +1820,11 @@ def run_bot(token: str) -> None:
                     if next_aw:
                         _gen_send_next(state, next_aw, "", cid, token, tg_request)
                     else:
-                        tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Ищу донора и обрабатываю..."})
-                        _run_gen_patch(token, uid, cid, state, tg_request)
+                        tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Генерирую чек..."})
+                        if state.get("gen_vtb_subtype") == "vtb_sbp":
+                            _run_sbp_generate(token, uid, cid, state, tg_request)
+                        else:
+                            _run_gen_patch(token, uid, cid, state, tg_request)
                     continue
                 if q["data"] == "main_new":
                     tg_request(token, "editMessageText", {

@@ -473,11 +473,28 @@ def find_best_base_pdf(
     ]
     _ref_ys: "frozenset[float] | None" = None
     _ref_size: int = 0  # размер эталонного 13.pdf — кандидат не должен быть крупнее
+    _ref_content_cids: "frozenset[int]" = frozenset()  # CID из контент-стримов 13.pdf (не-FIO)
     for _rp in _ref_paths:
         if _rp.exists():
             _ref_raw = _rp.read_bytes()
             _ref_ys = _get_tm_ys(_ref_raw)
             _ref_size = len(_ref_raw)
+            # Собираем все CID из content streams 13.pdf
+            _all_cids_ref: "set[int]" = set()
+            for _cm in re.finditer(rb'\d+\s+0\s+obj.*?stream\r?\n(.*?)endstream', _ref_raw, re.DOTALL):
+                try: _cdec = zlib.decompress(_cm.group(1).lstrip(b'\r\n'))
+                except: _cdec = _cm.group(1)
+                for _tj in re.finditer(rb'\[([^\]]+)\]\s*TJ', _cdec):
+                    for _pr in re.finditer(rb'\((.{2})\)', _tj.group(1)):
+                        _b = _pr.group(1)
+                        _all_cids_ref.add((_b[0] << 8) | _b[1])
+            # Из них берём только не-FIO CID (вне диапазона 0x021C-0x023F) с GID>0 в 13.pdf
+            _ref_ctg = _get_cidtogid_map(_ref_raw)
+            _ref_content_cids = frozenset(
+                c for c in _all_cids_ref
+                if not (0x021C <= c <= 0x023F)  # не Cyrillic-FIO диапазон
+                and _ref_ctg.get(c, 0) > 0
+            )
             break
 
     # Ожидаемые Y-координаты плательщика и получателя (из 13.pdf layout).
@@ -569,19 +586,42 @@ def find_best_base_pdf(
                 _raw_y = _gar(pdf_path).get("y", {})
                 _py = _raw_y.get("payer")
                 _ry = _raw_y.get("recipient")
-                if _py is not None and abs(_py - _EXPECTED_PAYER_Y) > _Y_SAFETY_TOL:
-                    continue  # payer Y смещён → PDF небезопасен
-                if _ry is not None and abs(_ry - _EXPECTED_RECIPIENT_Y) > _Y_SAFETY_TOL:
-                    continue  # recipient Y смещён → PDF небезопасен
+                if _py is None or abs(_py - _EXPECTED_PAYER_Y) > _Y_SAFETY_TOL:
+                    continue  # payer Y не найден или смещён → PDF небезопасен
+                if _ry is None or abs(_ry - _EXPECTED_RECIPIENT_Y) > _Y_SAFETY_TOL:
+                    continue  # recipient Y не найден или смещён → PDF небезопасен
             except Exception:
                 pass  # если fitz недоступен — не фильтруем по этому критерию
+            # Проверяем что кандидат имеет все не-FIO глифы из 13.pdf (цифры, пунктуация и пр.)
+            # Если CID из 13.pdf content stream имеет GID=0 в кандидате → пропускаем.
+            # Это предотвращает ситуацию когда цифра "8" или "4" исчезает из чека.
+            if _ref_content_cids:
+                _missing_content = [c for c in _ref_content_cids if ctg.get(c, 0) == 0]
+                if _missing_content:
+                    continue  # кандидат не имеет всех нужных глифов для дат/цифр/etc
             # Проверяем что все символы ФИО (включая строчные) рендерятся в этом PDF
             if not _is_fully_renderable(ctg):
                 continue  # хотя бы один символ ФИО не может быть ни нативным, ни инъецированным
             # Буквы, которые есть нативно в этом PDF И нужны в ФИО, НО отсутствуют в текущей базе
             extra_cids = {cid for cid in missing_needed_cids if ctg.get(cid, 0) > 0}
-            score = len(extra_cids)
-            # Предпочитаем: (1) больший score, (2) реальный чек (имя начинается с даты DD-MM-YY)
+            # Штраф: буквы нативные в текущей базе (13.pdf) но GID=0 в кандидате.
+            # Исключаем из штрафа буквы у которых есть естественный FIO-слот (самоинъекция):
+            # Ж имеет слот 0x0222, Е→0x0221, Г/г→0x023F — их потеря восстановима.
+            from vtb_cmap import _CID_CYRILLIC as _cc_sc
+            _self_injectable_cids = {
+                int(_cc_sc[ch], 16)
+                for slot_cid, chars in _SLOT_NATURAL.items()
+                for ch in chars
+                if ch in _cc_sc and int(_cc_sc[ch], 16) == slot_cid
+            }
+            lose_cids = {
+                cid for cid in needed_cids
+                if (current_base_ctg or {}).get(cid, 0) > 0
+                and ctg.get(cid, 0) == 0
+                and cid not in _self_injectable_cids  # слот есть → восстановимо
+            }
+            score = len(extra_cids) - len(lose_cids)
+            # Предпочитаем: (1) больший net-score, (2) реальный чек (имя начинается с даты DD-MM-YY)
             is_real = bool(pdf_path.name[:2].isdigit() and pdf_path.name[2] == "-")
             better = (score > best_score) or (score == best_score and is_real and not best_is_real)
             if better and score > 0:
@@ -729,6 +769,7 @@ def main() -> int:
     ap.add_argument("--operation-id", default=None, help="ID операции СБП (32 hex-символа); если не задан, генерируется через gen_sbp_operation_id")
     ap.add_argument("--time", default=None, help="Время перевода HH:MM (напр. 19:31)")
     ap.add_argument("--date", default="13.03.2026", help="Дата DD.MM.YYYY")
+    ap.add_argument("--account", default=None, help="Последние 4 цифры счёта (напр. 9426); если не задан — оставляет из шаблона")
     ap.add_argument("--target", default=None, help="База PDF (по умолчанию 13.pdf для структуры, 17.pdf для проверки)")
     ap.add_argument("--id-from", default=None, help="PDF, из которого взять Document ID; затем меняется 1 символ для уникальности")
     ap.add_argument("--replace", action="store_true", help="REPLACE: перезаписать существующие CID (Ф,Ч,Ю) — без изменений структуры PDF")
@@ -794,10 +835,26 @@ def main() -> int:
                 1 for cid, nat in _SLOTS_AB.items()
                 if cur_ctg.get(cid, 0) > 0 and not (nat & _fio_chars_ab)
             )
-            _need_inject = sum(
-                1 for ch in set(fio_for_search)
-                if ch.isupper() and ch in _cmap_ab and cur_ctg.get(int(_cmap_ab[ch], 16), 0) == 0
-            )
+            # Считаем буквы с GID=0 И HARDCODED-буквы (Ф, Ч, Ю) чей слот заблокирован другой буквой ФИО.
+            # Слот Ф (0x0222=Ж): заблокирован если Ж в ФИО.
+            # Слот Ч (0x023F=Г/г): заблокирован если Г или г в ФИО.
+            # Слот Ю (0x0221=Е): заблокирован если Е в ФИО.
+            # HARDCODED слоты: Ф→0x023F (Г блокирует), Ч→0x0222 (Ж блокирует), Ю→0x0221 (Е блокирует)
+            _HC_PAIRS_AB = {'Ф': 'Г', 'Ч': 'Ж', 'Ю': 'Е'}  # HARDCODED uni → blocking char
+            _fio_set_ab = frozenset(fio_for_search)
+            _need_inject = 0
+            for ch in set(fio_for_search):
+                if not (ch.isupper() and ch in _cmap_ab):
+                    continue
+                cid = int(_cmap_ab[ch], 16)
+                gid = cur_ctg.get(cid, 0)
+                if gid == 0:
+                    _need_inject += 1  # GID=0 → точно нужна инъекция
+                elif ch in _HC_PAIRS_AB:
+                    # HARDCODED: нужен слот, если слот занят другой буквой ФИО
+                    blocker = _HC_PAIRS_AB[ch]
+                    if blocker in _fio_set_ab or blocker.lower() in _fio_set_ab:
+                        _need_inject += 1  # слот заблокирован → нужен extra-слот
             if _need_inject <= _avail_slots:
                 print(f"[auto-base] Текущая база достаточна ({_need_inject} инъекций, {_avail_slots} слотов): {target_path.name}", file=sys.stderr)
             else:
@@ -863,7 +920,7 @@ def main() -> int:
 
             # Кандидаты safe-слотов: {target_uni: slot_cid}
             # Слот используем ТОЛЬКО если: (a) буква нужна в ФИО, (b) нет конфликта (другая буква ФИО не использует тот же CID)
-            _HARDCODED_CANDS = {0x0424: 0x0222, 0x0427: 0x023F, 0x042E: 0x0221}
+            _HARDCODED_CANDS = {0x0427: 0x023F, 0x042E: 0x0221}
             reuse_map: dict[int, int] = {}
             used_slots: set[int] = set()
 
@@ -899,12 +956,36 @@ def main() -> int:
                     return False
                 return cid not in base_w  # fallback если нет CIDToGIDMap
 
-            # Сортируем по первому вхождению в тексте ФИО: первые буквы имён важнее.
+            # Сортируем по приоритету: сначала буквы с GID=0 (без глифа вообще),
+            # потом HARDCODED-буквы с нативным GID>0 (неправильный глиф, но не пусто).
+            # Внутри каждой группы — по первому вхождению в тексте ФИО.
             _fio_first_pos: dict[int, int] = {}
             for _pos, _fio_ch in enumerate(fio_text):
                 _u = ord(_fio_ch)
                 if _u not in _fio_first_pos:
                     _fio_first_pos[_u] = _pos
+
+            def _inject_priority(u: int) -> tuple:
+                """Приоритет инъекции: (группа, позиция_в_ФИО).
+                0 = GID=0 + полное имя (первая буква полного слова — критично)
+                1 = GID=0 + инициал (буква перед '.' — менее критично)
+                2 = HARDCODED с нативным GID (некритично)."""
+                cid_hex = _all_vtb.get(chr(u))
+                if cid_hex and base_ctg is not None:
+                    gid = base_ctg.get(int(cid_hex, 16), 0)
+                    if gid > 0:
+                        return (2, _fio_first_pos.get(u, 99999))
+                # GID=0: проверяем инициал (следующий непробельный символ = '.')
+                pos = _fio_first_pos.get(u, 99999)
+                is_initial = False
+                if pos < len(fio_text) - 1:
+                    for i in range(pos + 1, len(fio_text)):
+                        if fio_text[i] == '.':
+                            is_initial = True
+                            break
+                        if fio_text[i] != ' ':
+                            break
+                return (1 if is_initial else 0, pos)
 
             extra_unis = sorted(
                 {
@@ -913,7 +994,7 @@ def main() -> int:
                     and ord(ch) not in reuse_map  # уже получил hardcoded слот
                     and _needs_donor_glyph(ch)
                 },
-                key=lambda u: _fio_first_pos.get(u, 99999),
+                key=_inject_priority,
             )
 
             if extra_unis:
@@ -1226,6 +1307,7 @@ def main() -> int:
             keep_metadata=True,
             override_uni_to_cid=custom_uni_to_cid,
             original_cid_widths=original_cid_widths,
+            account_last4=args.account,
         )
     except ValueError as e:
         print(f"[ERROR] {e}", file=sys.stderr)
@@ -1236,30 +1318,56 @@ def main() -> int:
     update_creation_date(out_arr, meta_date)
     id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', out_arr)
     if id_m:
+        import random as _random
         if id_from_pdf:
             # Явно передан --id-from: используем тот ID (меняем 1 символ для уникальности)
-            hex1 = id_from_pdf if isinstance(id_from_pdf, str) else id_from_pdf.decode()
-            c = hex1[-1]
-            idx = "0123456789ABCDEF".find(c.upper())
-            new_c = "0123456789ABCDEF"[(idx + 1) % 16]
-            new1 = hex1[:-1] + new_c
-            id_method = f"из {args.id_from}, 1 символ изменён"
+            hex1 = (id_from_pdf if isinstance(id_from_pdf, str) else id_from_pdf.decode()).upper()
         else:
-            # Путь Б: берём /ID из базового PDF и меняем ровно 1 символ.
-            # Это критично: бот помечает PDF как подделку если /ID изменён полностью.
-            base_pdf_bytes = target_path.read_bytes()
-            base_id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', base_pdf_bytes)
-            if base_id_m:
-                hex1 = base_id_m.group(1).decode().upper()
-                c = hex1[-1]
-                idx = "0123456789ABCDEF".find(c)
-                new_c = "0123456789ABCDEF"[(idx + 1) % 16]
-                new1 = hex1[:-1] + new_c
-                id_method = f"из {target_path.name}, 1 символ изменён"
-            else:
-                import os as _os
-                new1 = _os.urandom(16).hex().upper()
-                id_method = "os.urandom(16) — резервный (ID не найден в базе)"
+            # Всегда берём Document ID из эталонного 13.pdf (бот его знает).
+            # Если auto-base выбрал другой PDF для глифов — это не влияет на Document ID.
+            # Безопасные позиции: 0-7 и 20-31 (8-19 заморожены ботом, проверено эмпирически).
+            _ref_pdf = Path(__file__).parent / "база_чеков" / "vtb" / "СБП" / ".." / ".." / ".." / "Downloads" / "13-03-26_00-00 13.pdf"
+            # Ищем 13.pdf в Downloads
+            _ref_candidates = [
+                Path.home() / "Downloads" / "13-03-26_00-00 13.pdf",
+                target_path,  # fallback: текущая база
+            ]
+            _ref_id_hex = None
+            for _rc in _ref_candidates:
+                try:
+                    _rc_bytes = _rc.read_bytes()
+                    _rc_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', _rc_bytes)
+                    if _rc_m:
+                        _ref_id_hex = _rc_m.group(1).decode().upper()
+                        break
+                except Exception:
+                    pass
+            hex1 = _ref_id_hex
+        if hex1:
+            # Бот проверяет позиции 8-19 (байты 4-9 из 16) — они заморожены.
+            # Безопасные позиции: 0-7 и 20-31 → 20 позиций × 15 инкрементов = 300 уникальных ID.
+            # Счётчик в файле гарантирует отсутствие коллизий между запусками.
+            _safe_positions = list(range(0, 8)) + list(range(20, len(hex1)))
+            _total_slots = len(_safe_positions) * 15  # 300
+            _counter_file = Path(__file__).parent / ".docid_counter"
+            try:
+                _slot_idx = int(_counter_file.read_text().strip()) % _total_slots
+            except Exception:
+                _slot_idx = _random.randint(0, _total_slots - 1)
+            try:
+                _counter_file.write_text(str((_slot_idx + 1) % _total_slots))
+            except Exception:
+                pass
+            pos = _safe_positions[_slot_idx // 15]
+            inc = (_slot_idx % 15) + 1  # 1..15
+            idx = "0123456789ABCDEF".find(hex1[pos])
+            new_c = "0123456789ABCDEF"[(idx + inc) % 16]
+            new1 = hex1[:pos] + new_c + hex1[pos + 1:]
+            src = args.id_from if id_from_pdf else "13-03-26_00-00 13.pdf"
+            id_method = f"из {src}, 1 символ изменён (поз.{pos} inc={inc}, слот={_slot_idx})"
+        else:
+            import os as _os
+            new1 = _os.urandom(16).hex().upper()
         slot_len = id_m.end(1) - id_m.start(1)
         new_enc = new1.encode().ljust(slot_len)[:slot_len]
         out_arr[id_m.start(1) : id_m.end(1)] = new_enc

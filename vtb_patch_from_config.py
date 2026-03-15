@@ -225,6 +225,7 @@ def patch_from_values(
     amount: int | None = None,
     operation_id: str | None = None,
     account: str | None = None,
+    account_last4: str | None = None,
     message: str | None = None,
     keep_metadata: bool = False,
     keep_date: bool = False,
@@ -280,7 +281,56 @@ def patch_from_values(
     new_recipient_21 = _build(recipient, kern="-21.42857") if recipient else None
     new_phone_tj = _build(phone) if phone else None
     new_bank_tj = _build(bank) if bank else None
-    new_account_tj = _build(account) if account else None
+    if account_last4 is not None and account is None:
+        account = account_last4  # только цифры; * берём из оригинального шаблона
+    # Счёт: сохраняем оригинальный токен * из шаблона, заменяем только цифры.
+    # CID 0x000D содержит \r (carriage return) — в literal string () он ломается.
+    # Поэтому берём оригинальный <000D>-... префикс из шаблона как есть.
+    new_account_tj = None
+    if account:
+        _digits = account.lstrip("*")  # берём только цифры
+        _digit_cids = text_to_cids(_digits)
+        if _digit_cids:
+            _digit_tj = build_tj(_digit_cids)
+            # Ищем оригинальный asterisk-токен в контент-стриме шаблона
+            _orig_star_tok: bytes | None = None
+            try:
+                import zlib as _z
+                _raw_pdf = pdf_path.read_bytes()
+                for _om in re.finditer(rb'\d+ 0 obj', _raw_pdf):
+                    _chunk = _raw_pdf[_om.end():_om.end()+3000]
+                    _sm = re.search(rb'stream\r?\n', _chunk)
+                    if not _sm: continue
+                    _lm = re.search(rb'/Length\s+(\d+)', _chunk[:_sm.start()])
+                    if not _lm: continue
+                    _sl = int(_lm.group(1))
+                    _ss = _om.end() + _sm.end()
+                    try:
+                        _dec = _z.decompress(_raw_pdf[_ss:_ss+_sl])
+                    except Exception:
+                        continue
+                    # Ищем TJ с <000D> (hex) или (\x00\x0d) (literal) на Y≈251
+                    _acc_m = re.search(
+                        rb'[\d.]+\s+251\.25\s+Tm\s*\[(<000[Dd]>|[^]]*?\x00[\x0d\r])[^]]*\]',
+                        _dec
+                    )
+                    if _acc_m:
+                        # Извлечь первый токен (до первого kern)
+                        _tj_body = re.search(rb'\[(.+?)\]\s*TJ', _dec[_acc_m.start():_acc_m.start()+300])
+                        if _tj_body:
+                            _first = re.match(rb'(<[0-9A-Fa-f]+>|\([^)]*\))(-[\d.]+\s+)?', _tj_body.group(1))
+                            if _first:
+                                _orig_star_tok = _first.group(1)  # e.g. b'<000D>'
+                                break
+            except Exception:
+                pass
+            if _orig_star_tok:
+                # Собираем TJ: <оригинальная звёздочка>-kern <цифры>
+                _kern = b"-16.66667 "
+                new_account_tj = b"[" + _orig_star_tok + _kern + _digit_tj + b"]"
+            else:
+                # Fallback: собираем весь TJ включая *
+                new_account_tj = _build("*" + _digits)
     new_message_tj = _build(message, wrap=True) if message else None
     new_amount_tj = build_amount_tj(amount) if amount else None
     new_opid_tj = None
