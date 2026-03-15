@@ -397,6 +397,143 @@ def _check_metadata(data: bytes) -> dict[str, str | None]:
     return out
 
 
+def find_best_base_pdf(
+    fio_text: str,
+    sbp_dir: Path,
+    *,
+    current_base_ctg: "dict[int, int] | None" = None,
+    verbose: bool = True,
+) -> "tuple[Path | None, set[str]]":
+    """Найти PDF в sbp_dir с максимальным числом нативных заглавных глифов для FIO.
+
+    Возвращает (путь, множество_доп_букв) или (None, set()) если лучше текущей базы нет.
+    Буквы в возвращаемом множестве — те, что нативно есть в найденном PDF, но ОТСУТСТВУЮТ
+    в текущей базе (13.pdf). Т.е. именно те буквы, которые нам даёт этот PDF «в подарок».
+    """
+    from vtb_cmap import _CID_CYRILLIC
+    from find_reusable_cids import _get_cidtogid_map
+
+    # CID → char для заглавного диапазона 021C-023B
+    cid_to_uc: dict[int, str] = {
+        int(cid_hex, 16): ch
+        for ch, cid_hex in _CID_CYRILLIC.items()
+        if ch.isupper() and 0x021C <= int(cid_hex, 16) <= 0x023B
+    }
+
+    # Заглавные буквы, нужные в ФИО
+    needed_uc = {ch for ch in fio_text if ch.isupper() and ch in _CID_CYRILLIC}
+    needed_cids = {int(_CID_CYRILLIC[ch], 16) for ch in needed_uc}
+
+    # Базовые буквы из текущего базового PDF (13.pdf)
+    base_native_cids: set[int] = set()
+    if current_base_ctg:
+        base_native_cids = {cid for cid, gid in current_base_ctg.items() if cid in cid_to_uc and gid > 0}
+
+    # CIDs нужные, но отсутствующие в текущей базе
+    missing_needed_cids = needed_cids - base_native_cids
+
+    if not missing_needed_cids:
+        if verbose:
+            print(f"[auto-base] Все заглавные буквы уже есть в текущей базе: {''.join(sorted(needed_uc))}", flush=True)
+        return None, set()
+
+    if verbose:
+        missing_chars = ''.join(cid_to_uc.get(c, '?') for c in sorted(missing_needed_cids))
+        print(f"[auto-base] Ищу PDF с нативными глифами для: {missing_chars}", flush=True)
+
+    # Исключаем донорский PDF (check (3).pdf) — он используется для инъекции глифов,
+    # не должен быть базой (иначе Document ID донора используется дважды).
+    donor_name = DONOR.name
+
+    # Эталонные Y-координаты из базового PDF (13.pdf) для проверки совместимости layout.
+    # Кандидаты с другим набором Y не смогут правильно пропатчить поля.
+    def _get_tm_ys(pdf_bytes: bytes) -> "frozenset[float]":
+        import re as _re, zlib as _zlib
+        ys: set[float] = set()
+        for m in _re.finditer(rb'\d+\s+0\s+obj.*?stream\r?\n(.*?)endstream', pdf_bytes, _re.DOTALL):
+            try:
+                dec = _zlib.decompress(m.group(1).lstrip(b'\r\n'))
+            except Exception:
+                dec = m.group(1)
+            for tm in _re.finditer(rb'(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+Tm', dec):
+                try:
+                    ys.add(round(float(tm.group(6)), 1))
+                except Exception:
+                    pass
+        return frozenset(ys)
+
+    # Базовые Y из текущего target PDF (13.pdf) — кандидат должен совпадать полностью
+    ref_bytes = (current_base_ctg and None) or None  # placeholder — вычислим через sbp_dir/../../../
+    # Находим базовый 13.pdf для эталона Y-координат
+    _ref_paths = [
+        Path.home() / "Downloads" / "13-03-26_00-00 13.pdf",
+        sbp_dir / "13-03-26_00-00 13.pdf",
+    ]
+    _ref_ys: "frozenset[float] | None" = None
+    for _rp in _ref_paths:
+        if _rp.exists():
+            _ref_ys = _get_tm_ys(_rp.read_bytes())
+            break
+
+    # Ожидаемые Y-координаты плательщика и получателя (из 13.pdf layout).
+    # Если get_field_align_raw находит Y, отличный от ожидаемого более чем на 15 pt, PDF небезопасен.
+    _EXPECTED_PAYER_Y = 227.25   # из эталонного 13.pdf
+    _EXPECTED_RECIPIENT_Y = 203.25
+    _Y_SAFETY_TOL = 15.0
+
+    best_path: "Path | None" = None
+    best_extra: set[str] = set()
+    best_score = 0
+    best_is_real = False  # предпочитаем реальные чеки (дата в имени) над спец-файлами
+
+    for pdf_path in sorted(sbp_dir.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if pdf_path.name == donor_name:
+            continue  # пропускаем донора
+        try:
+            pdf_bytes_cand = pdf_path.read_bytes()
+            ctg = _get_cidtogid_map(pdf_bytes_cand)
+            if not ctg:
+                continue
+            # Проверяем layout-совместимость (Y-координаты полей должны совпадать с эталоном)
+            if _ref_ys is not None:
+                cand_ys = _get_tm_ys(pdf_bytes_cand)
+                if cand_ys != _ref_ys:
+                    continue  # несовместимый layout — пропускаем
+            # Проверяем безопасность поля-детекции (get_field_align_raw не перепутал поля).
+            # Если найденная Y для плательщика/получателя далека от ожидаемой → пропускаем.
+            try:
+                from vtb_sber_reference import get_field_align_raw as _gar
+                _raw_y = _gar(pdf_path).get("y", {})
+                _py = _raw_y.get("payer")
+                _ry = _raw_y.get("recipient")
+                if _py is not None and abs(_py - _EXPECTED_PAYER_Y) > _Y_SAFETY_TOL:
+                    continue  # payer Y смещён → PDF небезопасен
+                if _ry is not None and abs(_ry - _EXPECTED_RECIPIENT_Y) > _Y_SAFETY_TOL:
+                    continue  # recipient Y смещён → PDF небезопасен
+            except Exception:
+                pass  # если fitz недоступен — не фильтруем по этому критерию
+            # Буквы, которые есть нативно в этом PDF И нужны в ФИО, НО отсутствуют в текущей базе
+            extra_cids = {cid for cid in missing_needed_cids if ctg.get(cid, 0) > 0}
+            score = len(extra_cids)
+            # Предпочитаем: (1) больший score, (2) реальный чек (имя начинается с даты DD-MM-YY)
+            is_real = bool(pdf_path.name[:2].isdigit() and pdf_path.name[2] == "-")
+            better = (score > best_score) or (score == best_score and is_real and not best_is_real)
+            if better and score > 0:
+                best_score = score
+                best_path = pdf_path
+                best_extra = {cid_to_uc[cid] for cid in extra_cids if cid in cid_to_uc}
+                best_is_real = is_real
+        except Exception:
+            continue
+
+    if best_path and best_score > 0:
+        if verbose:
+            print(f"[auto-base] Лучший кандидат: {best_path.name}", flush=True)
+            print(f"[auto-base] Нативные extra-буквы: {''.join(sorted(best_extra))} (+{best_score})", flush=True)
+        return best_path, best_extra
+    return None, set()
+
+
 def _check_caps_mode(target_path: Path, payer: str, recipient: str) -> int:
     """Показать какие заглавные буквы в ФИО будут заглавными в PDF."""
     from vtb_cmap import _CID_CYRILLIC, _CID_DIGIT
@@ -537,6 +674,10 @@ def main() -> int:
                     help="Способ копирования глифов для REPLACE: pen (по умол.), deepcopy, decompose")
     ap.add_argument("--check-caps", action="store_true",
                     help="Проверить какие заглавные буквы в ФИО будут заглавными (не генерировать PDF)")
+    ap.add_argument("--auto-base", action="store_true",
+                    help="Автоматически выбрать лучший базовый PDF из --base-dir с максимумом нативных заглавных букв для ФИО")
+    ap.add_argument("--base-dir", default=None,
+                    help="Папка для поиска базового PDF (по умол. база_чеков/vtb/СБП)")
     args = ap.parse_args()
 
     try:
@@ -567,6 +708,22 @@ def main() -> int:
     if not donor_path.exists():
         print(f"[ERROR] Не найден: {donor_path}", file=sys.stderr)
         return 1
+
+    # --- --auto-base: выбираем лучший базовый PDF из базы чеков ---
+    if args.auto_base:
+        sbp_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else (BASE / "база_чеков" / "vtb" / "СБП")
+        if sbp_dir.is_dir():
+            from find_reusable_cids import _get_cidtogid_map as _ctg_for_autobase
+            cur_ctg = _ctg_for_autobase(target_path.read_bytes())
+            fio_for_search = " ".join(filter(None, [args.payer, args.recipient]))
+            best_base, extra_chars = find_best_base_pdf(fio_for_search, sbp_dir, current_base_ctg=cur_ctg, verbose=True)
+            if best_base:
+                target_path = best_base
+                print(f"[auto-base] Используем базу: {target_path.name}", file=sys.stderr)
+            else:
+                print(f"[auto-base] Текущая база оптимальна: {target_path.name}", file=sys.stderr)
+        else:
+            print(f"[WARN] --base-dir не найден: {sbp_dir}", file=sys.stderr)
 
     # --- --check-caps: диагностика заглавных букв до генерации PDF ---
     if args.check_caps:
@@ -728,8 +885,12 @@ def main() -> int:
         else:
             _, reuse_map = find_reusable(target_path)
         if not reuse_map:
-            print(f"[ERROR] REPLACE: слоты не найдены. Используйте ADD.", file=sys.stderr)
-            return 1
+            if args.hybrid_safe and not extra_unis:
+                # Все буквы уже нативные в базовом PDF — инъекция не нужна, продолжаем патчинг
+                print(f"[INFO] hybrid-safe: все буквы ФИО нативные в базе, инъекция глифов не требуется.", file=sys.stderr)
+            else:
+                print(f"[ERROR] REPLACE: слоты не найдены. Используйте ADD.", file=sys.stderr)
+                return 1
         for target_uni, base_cid in reuse_map.items():
             donor_cid = DONOR_CIDS.get(target_uni)
             if donor_cid is None:
@@ -805,7 +966,7 @@ def main() -> int:
             w = int(w_raw * scale)
             new_cid_widths.append((cid, w))
 
-    if not uni_to_new_cid:
+    if not uni_to_new_cid and not args.replace:
         print("[ERROR] Не удалось получить маппинг Ф,Ч,Ю", file=sys.stderr)
         return 1
 
@@ -1060,8 +1221,8 @@ def main() -> int:
     temp_pdf.unlink(missing_ok=True)
     print("✅ Готово:", out_path)
     added = list(uni_to_new_cid.keys())
-    bf = "AAHTMC" if " 13.pdf" in target_path.name else "AASONC"
-    print(f"   База: {target_path.name} (BaseFont {bf})")
+    bf = "AAHTMC" if " 13.pdf" in target_path.name else target_path.stem[:8].upper()
+    print(f"   База: {target_path.name}")
     print(f"   Дата в чеке: {date_str}")
     print(f"   Document ID: {id_method if id_m else 'не найден'}")
     print(f"   Глифы: {''.join(chr(u) for u in added)}" if added else "")
