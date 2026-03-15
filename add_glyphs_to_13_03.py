@@ -1415,11 +1415,20 @@ def main() -> int:
                     except Exception:
                         pass
             hex1 = _ref_id_hex
+        def _decimal_safe_incs(hex_char):
+            """Инкременты 1..15, которые оставляют десятичную цифру десятичной.
+            Если исходный символ — буква (A-F), разрешены любые инкременты."""
+            base = int(hex_char.upper(), 16)
+            if base < 10:
+                return [i for i in range(1, 16) if (base + i) % 16 < 10] or list(range(1, 16))
+            return list(range(1, 16))
+
         if hex1:
             if not id_from_pdf:
                 # Рассчитываем pos/inc из _within (позиция внутри текущего шаблона)
                 pos = _safe_positions[_within // 15]
-                inc = (_within % 15) + 1  # 1..15
+                _valid_incs = _decimal_safe_incs(hex1[pos])
+                inc = _valid_incs[(_within % 15) % len(_valid_incs)]
             else:
                 # --id-from: используем простой счётчик без ротации шаблонов
                 _safe_positions = [0, 26]  # только подтверждённые безопасные позиции
@@ -1434,8 +1443,9 @@ def main() -> int:
                 except Exception:
                     pass
                 pos = _safe_positions[_slot_idx // 15]
-                inc = (_slot_idx % 15) + 1
-            idx = "0123456789ABCDEF".find(hex1[pos])
+                _valid_incs = _decimal_safe_incs(hex1[pos])
+                inc = _valid_incs[(_slot_idx % 15) % len(_valid_incs)]
+            idx = "0123456789ABCDEF".find(hex1[pos].upper())
             new_c = "0123456789ABCDEF"[(idx + inc) % 16]
             new1 = hex1[:pos] + new_c + hex1[pos + 1:]
             src = args.id_from if id_from_pdf else _used_ref_name
