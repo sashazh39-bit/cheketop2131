@@ -809,7 +809,17 @@ def main() -> int:
                     break
         if target_path is None:
             target_path = TARGET.resolve()
-    if not target_path.exists():
+        # Последний резерв: если шаблон не найден — берём любой PDF из базы чеков
+        if not target_path.exists():
+            sbp_dir_fb = BASE / "база_чеков" / "vtb" / "СБП"
+            if sbp_dir_fb.is_dir():
+                _candidates_fb = sorted(sbp_dir_fb.glob("*.pdf"), key=lambda f: f.stat().st_size, reverse=True)
+                for _c in _candidates_fb:
+                    if _c.stat().st_size > 5000:
+                        target_path = _c.resolve()
+                        print(f"[WARN] Шаблон 13.pdf не найден, используем из базы: {target_path.name}", file=sys.stderr)
+                        break
+    if not target_path or not target_path.exists():
         print(f"[ERROR] Не найден: {target_path}", file=sys.stderr)
         return 1
     if not donor_path.exists():
