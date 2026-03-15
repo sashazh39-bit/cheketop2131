@@ -472,9 +472,12 @@ def find_best_base_pdf(
         sbp_dir / "13-03-26_00-00 13.pdf",
     ]
     _ref_ys: "frozenset[float] | None" = None
+    _ref_size: int = 0  # размер эталонного 13.pdf — кандидат не должен быть крупнее
     for _rp in _ref_paths:
         if _rp.exists():
-            _ref_ys = _get_tm_ys(_rp.read_bytes())
+            _ref_raw = _rp.read_bytes()
+            _ref_ys = _get_tm_ys(_ref_raw)
+            _ref_size = len(_ref_raw)
             break
 
     # Ожидаемые Y-координаты плательщика и получателя (из 13.pdf layout).
@@ -483,10 +486,12 @@ def find_best_base_pdf(
     _EXPECTED_RECIPIENT_Y = 203.25
     _Y_SAFETY_TOL = 15.0
 
-    # FIO-only слоты: CID → набор символов, которые «естественно» его используют (из vtb_cmap)
+    # FIO-only слоты: CID → набор символов, которые «естественно» его используют (из vtb_cmap).
+    # CID 0x0221 кодирует только заглавную 'Е', CID 0x0222 — только 'Ж'.
+    # Строчные е/ж кодируются через другие CIDs и НЕ создают конфликта для этих слотов.
     _SLOT_NATURAL: "dict[int, frozenset[str]]" = {
-        0x0221: frozenset({"Е", "е"}),
-        0x0222: frozenset({"Ж", "ж"}),
+        0x0221: frozenset({"Е"}),
+        0x0222: frozenset({"Ж"}),
         0x023F: frozenset({"Г", "г"}),
     }
     _FIO_SLOT_LIST = [0x0221, 0x0222, 0x023F]
@@ -545,6 +550,10 @@ def find_best_base_pdf(
             continue  # пропускаем донора
         try:
             pdf_bytes_cand = pdf_path.read_bytes()
+            # Пропускаем PDF крупнее эталона 13.pdf — они дадут больший output (хуже проходимость).
+            # Допуск +300 байт чтобы не исключать валидные кандидаты из-за мелких различий.
+            if _ref_size and len(pdf_bytes_cand) > _ref_size + 300:
+                continue
             ctg = _get_cidtogid_map(pdf_bytes_cand)
             if not ctg:
                 continue
@@ -771,14 +780,33 @@ def main() -> int:
         sbp_dir = Path(args.base_dir).expanduser().resolve() if args.base_dir else (BASE / "база_чеков" / "vtb" / "СБП")
         if sbp_dir.is_dir():
             from find_reusable_cids import _get_cidtogid_map as _ctg_for_autobase
+            from vtb_cmap import _CID_CYRILLIC as _cmap_ab
             cur_ctg = _ctg_for_autobase(target_path.read_bytes())
             fio_for_search = " ".join(filter(None, [args.payer, args.recipient]))
-            best_base, extra_chars = find_best_base_pdf(fio_for_search, sbp_dir, current_base_ctg=cur_ctg, verbose=True)
-            if best_base:
-                target_path = best_base
-                print(f"[auto-base] Используем базу: {target_path.name}", file=sys.stderr)
+
+            # Подсчёт: сколько заглавных букв ФИО нужна инъекция в текущей базе,
+            # и сколько слотов для инъекции доступно (GID>0, без конфликтов с ФИО).
+            _fio_chars_ab = frozenset(fio_for_search)
+            # CID 0x0221 → только 'Е' (заглавная), CID 0x0222 → 'Ж', CID 0x023F → 'Г'+'г'
+            # (согласно vtb_cmap; строчные е/ж НЕ блокируют соответствующие слоты)
+            _SLOTS_AB = {0x0221: frozenset({'Е'}), 0x0222: frozenset({'Ж'}), 0x023F: frozenset({'Г', 'г'})}
+            _avail_slots = sum(
+                1 for cid, nat in _SLOTS_AB.items()
+                if cur_ctg.get(cid, 0) > 0 and not (nat & _fio_chars_ab)
+            )
+            _need_inject = sum(
+                1 for ch in set(fio_for_search)
+                if ch.isupper() and ch in _cmap_ab and cur_ctg.get(int(_cmap_ab[ch], 16), 0) == 0
+            )
+            if _need_inject <= _avail_slots:
+                print(f"[auto-base] Текущая база достаточна ({_need_inject} инъекций, {_avail_slots} слотов): {target_path.name}", file=sys.stderr)
             else:
-                print(f"[auto-base] Текущая база оптимальна: {target_path.name}", file=sys.stderr)
+                best_base, extra_chars = find_best_base_pdf(fio_for_search, sbp_dir, current_base_ctg=cur_ctg, verbose=True)
+                if best_base:
+                    target_path = best_base
+                    print(f"[auto-base] Используем базу: {target_path.name}", file=sys.stderr)
+                else:
+                    print(f"[auto-base] Кандидат не найден, остаёмся на: {target_path.name}", file=sys.stderr)
         else:
             print(f"[WARN] --base-dir не найден: {sbp_dir}", file=sys.stderr)
 
