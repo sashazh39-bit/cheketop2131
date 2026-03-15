@@ -1,2 +1,5 @@
 # bot_standalone.py + vyписка_service, receipt_extractor
 PyMuPDF>=1.23.0
+
+# add_glyphs_to_13_03.py (проверка ФИО, генерация чека СБП)
+fonttools>=4.0.0
