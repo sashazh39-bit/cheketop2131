@@ -1204,6 +1204,13 @@ def main() -> int:
                     dec = _decompress_stream(bytes(tgt_data[tu_start : tu_start + tu_len]))
                     cid_uni_pairs = [(int(c, 16), u) for u, c in uni_to_new_cid.items()
                                      if u not in _case_fallback_unis]
+                    # Верификатор требует ровно 3 bfchar записи для слотов 0221/0222/023F.
+                    # Если какой-то слот не использован — дополняем стандартными значениями.
+                    _FIO_SLOT_DEFAULTS = {0x0221: 0x041D, 0x0222: 0x0420, 0x023F: 0x041A}  # Н, Р, К
+                    _used_slot_cids = {cid for cid, _ in cid_uni_pairs}
+                    for _slot_cid, _slot_uni in _FIO_SLOT_DEFAULTS.items():
+                        if _slot_cid not in _used_slot_cids:
+                            cid_uni_pairs.append((_slot_cid, _slot_uni))
                     new_dec = _add_tounicode_entries(dec, cid_uni_pairs)
                     new_tu = _compress_stream(new_dec)
                 except (zlib.error, KeyError):
