@@ -237,6 +237,8 @@ def _replace_glyph_in_slot(
     donor_gid = donor_ctg.get(donor_cid, donor_cid)
     if base_gid is None or donor_gid is None:
         return False
+    if base_gid == 0:
+        return False  # инъекция в GID=0 (.notdef) — рендерер игнорирует изменения
     base_order = base_font.getGlyphOrder()
     donor_order = donor_font.getGlyphOrder()
     if base_gid >= len(base_order) or donor_gid >= len(donor_order):
@@ -481,6 +483,58 @@ def find_best_base_pdf(
     _EXPECTED_RECIPIENT_Y = 203.25
     _Y_SAFETY_TOL = 15.0
 
+    # FIO-only слоты: CID → набор символов, которые «естественно» его используют (из vtb_cmap)
+    _SLOT_NATURAL: "dict[int, frozenset[str]]" = {
+        0x0221: frozenset({"Е", "е"}),
+        0x0222: frozenset({"Ж", "ж"}),
+        0x023F: frozenset({"Г", "г"}),
+    }
+    _FIO_SLOT_LIST = [0x0221, 0x0222, 0x023F]
+
+    def _is_fully_renderable(ctg: "dict[int, int]") -> bool:
+        """Вернуть True если все символы из fio_text можно рендерить через данный CIDToGIDMap.
+
+        Символы с GID=0 могут быть инъецированы в FIO-only слоты (при условии что слот
+        имеет GID>0 и не конфликтует с другим символом из ФИО).
+        """
+        from vtb_cmap import _CID_CYRILLIC, _CID_DIGIT
+        _all_vtb: "dict[str, str]" = {**_CID_CYRILLIC, **_CID_DIGIT}
+
+        fio_chars = frozenset(ch for ch in fio_text if ch.isalpha())
+
+        # Собираем символы ФИО с GID=0 в данной базе
+        blank_chars: list[str] = []
+        for ch in sorted(fio_chars):
+            cid_str = _all_vtb.get(ch)
+            if not cid_str:
+                continue
+            cid = int(cid_str, 16)
+            if ctg.get(cid, 0) == 0:
+                blank_chars.append(ch)
+
+        if not blank_chars:
+            return True
+
+        # Жадное распределение blank_chars по слотам
+        used_slots: set[int] = set()
+        for ch in blank_chars:
+            placed = False
+            for slot in _FIO_SLOT_LIST:
+                if slot in used_slots:
+                    continue
+                if ctg.get(slot, 0) == 0:
+                    continue  # слот без глифа — инъекция в него запрещена (GID=0)
+                # Конфликт: другой символ из ФИО использует этот слот как родной
+                other_naturals = _SLOT_NATURAL.get(slot, frozenset()) - {ch}
+                if other_naturals & fio_chars:
+                    continue
+                used_slots.add(slot)
+                placed = True
+                break
+            if not placed:
+                return False
+        return True
+
     best_path: "Path | None" = None
     best_extra: set[str] = set()
     best_score = 0
@@ -512,6 +566,9 @@ def find_best_base_pdf(
                     continue  # recipient Y смещён → PDF небезопасен
             except Exception:
                 pass  # если fitz недоступен — не фильтруем по этому критерию
+            # Проверяем что все символы ФИО (включая строчные) рендерятся в этом PDF
+            if not _is_fully_renderable(ctg):
+                continue  # хотя бы один символ ФИО не может быть ни нативным, ни инъецированным
             # Буквы, которые есть нативно в этом PDF И нужны в ФИО, НО отсутствуют в текущей базе
             extra_cids = {cid for cid in missing_needed_cids if ctg.get(cid, 0) > 0}
             score = len(extra_cids)
@@ -842,6 +899,8 @@ def main() -> int:
                     for slot in _FIO_ONLY_SLOTS:
                         if slot in used_slots:
                             continue
+                        if (base_ctg or {}).get(slot, 0) == 0:
+                            continue  # GID=0 в базе — инъекция в .notdef запрещена
                         conflict = _cid_int_to_fio_chars.get(slot, set()) & fio_unis - {uni}
                         if not conflict:
                             reuse_map[uni] = slot
