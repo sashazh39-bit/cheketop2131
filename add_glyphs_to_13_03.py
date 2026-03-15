@@ -1363,8 +1363,11 @@ def main() -> int:
             if not _valid_templates:
                 _valid_templates = [target_path]
 
-            _safe_positions = list(range(0, 8)) + list(range(20, 32))
-            _slots_per_tpl = len(_safe_positions) * 15  # 20 × 15 = 300
+            # Только эмпирически подтверждённые безопасные позиции для 15-03-26 ID:
+            # pos0 (✅ PASS), pos26 (✅ PASS).
+            # pos4,20,24,27 — FAIL. Остальные не тестировались, не включаем.
+            _safe_positions = [0, 26]
+            _slots_per_tpl = len(_safe_positions) * 15  # 2 × 15 = 30
             _total_slots = len(_valid_templates) * _slots_per_tpl
             _counter_file = Path(__file__).parent / ".docid_counter"
             try:
@@ -1409,7 +1412,7 @@ def main() -> int:
                 inc = (_within % 15) + 1  # 1..15
             else:
                 # --id-from: используем простой счётчик без ротации шаблонов
-                _safe_positions = list(range(0, 8)) + list(range(20, 32))
+                _safe_positions = [0, 26]  # только подтверждённые безопасные позиции
                 _total_slots_simple = len(_safe_positions) * 15
                 _counter_file = Path(__file__).parent / ".docid_counter"
                 try:
