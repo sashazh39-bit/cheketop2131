@@ -228,14 +228,23 @@ def patch_from_values(
     message: str | None = None,
     keep_metadata: bool = False,
     keep_date: bool = False,
+    override_uni_to_cid: dict[int, str] | None = None,
+    original_cid_widths: dict[int, int] | None = None,
 ) -> bytes:
-    """Патч: wall и pts из донора; pts из блока при замене по Y."""
+    """Патч: wall и pts из донора; pts из блока при замене по Y.
+
+    original_cid_widths — /W до замены глифов (для корректного расчёта scale по старому ФИО).
+    Если не передан, используется текущий /W (возможна неточность при hybrid-safe замене).
+    """
     pdf_bytes = pdf_path.read_bytes()
     params = get_vtb_per_field_params(pdf_path)
     layout = get_layout_values()
     raw = get_field_align_raw(pdf_path)
     cid_widths = _parse_cid_widths(pdf_bytes)
-    uni_to_cid = _parse_donor_tounicode(pdf_bytes)
+    # Для вычисления old_units (scale по старому ФИО) используем ИСХОДНЫЕ ширины,
+    # чтобы замена глифов не сдвигала scale.
+    old_cid_widths = original_cid_widths if original_cid_widths is not None else cid_widths
+    uni_to_cid = override_uni_to_cid or _parse_donor_tounicode(pdf_bytes)
     wall = params.get("wall") or layout["wall"]
     center_heading = params.get("center_heading") or layout["center_heading"]
     ly = layout["y"]
@@ -335,8 +344,14 @@ def patch_from_values(
             dec: bytes, y_list: list[float], new_tj: bytes,
             n_min: int = 0, n_max: int = 999, tol: float = 0.15,
             exclude_y_list: list[float] | None = None,
+            font_pts_per_unit: float | None = None,
         ) -> bytes:
-            """Последний символ = wall. Ширина TJ считается по /W и кернингу."""
+            """Последний символ = wall. Ширина TJ считается по /W и кернингу.
+
+            font_pts_per_unit: если задан, new_x = wall - new_units * font_pts_per_unit
+              (точное выравнивание по шрифтовым метрикам, игнорирует tm_x как опорную точку).
+              Например: font_size=9pt / unitsPerEm=1000 → 0.009.
+            """
             exclude_y = exclude_y_list or []
             pat = rb"(1 0 0 1 )([\d.]+)( ([\d.]+) Tm)\s*\[([^\]]*)\](\s*TJ)"
             for mt in re.finditer(pat, dec):
@@ -353,17 +368,22 @@ def patch_from_values(
                 if n_old <= 0 or not (n_min <= n_old <= n_max):
                     continue
                 new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
-                old_units = _tj_advance_units(old_content, cid_widths)
                 new_units = _tj_advance_units(new_content, cid_widths)
-                if old_units > 0 and new_units > 0:
-                    scale = (wall - tm_x) / old_units
-                    new_x = wall - new_units * scale
+                if font_pts_per_unit is not None and new_units > 0:
+                    # Точное выравнивание: new_x = wall - ширина_в_пт (не зависит от tm_x)
+                    new_x = wall - new_units * font_pts_per_unit
                 else:
-                    p = (wall - tm_x) / n_old
-                    if p <= 0 or p > 15:
-                        p = _fallback_pts(new_tj)
-                    n_new = n_glyphs(b"[" + new_content + b"]")
-                    new_x = tm_x_touch_wall(wall, n_new, p)
+                    # old_units: используем ИСХОДНЫЕ ширины (до замены глифов), чтобы scale = правильный
+                    old_units = _tj_advance_units(old_content, old_cid_widths)
+                    if old_units > 0 and new_units > 0:
+                        scale = (wall - tm_x) / old_units
+                        new_x = wall - new_units * scale
+                    else:
+                        p = (wall - tm_x) / n_old
+                        if p <= 0 or p > 15:
+                            p = _fallback_pts(new_tj)
+                        n_new = n_glyphs(b"[" + new_content + b"]")
+                        new_x = tm_x_touch_wall(wall, n_new, p)
                 repl = mt.group(1) + f"{new_x:.5f}".encode() + mt.group(3) + b" [" + new_content + b"]" + mt.group(6)
                 return dec.replace(mt.group(0), repl)
             return dec
@@ -411,7 +431,7 @@ def patch_from_values(
                 if n_old <= 0:
                     continue
                 new_content = new_tj[1:-1] if new_tj.startswith(b"[") and new_tj.endswith(b"]") else new_tj
-                old_units = _tj_advance_units(old_content, cid_widths)
+                old_units = _tj_advance_units(old_content, old_cid_widths)
                 new_units = _tj_advance_units(new_content, cid_widths)
                 if old_units > 0 and new_units > 0:
                     scale = 2 * (center_heading - tm_x) / old_units
@@ -633,7 +653,10 @@ def patch_from_values(
         if new_opid_tj:
             ys_opid, tol_opid = _y_list("opid")
             exclude_done = [raw["y"]["done"]] if raw.get("y", {}).get("done") is not None else []
-            out = replace_field_by_y(new_dec, ys_opid, new_opid_tj, n_min=15, tol=max(y_tol, tol_opid), exclude_y_list=exclude_done)
+            # font_pts_per_unit=0.009 (font_size=9pt / unitsPerEm=1000) для точного выравнивания
+            # к правому краю независимо от tm_x в deepcopy-генерируемом PDF
+            out = replace_field_by_y(new_dec, ys_opid, new_opid_tj, n_min=15, tol=max(y_tol, tol_opid),
+                                     exclude_y_list=exclude_done, font_pts_per_unit=0.009)
             if out != new_dec:
                 new_dec = out
 

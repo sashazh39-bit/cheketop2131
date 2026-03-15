@@ -89,7 +89,27 @@ def _parse_tounicode_from_stream(stream_data: bytes) -> dict[int, str]:
             cid = mm.group(1).decode().upper().zfill(4)
             uni = int(mm.group(2).decode().upper(), 16)
             uni_to_cid[uni] = cid
-    elif b"beginbfrange" in dec:
+    if b"beginbfrange" in dec:
+        for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
+            s1, s2, d = int(mm.group(1).decode(), 16), int(mm.group(2).decode(), 16), int(mm.group(3).decode(), 16)
+            for i in range(s2 - s1 + 1):
+                uni_to_cid[d + i] = f"{s1 + i:04X}"
+    return uni_to_cid
+
+
+def _parse_tounicode_full(stream_data: bytes) -> dict[int, str]:
+    """Парсит beginbfchar И beginbfrange — полный маппинг (для find_reusable)."""
+    try:
+        dec = zlib.decompress(stream_data)
+    except zlib.error:
+        return {}
+    uni_to_cid: dict[int, str] = {}
+    if b"beginbfchar" in dec:
+        for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
+            cid = mm.group(1).decode().upper().zfill(4)
+            uni = int(mm.group(2).decode().upper(), 16)
+            uni_to_cid[uni] = cid
+    if b"beginbfrange" in dec:
         for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
             s1, s2, d = int(mm.group(1).decode(), 16), int(mm.group(2).decode(), 16), int(mm.group(3).decode(), 16)
             for i in range(s2 - s1 + 1):
@@ -114,7 +134,8 @@ def copy_font_cmap(
     merge_cmap_paths: list[Path] | None = None,
 ) -> bool:
     """
-    Скопировать шрифт и ToUnicode из source в target. Результат в out_path.
+    Скопировать шрифт, ToUnicode и /W из source в target. Результат в out_path.
+    /W — массив ширин глифов, нужен для корректного отображения (без наложения).
     merge_cmap_paths: доп. PDF для объединения CMap (символы из разных чеков).
     """
     src_data = source_path.read_bytes()
@@ -134,8 +155,11 @@ def copy_font_cmap(
     ti = tgt_info["tounicode"]
     new_font = src_font
 
-    # ToUnicode: объединяем из source + merge_cmap
-    uni_to_cid = _parse_tounicode_from_stream(src_tounicode)
+    # ToUnicode: база из TARGET (сохраняем отображение существующего контента), добавляем из source недостающие
+    uni_to_cid = _parse_tounicode_from_stream(tgt_tounicode)
+    for uni, cid in _parse_tounicode_from_stream(src_tounicode).items():
+        if uni not in uni_to_cid:
+            uni_to_cid[uni] = cid
     for p in merge_cmap_paths or []:
         if p.exists():
             _, extra_tu, _ = _find_font_and_tounicode(p.read_bytes())
@@ -143,7 +167,7 @@ def copy_font_cmap(
                 for k, v in _parse_tounicode_from_stream(extra_tu).items():
                     if k not in uni_to_cid:
                         uni_to_cid[k] = v
-    new_tu = _build_tounicode_stream(uni_to_cid) if uni_to_cid else src_tounicode
+    new_tu = _build_tounicode_stream(uni_to_cid) if uni_to_cid else tgt_tounicode
 
     # Заменяем от начала к концу (второй stream сдвигается после первой замены)
     min_pos = min(fi["stream_start"], ti["stream_start"])

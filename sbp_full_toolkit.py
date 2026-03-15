@@ -57,7 +57,6 @@ def parse_tounicode(data: bytes) -> dict[int, str]:
                 cid = mm.group(1).decode().upper().zfill(4)
                 uni = int(mm.group(2).decode().upper(), 16)
                 uni_to_cid[uni] = cid
-            return uni_to_cid
         if b"beginbfrange" in dec:
             for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
                 src_start = int(mm.group(1).decode().upper(), 16)
@@ -65,8 +64,9 @@ def parse_tounicode(data: bytes) -> dict[int, str]:
                 dest = int(mm.group(3).decode().upper(), 16)
                 for i in range(src_end - src_start + 1):
                     uni_to_cid[dest + i] = f"{src_start + i:04X}"
+        if uni_to_cid:
             return uni_to_cid
-    return {}
+    return uni_to_cid
 
 
 def extract_tj_blocks(data: bytes) -> list[tuple[float, float, bytes]]:
