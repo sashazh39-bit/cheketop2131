@@ -398,6 +398,9 @@ def run_sbp_generate(
             parts = date_str.strip().split(",")
             date_part = parts[0].strip()
             time_part = parts[1].strip() if len(parts) > 1 else datetime.now().strftime("%H:%M")
+        # Используем 15-03-26 как базовый шаблон и источник ID (актуальный, проходит проверку)
+        _template_15 = str(_BOT_DIR / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf")
+        _template_exists = Path(_template_15).exists()
         cmd = [
             os.sys.executable, str(_ADD_GLYPHS_SCRIPT),
             "--replace", "--hybrid-safe", "--auto-base",
@@ -409,6 +412,8 @@ def run_sbp_generate(
             "--time", time_part,
             "-o", out_path,
         ]
+        if _template_exists:
+            cmd.extend(["--id-from", _template_15])
         if account and re.match(r"^\d{4}$", account):
             cmd.extend(["--account", account])
         if operation_id:

@@ -24,17 +24,20 @@ from io import BytesIO
 BASE = Path(__file__).parent
 DONOR = BASE / "база_чеков" / "vtb" / "СБП" / "check (3).pdf"
 
-# 13.pdf — для совпадения структуры (BaseFont AAHTMC, obj 1,9,13,17)
+# 15-03-26 — актуальный шаблон (проходит проверку, приоритет 1)
+# 13-03-26 — старый шаблон (резерв)
 TARGET_13 = [
+    BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf",
+    BASE / "15-03-26_00-00.pdf",
+    Path.home() / "Downloads" / "15-03-26_00-00.pdf",
     Path.home() / "Downloads" / "13-03-26_00-00 13.pdf",
     BASE / "база_чеков" / "vtb" / "СБП" / "13-03-26_00-00 13.pdf",
 ]
-# 17.pdf — для прохождения проверки (BaseFont AASONC)
 TARGET_17 = [
     Path.home() / "Downloads" / "13-03-26_00-00 17.pdf",
     BASE / "база_чеков" / "vtb" / "СБП" / "13-03-26_00-00 17.pdf",
 ]
-TARGET = Path.home() / "Downloads" / "13-03-26_00-00 13.pdf"  # fallback
+TARGET = BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf"  # fallback
 
 # check(3).pdf ToUnicode (из beginbfrange):
 #   Uppercase А-Я:  Unicode 0x0410-0x042F → CID 0x021C-0x023B
@@ -1336,19 +1339,24 @@ def main() -> int:
             # Всегда берём Document ID из эталонного 13.pdf (бот его знает).
             # Если auto-base выбрал другой PDF для глифов — это не влияет на Document ID.
             # Безопасные позиции: 0-7 и 20-31 (8-19 заморожены ботом, проверено эмпирически).
-            _ref_pdf = Path(__file__).parent / "база_чеков" / "vtb" / "СБП" / ".." / ".." / ".." / "Downloads" / "13-03-26_00-00 13.pdf"
-            # Ищем 13.pdf в Downloads
+            # Приоритет: 15-03-26 (актуальный, проходит проверку) > 13-03-26 (старый)
             _ref_candidates = [
+                BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf",
+                BASE / "15-03-26_00-00.pdf",
+                Path.home() / "Downloads" / "15-03-26_00-00.pdf",
                 Path.home() / "Downloads" / "13-03-26_00-00 13.pdf",
+                BASE / "база_чеков" / "vtb" / "СБП" / "13-03-26_00-00 13.pdf",
                 target_path,  # fallback: текущая база
             ]
             _ref_id_hex = None
+            _used_ref_name = "неизвестно"
             for _rc in _ref_candidates:
                 try:
                     _rc_bytes = _rc.read_bytes()
                     _rc_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', _rc_bytes)
                     if _rc_m:
                         _ref_id_hex = _rc_m.group(1).decode().upper()
+                        _used_ref_name = Path(_rc).name if hasattr(_rc, 'name') else str(_rc)
                         break
                 except Exception:
                     pass
@@ -1373,7 +1381,7 @@ def main() -> int:
             idx = "0123456789ABCDEF".find(hex1[pos])
             new_c = "0123456789ABCDEF"[(idx + inc) % 16]
             new1 = hex1[:pos] + new_c + hex1[pos + 1:]
-            src = args.id_from if id_from_pdf else "13-03-26_00-00 13.pdf"
+            src = args.id_from if id_from_pdf else _used_ref_name
             id_method = f"из {src}, 1 символ изменён (поз.{pos} inc={inc}, слот={_slot_idx})"
         else:
             import os as _os
