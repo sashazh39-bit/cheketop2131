@@ -900,7 +900,6 @@ def _pristine_mode(args, target_path: Path) -> int:
         print(f"[WARN] pristine: ФИО содержит конфликтные символы {_fio_conflicts}. "
               f"Текст-экстракция для этих букв будет неточной.", file=sys.stderr)
     tgt_data = _inject_bfchar_into_tounicode(tgt_data, bfchar_pairs)
-    native_uni_to_cid = parse_tounicode(bytes(tgt_data))
 
     phone = args.phone
     if phone is None:
