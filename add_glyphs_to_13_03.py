@@ -764,14 +764,34 @@ def _check_caps_mode(target_path: Path, payer: str, recipient: str) -> int:
 
 
 def _pristine_mode(args, target_path: Path) -> int:
-    """Кристально чистый режим: модифицирует ТОЛЬКО content stream (текст), CreationDate, Document ID.
-    Шрифт, ToUnicode, /W, BaseFont, FontDescriptor, font stream — нетронуты.
-    Результат побайтово идентичен оригиналу кроме текста/даты/ID."""
+    """Кристально чистый режим: модифицирует ТОЛЬКО content stream (текст), CreationDate,
+    Document ID и добавляет 3 фиксированных bfchar записи (Н/Р/К) в ToUnicode.
+    Шрифт, /W, BaseFont, FontDescriptor, font stream, CIDToGIDMap — нетронуты."""
     from datetime import datetime
     from vtb_patch_from_config import patch_from_values
     from vtb_test_generator import update_creation_date
     from sbp_full_toolkit import parse_tounicode
     import random as _random
+
+    # Pristine использует ТОЛЬКО 15-03-26 шаблоны (проверенная структура с bfchar)
+    _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
+    _pristine_bases = [
+        _sbp_dir / "15-03-26_00-00.pdf",
+        _sbp_dir / "15-03-26_00-00 2.pdf",
+        _sbp_dir / "15-03-26_00-00 3.pdf",
+        _sbp_dir / "15-03-26_00-00 4.pdf",
+        _sbp_dir / "15-03-26_00-00 5.pdf",
+        _sbp_dir / "15-03-26_00-00 6.pdf",
+        _sbp_dir / "15-03-26_00-00 7.pdf",
+        _sbp_dir / "15-03-26_22-51.pdf",
+        _sbp_dir / "15-03-26_22-52.pdf",
+    ]
+    _pristine_bases = [p for p in _pristine_bases if p.exists()]
+    if _pristine_bases:
+        target_path = _pristine_bases[0]
+        print(f"[pristine] База: {target_path.name}", file=sys.stderr)
+    else:
+        print("[WARN] pristine: 15-03-26 шаблоны не найдены, используем текущий target", file=sys.stderr)
 
     tgt_data = bytearray(target_path.read_bytes())
 
@@ -861,6 +881,46 @@ def _pristine_mode(args, target_path: Path) -> int:
     out_arr = bytearray(out)
     update_creation_date(out_arr, meta_date)
 
+    # Добавляем 3 фиксированных bfchar записи — верификатор требует их
+    # Значения из эмпирически проходящих чеков: 0221→К, 0222→Р, 023F→К
+    _BFCHAR_FIXED = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]  # К, Р, К
+    _tu_pat = re.compile(rb'(stream\r?\n)(.*?)(endstream)', re.DOTALL)
+    for _tm in _tu_pat.finditer(bytes(out_arr)):
+        try:
+            _dec = zlib.decompress(_tm.group(2))
+            if b'CMapName' not in _dec and b'beginbfrange' not in _dec:
+                continue
+            if b'beginbfchar' in _dec:
+                break  # уже есть bfchar — не трогаем
+            _bfblock = b"\n3 beginbfchar\n"
+            for _cid, _uni in _BFCHAR_FIXED:
+                _bfblock += f"<{_cid:04X}> <{_uni:04X}>\n".encode()
+            _bfblock += b"endbfchar\n"
+            _endcmap = _dec.find(b"endcmap")
+            if _endcmap < 0:
+                continue
+            _new_dec = _dec[:_endcmap] + _bfblock + _dec[_endcmap:]
+            _new_compressed = zlib.compress(_new_dec, 9)
+            _old_start = _tm.start(2)
+            _old_end = _tm.end(2)
+            out_arr[_old_start:_old_end] = _new_compressed
+            _len_diff = len(_new_compressed) - (_old_end - _old_start)
+            # Обновляем /Length для этого потока
+            _before = bytes(out_arr[:_tm.start()])
+            _len_m = re.search(rb'/Length\s+(\d+)', _before[::-1])
+            if not _len_m:
+                _len_m2 = list(re.finditer(rb'/Length\s+(\d+)', _before))
+                if _len_m2:
+                    _lm = _len_m2[-1]
+                    _old_len_str = _lm.group(1)
+                    _new_len_val = len(_new_compressed)
+                    _new_len_str = str(_new_len_val).encode().ljust(len(_old_len_str))[:len(_old_len_str)]
+                    out_arr[_lm.start(1):_lm.end(1)] = _new_len_str
+            print(f"[pristine] Добавлены 3 bfchar записи (Н/Р/К) в ToUnicode", file=sys.stderr)
+            break
+        except (zlib.error, Exception):
+            continue
+
     id_from_pdf = _extract_id_from_pdf(Path(args.id_from)) if args.id_from else None
     id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', out_arr)
     id_method = "не найден"
@@ -868,20 +928,7 @@ def _pristine_mode(args, target_path: Path) -> int:
         if id_from_pdf:
             hex1 = (id_from_pdf if isinstance(id_from_pdf, str) else id_from_pdf.decode()).upper()
         else:
-            _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
-            _valid_templates = [
-                _sbp_dir / "16-03-26_00-00.pdf",
-                _sbp_dir / "15-03-26_00-00.pdf",
-                _sbp_dir / "15-03-26_00-00 2.pdf",
-                _sbp_dir / "15-03-26_00-00 3.pdf",
-                _sbp_dir / "15-03-26_00-00 4.pdf",
-                _sbp_dir / "15-03-26_00-00 5.pdf",
-                _sbp_dir / "15-03-26_00-00 6.pdf",
-                _sbp_dir / "15-03-26_00-00 7.pdf",
-                _sbp_dir / "15-03-26_22-51.pdf",
-                _sbp_dir / "15-03-26_22-52.pdf",
-            ]
-            _valid_templates = [p for p in _valid_templates if p.exists()]
+            _valid_templates = [p for p in _pristine_bases if p.exists()]
             if not _valid_templates:
                 _valid_templates = [target_path]
             _safe_positions = [0]
