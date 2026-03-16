@@ -799,7 +799,7 @@ def _rebuild_xref(data: bytearray) -> bytearray:
 
 
 def _inject_bfchar_into_tounicode(data: bytearray, bfchar_pairs: list[tuple[int, int]]) -> bytearray:
-    """Инъецировать bfchar записи в ToUnicode CMap stream и пересчитать /Length + xref."""
+    """Инъецировать bfchar записи в ToUnicode CMap stream с дельта-обновлением xref."""
     raw = bytes(data)
     tu_stream_pat = re.compile(rb'stream\r?\n(.*?)endstream', re.DOTALL)
     for m in tu_stream_pat.finditer(raw):
@@ -819,26 +819,39 @@ def _inject_bfchar_into_tounicode(data: bytearray, bfchar_pairs: list[tuple[int,
         insert_pos = dec_str.find('endcmap')
         if insert_pos < 0:
             continue
-        new_dec = dec_str[:insert_pos] + bfchar_block + dec_str[insert_pos:]
-        new_compressed = zlib.compress(new_dec.encode('latin-1'), 9)
+        new_dec_str = dec_str[:insert_pos] + bfchar_block + dec_str[insert_pos:]
+        new_compressed = zlib.compress(new_dec_str.encode('latin-1'), 9)
         old_compressed = m.group(1)
-        result = bytearray()
-        result += raw[:m.start(1)]
-        result += new_compressed
-        tail_start = m.start(1) + len(old_compressed)
-        result += raw[tail_start:]
+        delta = len(new_compressed) - len(old_compressed)
+        stream_end = m.start(1) + len(old_compressed)
+        result = bytearray(raw[:m.start(1)] + new_compressed + raw[stream_end:])
         length_pat = re.compile(rb'/Length\s+(\d+)')
-        search_start = max(0, m.start() - 200)
-        for lm in length_pat.finditer(bytes(result), search_start):
+        for lm in length_pat.finditer(bytes(result), max(0, m.start() - 200)):
             if lm.start() < m.start():
                 old_len_str = lm.group(1)
                 new_len_val = len(new_compressed)
                 new_len_str = str(new_len_val).encode()
                 if len(new_len_str) <= len(old_len_str):
                     new_len_str = new_len_str.ljust(len(old_len_str))
-                result[lm.start(1):lm.end(1)] = new_len_str
+                    result[lm.start(1):lm.end(1)] = new_len_str
                 break
-        return _rebuild_xref(result)
+        if delta != 0:
+            xref_m = re.search(
+                rb'xref\r?\n(\d+)\s+(\d+)\r?\n((?:\d{10}\s\d{5}\s[fn]\s*\r?\n)+)',
+                result)
+            if xref_m:
+                entries = bytearray(xref_m.group(3))
+                for em in re.finditer(rb'(\d{10})\s(\d{5})\s(n)', entries):
+                    offset = int(em.group(1))
+                    if offset > stream_end:
+                        entries[em.start(1):em.start(1) + 10] = f"{offset + delta:010d}".encode()
+                result[xref_m.start(3):xref_m.end(3)] = bytes(entries)
+            startxref_m = re.search(rb'startxref\r?\n(\d+)\r?\n', result)
+            if startxref_m:
+                old_pos = int(startxref_m.group(1))
+                pos = startxref_m.start(1)
+                result[pos:pos + len(str(old_pos))] = str(old_pos + delta).encode()
+        return result
     return data
 
 
@@ -1543,6 +1556,9 @@ def main() -> int:
 
     id_from_pdf = _extract_id_from_pdf(Path(args.id_from)) if args.id_from else None
 
+    _bfchar_pre = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]
+    tgt_data = _inject_bfchar_into_tounicode(tgt_data, _bfchar_pre)
+
     temp_pdf = BASE / ".temp_13_03_mod.pdf"
     temp_pdf.write_bytes(tgt_data)
 
@@ -1593,8 +1609,6 @@ def main() -> int:
 
     out_arr = bytearray(out)
     update_creation_date(out_arr, meta_date)
-    _bfchar_fixed = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]
-    out_arr = _inject_bfchar_into_tounicode(out_arr, _bfchar_fixed)
     id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', out_arr)
     if id_m:
         import random as _random
