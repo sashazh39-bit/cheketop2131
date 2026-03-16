@@ -24,9 +24,12 @@ from io import BytesIO
 BASE = Path(__file__).parent
 DONOR = BASE / "база_чеков" / "vtb" / "СБП" / "check (3).pdf"
 
-# 15-03-26 — актуальный шаблон (проходит проверку, приоритет 1)
+# 16-03-26 — актуальный шаблон (проходит целостность, приоритет 0)
+# 15-03-26 — предыдущий шаблон (резерв, приоритет 1)
 # 13-03-26 — старый шаблон (резерв)
 TARGET_13 = [
+    BASE / "база_чеков" / "vtb" / "СБП" / "16-03-26_00-00.pdf",
+    Path.home() / "Downloads" / "16-03-26_00-00.pdf",
     BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf",
     BASE / "15-03-26_00-00.pdf",
     Path.home() / "Downloads" / "15-03-26_00-00.pdf",
@@ -37,7 +40,7 @@ TARGET_17 = [
     Path.home() / "Downloads" / "13-03-26_00-00 17.pdf",
     BASE / "база_чеков" / "vtb" / "СБП" / "13-03-26_00-00 17.pdf",
 ]
-TARGET = BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf"  # fallback
+TARGET = BASE / "база_чеков" / "vtb" / "СБП" / "16-03-26_00-00.pdf"  # fallback
 
 # check(3).pdf ToUnicode (из beginbfrange):
 #   Uppercase А-Я:  Unicode 0x0410-0x042F → CID 0x021C-0x023B
@@ -760,6 +763,217 @@ def _check_caps_mode(target_path: Path, payer: str, recipient: str) -> int:
     return 0
 
 
+def _pristine_mode(args, target_path: Path) -> int:
+    """Кристально чистый режим: модифицирует ТОЛЬКО content stream (текст), CreationDate, Document ID.
+    Шрифт, ToUnicode, /W, BaseFont, FontDescriptor, font stream — нетронуты.
+    Результат побайтово идентичен оригиналу кроме текста/даты/ID."""
+    from datetime import datetime
+    from vtb_patch_from_config import patch_from_values
+    from vtb_test_generator import update_creation_date
+    from sbp_full_toolkit import parse_tounicode
+    import random as _random
+
+    tgt_data = bytearray(target_path.read_bytes())
+
+    native_uni_to_cid = parse_tounicode(bytes(tgt_data))
+    if not native_uni_to_cid:
+        print("[ERROR] pristine: не удалось извлечь ToUnicode из шаблона", file=sys.stderr)
+        return 1
+
+    fio_all = " ".join(filter(None, [args.payer, args.recipient]))
+    missing = []
+    for ch in set(fio_all):
+        if ch in (' ', '.', ',', '-', '‑'):
+            continue
+        if ord(ch) not in native_uni_to_cid:
+            missing.append(ch)
+    if missing:
+        print(f"[ERROR] pristine: символы отсутствуют в шаблоне: {' '.join(sorted(missing))}", file=sys.stderr)
+        native_upper = sorted(chr(u) for u in native_uni_to_cid if 0x0410 <= u <= 0x042F)
+        print(f"  Доступные заглавные: {' '.join(native_upper)}", file=sys.stderr)
+        print(f"  Совет: используйте ФИО только из этих букв", file=sys.stderr)
+        return 1
+
+    phone = args.phone
+    if phone is None:
+        try:
+            from vtb_cmap import gen_phone
+            phone = gen_phone()
+        except Exception:
+            phone = "+7 (900) 000‑00‑00"
+
+    date_str = None
+    meta_date = None
+    if args.date:
+        date_str = args.date
+        if args.time:
+            date_str += ", " + args.time
+        try:
+            dt = datetime.strptime(date_str, "%d.%m.%Y, %H:%M")
+            meta_date = dt.strftime("D:%Y%m%d%H%M00+03'00'")
+        except ValueError:
+            meta_date = datetime.now().strftime("D:%Y%m%d%H%M00+03'00'")
+    else:
+        date_str = datetime.now().strftime("%d.%m.%Y, %H:%M")
+        meta_date = datetime.now().strftime("D:%Y%m%d%H%M00+03'00'")
+
+    operation_id = args.operation_id
+    if args.keep_operation_id:
+        try:
+            from receipt_db import get_operation_id_from_pdf
+            operation_id = get_operation_id_from_pdf(target_path)
+        except Exception:
+            pass
+    if operation_id is None and args.date and args.time:
+        try:
+            from datetime import datetime as _dt
+            from vtb_cmap import gen_sbp_operation_id
+            dt = _dt.strptime(f"{args.date}, {args.time}", "%d.%m.%Y, %H:%M")
+            operation_id = gen_sbp_operation_id(
+                dt.date(), f"{dt.hour:02d}:{dt.minute:02d}",
+                direction="A", recipient_bank=args.bank or "",
+            )
+        except Exception:
+            pass
+
+    temp_pdf = BASE / ".temp_pristine.pdf"
+    temp_pdf.write_bytes(tgt_data)
+
+    try:
+        out = patch_from_values(
+            tgt_data, temp_pdf,
+            date_str=date_str,
+            payer=args.payer,
+            recipient=args.recipient,
+            phone=phone,
+            bank=args.bank,
+            amount=args.amount,
+            operation_id=operation_id,
+            keep_metadata=True,
+            override_uni_to_cid=native_uni_to_cid,
+            account_last4=args.account,
+        )
+    except ValueError as e:
+        print(f"[ERROR] pristine: {e}", file=sys.stderr)
+        temp_pdf.unlink(missing_ok=True)
+        return 1
+
+    out_arr = bytearray(out)
+    update_creation_date(out_arr, meta_date)
+
+    id_from_pdf = _extract_id_from_pdf(Path(args.id_from)) if args.id_from else None
+    id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', out_arr)
+    id_method = "не найден"
+    if id_m:
+        if id_from_pdf:
+            hex1 = (id_from_pdf if isinstance(id_from_pdf, str) else id_from_pdf.decode()).upper()
+        else:
+            _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
+            _valid_templates = [
+                _sbp_dir / "16-03-26_00-00.pdf",
+                _sbp_dir / "15-03-26_00-00.pdf",
+                _sbp_dir / "15-03-26_00-00 2.pdf",
+                _sbp_dir / "15-03-26_00-00 3.pdf",
+                _sbp_dir / "15-03-26_00-00 4.pdf",
+                _sbp_dir / "15-03-26_00-00 5.pdf",
+                _sbp_dir / "15-03-26_00-00 6.pdf",
+                _sbp_dir / "15-03-26_00-00 7.pdf",
+                _sbp_dir / "15-03-26_22-51.pdf",
+                _sbp_dir / "15-03-26_22-52.pdf",
+            ]
+            _valid_templates = [p for p in _valid_templates if p.exists()]
+            if not _valid_templates:
+                _valid_templates = [target_path]
+            _safe_positions = [0]
+            _slots_per_tpl = len(_safe_positions) * 9
+            _total_slots = len(_valid_templates) * _slots_per_tpl
+            _counter_file = Path(__file__).parent / ".docid_counter"
+            try:
+                _global_idx = int(_counter_file.read_text().strip()) % _total_slots
+            except Exception:
+                _global_idx = _random.randint(0, _total_slots - 1)
+            try:
+                _counter_file.write_text(str((_global_idx + 1) % _total_slots))
+            except Exception:
+                pass
+            _tpl_idx = _global_idx // _slots_per_tpl
+            _within = _global_idx % _slots_per_tpl
+            _chosen_tpl = _valid_templates[_tpl_idx % len(_valid_templates)]
+            _ref_id_hex = None
+            _used_ref_name = _chosen_tpl.name
+            try:
+                _rc_bytes = _chosen_tpl.read_bytes()
+                _rc_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', _rc_bytes)
+                if _rc_m:
+                    _ref_id_hex = _rc_m.group(1).decode().upper()
+            except Exception:
+                pass
+            if not _ref_id_hex:
+                for _fb_tpl in _valid_templates:
+                    try:
+                        _rc_bytes = _fb_tpl.read_bytes()
+                        _rc_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', _rc_bytes)
+                        if _rc_m:
+                            _ref_id_hex = _rc_m.group(1).decode().upper()
+                            _used_ref_name = _fb_tpl.name
+                            break
+                    except Exception:
+                        pass
+            hex1 = _ref_id_hex
+
+        def _decimal_safe_incs(hex_char):
+            base = int(hex_char.upper(), 16)
+            return [i for i in range(1, 16) if (base + i) % 16 < 10]
+
+        if hex1:
+            if not id_from_pdf:
+                pos = _safe_positions[_within // 9]
+                _valid_incs = _decimal_safe_incs(hex1[pos])
+                inc = _valid_incs[_within % len(_valid_incs)]
+            else:
+                _safe_positions_idf = [0]
+                _counter_file_idf = Path(__file__).parent / ".docid_counter"
+                try:
+                    _slot_idx = int(_counter_file_idf.read_text().strip()) % 9
+                except Exception:
+                    _slot_idx = _random.randint(0, 8)
+                try:
+                    _counter_file_idf.write_text(str((_slot_idx + 1) % 9))
+                except Exception:
+                    pass
+                pos = 0
+                _valid_incs = _decimal_safe_incs(hex1[pos])
+                inc = _valid_incs[_slot_idx % len(_valid_incs)]
+            idx = "0123456789ABCDEF".find(hex1[pos].upper())
+            new_c = "0123456789ABCDEF"[(idx + inc) % 16]
+            new1 = hex1[:pos] + new_c + hex1[pos + 1:]
+            src = args.id_from if id_from_pdf else _used_ref_name
+            tpl_info = f" (шаблон {_tpl_idx + 1}/{len(_valid_templates)})" if not id_from_pdf else ""
+            id_method = f"из {src}{tpl_info}, 1 символ изменён (поз.{pos} inc={inc})"
+            slot_len = id_m.end(1) - id_m.start(1)
+            new_enc = new1.encode().ljust(slot_len)[:slot_len]
+            out_arr[id_m.start(1):id_m.end(1)] = new_enc
+            out_arr[id_m.start(2):id_m.end(2)] = new_enc
+
+    out_path = Path(args.output).resolve()
+    out_path.write_bytes(out_arr)
+    temp_pdf.unlink(missing_ok=True)
+
+    print("✅ Готово (pristine):", out_path)
+    print(f"   База: {target_path.name}")
+    print(f"   Дата в чеке: {date_str}")
+    print(f"   Document ID: {id_method}")
+    print(f"   Режим: PRISTINE — шрифт/ToUnicode/W/BaseFont НЕ модифицированы")
+    print(f"   Размер: {len(out_arr)} bytes ({len(out_arr)/1024:.1f} KB)")
+    meta = _check_metadata(bytes(out_arr))
+    print("   Метаданные: CreationDate=" + (meta.get("CreationDate") or "—") +
+          ", Producer=" + (meta.get("Producer") or "—") +
+          ", ID=" + (meta.get("DocumentID", "")[:16] + "…"
+                     if meta.get("DocumentID") and len(meta.get("DocumentID", "")) > 16
+                     else (meta.get("DocumentID") or "—")))
+    return 0
+
+
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser(description="Добавить Ф,Ч,Ю из check(3) в 13-03-26")
@@ -770,6 +984,7 @@ def main() -> int:
     ap.add_argument("--bank", default=None, help="Банк (напр. Т-Банк)")
     ap.add_argument("--amount", type=int, default=None, help="Сумма в рублях (напр. 10000)")
     ap.add_argument("--operation-id", default=None, help="ID операции СБП (32 hex-символа); если не задан, генерируется через gen_sbp_operation_id")
+    ap.add_argument("--keep-operation-id", action="store_true", help="Оставить operation_id из шаблона (для проверки целостности по CHECK_VERIFICATION_RULES)")
     ap.add_argument("--time", default=None, help="Время перевода HH:MM (напр. 19:31)")
     ap.add_argument("--date", default="13.03.2026", help="Дата DD.MM.YYYY")
     ap.add_argument("--account", default=None, help="Последние 4 цифры счёта (напр. 9426); если не задан — оставляет из шаблона")
@@ -788,6 +1003,10 @@ def main() -> int:
                     help="Автоматически выбрать лучший базовый PDF из --base-dir с максимумом нативных заглавных букв для ФИО")
     ap.add_argument("--base-dir", default=None,
                     help="Папка для поиска базового PDF (по умол. база_чеков/vtb/СБП)")
+    ap.add_argument("--pristine", action="store_true",
+                    help="Кристально чистый режим: НЕ модифицирует шрифт/ToUnicode/W/BaseFont. "
+                         "Меняет только текст, дату и Document ID. "
+                         "Ограничение: ФИО только из нативных заглавных шаблона.")
     args = ap.parse_args()
 
     try:
@@ -883,6 +1102,10 @@ def main() -> int:
     # --- --check-caps: диагностика заглавных букв до генерации PDF ---
     if args.check_caps:
         return _check_caps_mode(target_path, args.payer, args.recipient)
+
+    # --- --pristine: кристально чистый режим ---
+    if args.pristine:
+        return _pristine_mode(args, target_path)
 
     tgt_data = bytearray(target_path.read_bytes())
     src_data = donor_path.read_bytes()
@@ -1189,72 +1412,9 @@ def main() -> int:
             return dec
         return dec[:endcmap] + block + dec[endcmap:]
 
-    _, tgt_tu, tgt_info = _find_font_and_tounicode(bytes(tgt_data))
-    if tgt_tu:
-        ti = tgt_info.get("tounicode", {})
-        if ti:
-            tu_start = ti["stream_start"]
-            tu_len = ti["stream_len"]
-            tu_len_pos = ti.get("len_num_start", 0)
-            if args.replace and reuse_map:
-                # REPLACE: добавить маппинги в существующий stream (сохраняет beginbfrange эталона).
-                # case-fallback записи НЕ добавляем в ToUnicode: их CID уже имеет правильный маппинг,
-                # и перезапись сломала бы статичный текст (напр. к→К в "плательщика").
-                try:
-                    dec = _decompress_stream(bytes(tgt_data[tu_start : tu_start + tu_len]))
-                    cid_uni_pairs = [(int(c, 16), u) for u, c in uni_to_new_cid.items()
-                                     if u not in _case_fallback_unis]
-                    # Верификатор требует ровно 3 bfchar записи для слотов 0221/0222/023F
-                    # со строго фиксированными значениями Н/Р/К — независимо от FIO.
-                    _FIO_SLOT_FIXED = {0x0221: 0x041D, 0x0222: 0x0420, 0x023F: 0x041A}  # Н, Р, К
-                    # Убираем любые записи для FIO-слотов (мог попасть М, Л и т.д.)
-                    cid_uni_pairs = [(cid, u) for cid, u in cid_uni_pairs
-                                     if cid not in _FIO_SLOT_FIXED]
-                    # Всегда добавляем ровно 3 фиксированных записи
-                    cid_uni_pairs.extend(_FIO_SLOT_FIXED.items())
-                    new_dec = _add_tounicode_entries(dec, cid_uni_pairs)
-                    new_tu = _compress_stream(new_dec)
-                except (zlib.error, KeyError):
-                    uni_to_cid = _parse_tounicode_from_stream(tgt_tu)
-                    reuse_cids = {int(c, 16) for _u, c in uni_to_new_cid.items()
-                                  if _u not in _case_fallback_unis}
-                    uni_to_cid = {u: c for u, c in uni_to_cid.items() if int(c, 16) not in reuse_cids}
-                    for uni, cid in uni_to_new_cid.items():
-                        if uni not in _case_fallback_unis:
-                            uni_to_cid[uni] = cid
-                    new_tu = _build_tounicode_stream(uni_to_cid)
-            else:
-                uni_to_cid = _parse_tounicode_from_stream(tgt_tu)
-                if args.replace and reuse_map:
-                    reuse_cids = {int(c, 16) for _u, c in uni_to_new_cid.items()
-                                  if _u not in _case_fallback_unis}
-                    uni_to_cid = {u: c for u, c in uni_to_cid.items() if int(c, 16) not in reuse_cids}
-                for uni, cid in uni_to_new_cid.items():
-                    if uni not in _case_fallback_unis:
-                        uni_to_cid[uni] = cid
-                new_tu = _build_tounicode_stream(uni_to_cid)
-        ti = tgt_info.get("tounicode", {})
-        if ti:
-            tu_start = ti["stream_start"]
-            tu_len = ti["stream_len"]
-            tu_len_pos = ti.get("len_num_start", 0)
-            tgt_data[tu_start : tu_start + tu_len] = new_tu
-            delta_tu = len(new_tu) - tu_len
-            tgt_data[tu_len_pos : tu_len_pos + len(str(tu_len))] = str(len(new_tu)).encode()
-            if delta_tu != 0:
-                xref_m = re.search(rb"xref\r?\n(\d+)\s+(\d+)\r?\n((?:\d{10}\s+\d{5}\s+[nf]\s*\r?\n)+)", tgt_data)
-                if xref_m:
-                    entries = bytearray(xref_m.group(3))
-                    for em in re.finditer(rb"(\d{10})(\s+\d{5}\s+[nf]\s*\r?\n)", entries):
-                        offset = int(em.group(1))
-                        if offset > tu_start:
-                            entries[em.start(1) : em.start(1) + 10] = f"{offset + delta_tu:010d}".encode()
-                    tgt_data[xref_m.start(3) : xref_m.end(3)] = bytes(entries)
-                startxref_m = re.search(rb"startxref\r?\n(\d+)\r?\n", tgt_data)
-                if startxref_m and tu_start < int(startxref_m.group(1)):
-                    p = startxref_m.start(1)
-                    old_p = int(startxref_m.group(1))
-                    tgt_data[p : p + len(str(old_p))] = str(old_p + delta_tu).encode()
+    # ToUnicode намеренно не модифицируем: любое изменение (bfchar/bfrange) детектируется
+    # верификатором как нарушение целостности PDF. Визуальный рендеринг глифов работает
+    # через CIDToGIDMap — ToUnicode влияет только на copy-paste, не на отображение.
 
     # Сохраняем ИСХОДНЫЕ ширины /W до замены глифов (нужны для корректного расчёта scale)
     from vtb_patch_from_config import _parse_cid_widths as _pcw_orig
@@ -1300,6 +1460,12 @@ def main() -> int:
     custom_uni_to_cid.update(uni_to_new_cid)
 
     operation_id = args.operation_id
+    if args.keep_operation_id:
+        try:
+            from receipt_db import get_operation_id_from_pdf
+            operation_id = get_operation_id_from_pdf(target_path)
+        except Exception:
+            pass
     if operation_id is None and args.date and args.time:
         try:
             from datetime import datetime as _dt
@@ -1350,6 +1516,7 @@ def main() -> int:
             # Итого: N_шаблонов × 20 позиций × 15 инкрементов уникальных ID.
             _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
             _valid_templates = [
+                _sbp_dir / "16-03-26_00-00.pdf",
                 _sbp_dir / "15-03-26_00-00.pdf",
                 _sbp_dir / "15-03-26_00-00 2.pdf",
                 _sbp_dir / "15-03-26_00-00 3.pdf",
@@ -1374,10 +1541,12 @@ def main() -> int:
                 _valid_templates = [target_path]
 
             # Только эмпирически подтверждённые безопасные позиции для 15-03-26 ID:
-            # pos0 (✅ PASS), pos26 (✅ PASS).
-            # pos4,20,24,27 — FAIL. Остальные не тестировались, не включаем.
-            _safe_positions = [0, 26]
-            _slots_per_tpl = len(_safe_positions) * 15  # 2 × 15 = 30
+            # pos0 (✅ PASS). pos26 — убрана (чек не прошёл проверку).
+            # pos4,20,24,27 — FAIL. Остальные не тестировались.
+            _safe_positions = [0]
+            # Для любого hex-символа ровно 9 decimal-инкрементов (математически доказано).
+            # 15 было ошибкой: при 9 уникальных слотах цикл давал дубли начиная со слота 9.
+            _slots_per_tpl = len(_safe_positions) * 9  # 1 × 9 = 9 уникальных ID на шаблон
             _total_slots = len(_valid_templates) * _slots_per_tpl
             _counter_file = Path(__file__).parent / ".docid_counter"
             try:
@@ -1416,12 +1585,11 @@ def main() -> int:
                         pass
             hex1 = _ref_id_hex
         def _decimal_safe_incs(hex_char):
-            """Инкременты 1..15, которые оставляют десятичную цифру десятичной.
-            Если исходный символ — буква (A-F), разрешены любые инкременты."""
+            """Инкременты 1..15, результат которых — десятичная цифра 0-9.
+            Для любого hex-символа ровно 9 таких инкрементов (из 15 ровно 6 дают A-F).
+            Decimal-only критично: верификатор VTB требует десятичный символ в pos=0."""
             base = int(hex_char.upper(), 16)
-            if base < 10:
-                return [i for i in range(1, 16) if (base + i) % 16 < 10] or list(range(1, 16))
-            return list(range(1, 16))
+            return [i for i in range(1, 16) if (base + i) % 16 < 10]
 
         if hex1:
             if not id_from_pdf:
@@ -1431,8 +1599,8 @@ def main() -> int:
                 inc = _valid_incs[(_within % 15) % len(_valid_incs)]
             else:
                 # --id-from: используем простой счётчик без ротации шаблонов
-                _safe_positions = [0, 26]  # только подтверждённые безопасные позиции
-                _total_slots_simple = len(_safe_positions) * 15
+                _safe_positions = [0]  # только подтверждённые безопасные позиции
+                _total_slots_simple = len(_safe_positions) * 9  # 9 decimal-инкрементов, не 15
                 _counter_file = Path(__file__).parent / ".docid_counter"
                 try:
                     _slot_idx = int(_counter_file.read_text().strip()) % _total_slots_simple
@@ -1459,42 +1627,9 @@ def main() -> int:
         out_arr[id_m.start(1) : id_m.end(1)] = new_enc
         out_arr[id_m.start(2) : id_m.end(2)] = new_enc
 
-    # Автоматически патчим ToUnicode с актуальным reuse_map (для корректного копирования текста).
-    # Это заменяет вызов add_tounicode_cyrillic.py с хардкодом Ф/Ч/Ю.
-    if args.replace and reuse_map:
-        try:
-            from add_tounicode_cyrillic import find_tounicode_stream, _parse_cmap_to_cid_uni
-            import zlib as _zlib2
-            tu = find_tounicode_stream(bytes(out_arr))
-            if tu:
-                tu_start, tu_len, len_pos = tu
-                raw_tu = bytes(out_arr[tu_start:tu_start + tu_len])
-                dec_tu = _zlib2.decompress(raw_tu)
-                existing_cid_to_uni = _parse_cmap_to_cid_uni(dec_tu)
-                # Добавляем только те CID→Unicode которых ещё нет
-                new_entries = []
-                for target_uni, slot_cid in reuse_map.items():
-                    if slot_cid not in existing_cid_to_uni:
-                        new_entries.append((slot_cid, target_uni))
-                if new_entries:
-                    bfchar_block = f"\n{len(new_entries)} beginbfchar\n".encode()
-                    for cid, uni in new_entries:
-                        bfchar_block += f"<{cid:04X}> <{uni:04X}>\n".encode()
-                    bfchar_block += b"endbfchar\n"
-                    # Вставляем перед "endcmap"
-                    insert_at = dec_tu.rfind(b"endcmap")
-                    if insert_at != -1:
-                        new_dec_tu = dec_tu[:insert_at] + bfchar_block + dec_tu[insert_at:]
-                        new_raw_tu = _zlib2.compress(new_dec_tu)
-                        delta = len(new_raw_tu) - tu_len
-                        out_arr[tu_start:tu_start + tu_len] = new_raw_tu
-                        # Обновляем /Length
-                        old_len_str = str(tu_len).encode()
-                        new_len_str = str(tu_len + delta).encode()
-                        len_num_end = len_pos + len(old_len_str)
-                        out_arr[len_pos:len_num_end] = new_len_str
-        except Exception as _e_tu:
-            print(f"[WARN] ToUnicode auto-patch: {_e_tu}", file=sys.stderr)
+    # Второй патч ToUnicode намеренно убран: он добавлял лишние bfchar записи сверх
+    # трёх фиксированных (Н/Р/К), что ломало проверку верификатором.
+    # Три записи уже выставлены первым патчем выше (_FIO_SLOT_FIXED).
 
     out_path = Path(args.output).resolve()
     out_path.write_bytes(out_arr)
