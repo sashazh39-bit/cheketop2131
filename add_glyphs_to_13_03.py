@@ -763,17 +763,98 @@ def _check_caps_mode(target_path: Path, payer: str, recipient: str) -> int:
     return 0
 
 
+def _rebuild_xref(data: bytearray) -> bytearray:
+    """Пересчитать xref таблицу и startxref после модификации байтов."""
+    obj_offsets = {}
+    for m in re.finditer(rb'(\d+) (\d+) obj', data):
+        num = int(m.group(1))
+        obj_offsets[num] = m.start()
+    if not obj_offsets:
+        return data
+    max_obj = max(obj_offsets.keys())
+    xref_pos = data.find(b'xref')
+    if xref_pos < 0:
+        return data
+    trailer_pos = data.find(b'trailer', xref_pos)
+    if trailer_pos < 0:
+        return data
+    trailer_m = re.search(rb'trailer\s*<<.*?>>', data[trailer_pos:], re.DOTALL)
+    if not trailer_m:
+        return data
+    trailer_dict = data[trailer_pos:trailer_pos + trailer_m.end()]
+    eof_marker = b'\n%%EOF'
+    new_xref = bytearray(b'xref\n')
+    new_xref += f'0 {max_obj + 1}\n'.encode()
+    new_xref += b'0000000000 65535 f \n'
+    for i in range(1, max_obj + 1):
+        if i in obj_offsets:
+            new_xref += f'{obj_offsets[i]:010d} 00000 n \n'.encode()
+        else:
+            new_xref += b'0000000000 00000 f \n'
+    before_xref = data[:xref_pos]
+    new_startxref = len(before_xref)
+    result = bytearray(before_xref)
+    result += new_xref
+    result += trailer_dict
+    result += f'\nstartxref\n{new_startxref}\n'.encode()
+    result += b'%%EOF\n'
+    return result
+
+
+def _inject_bfchar_into_tounicode(data: bytearray, bfchar_pairs: list[tuple[int, int]]) -> bytearray:
+    """Инъецировать bfchar записи в ToUnicode CMap stream и пересчитать /Length + xref."""
+    raw = bytes(data)
+    tu_stream_pat = re.compile(rb'stream\r?\n(.*?)endstream', re.DOTALL)
+    for m in tu_stream_pat.finditer(raw):
+        try:
+            dec = zlib.decompress(m.group(1))
+        except (zlib.error, Exception):
+            continue
+        dec_str = dec.decode('latin-1')
+        if 'CMapName' not in dec_str or 'beginbfrange' not in dec_str:
+            continue
+        if 'beginbfchar' in dec_str:
+            continue
+        bfchar_block = f"\n{len(bfchar_pairs)} beginbfchar\n"
+        for cid, uni in bfchar_pairs:
+            bfchar_block += f"<{cid:04X}> <{uni:04X}>\n"
+        bfchar_block += "endbfchar\n"
+        insert_pos = dec_str.find('endcmap')
+        if insert_pos < 0:
+            continue
+        new_dec = dec_str[:insert_pos] + bfchar_block + dec_str[insert_pos:]
+        new_compressed = zlib.compress(new_dec.encode('latin-1'), 9)
+        old_compressed = m.group(1)
+        result = bytearray()
+        result += raw[:m.start(1)]
+        result += new_compressed
+        tail_start = m.start(1) + len(old_compressed)
+        result += raw[tail_start:]
+        length_pat = re.compile(rb'/Length\s+(\d+)')
+        search_start = max(0, m.start() - 200)
+        for lm in length_pat.finditer(bytes(result), search_start):
+            if lm.start() < m.start():
+                old_len_str = lm.group(1)
+                new_len_val = len(new_compressed)
+                new_len_str = str(new_len_val).encode()
+                if len(new_len_str) <= len(old_len_str):
+                    new_len_str = new_len_str.ljust(len(old_len_str))
+                result[lm.start(1):lm.end(1)] = new_len_str
+                break
+        return _rebuild_xref(result)
+    return data
+
+
 def _pristine_mode(args, target_path: Path) -> int:
-    """Кристально чистый режим: модифицирует ТОЛЬКО content stream (текст), CreationDate,
-    Document ID и добавляет 3 фиксированных bfchar записи (Н/Р/К) в ToUnicode.
-    Шрифт, /W, BaseFont, FontDescriptor, font stream, CIDToGIDMap — нетронуты."""
+    """Кристально чистый режим: минимальные изменения в PDF.
+    Модифицирует: content stream (текст), CreationDate, Document ID, +3 bfchar.
+    НЕ модифицирует: шрифт, /W, BaseFont, FontDescriptor, font stream, CIDToGIDMap."""
     from datetime import datetime
     from vtb_patch_from_config import patch_from_values
     from vtb_test_generator import update_creation_date
     from sbp_full_toolkit import parse_tounicode
     import random as _random
 
-    # Pristine использует ТОЛЬКО 15-03-26 шаблоны (проверенная структура с bfchar)
     _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
     _pristine_bases = [
         _sbp_dir / "15-03-26_00-00.pdf",
@@ -789,12 +870,11 @@ def _pristine_mode(args, target_path: Path) -> int:
     _pristine_bases = [p for p in _pristine_bases if p.exists()]
     if _pristine_bases:
         target_path = _pristine_bases[0]
-        print(f"[pristine] База: {target_path.name}", file=sys.stderr)
-    else:
-        print("[WARN] pristine: 15-03-26 шаблоны не найдены, используем текущий target", file=sys.stderr)
+    elif not target_path.exists():
+        print("[ERROR] pristine: шаблон 15-03-26 не найден", file=sys.stderr)
+        return 1
 
     tgt_data = bytearray(target_path.read_bytes())
-
     native_uni_to_cid = parse_tounicode(bytes(tgt_data))
     if not native_uni_to_cid:
         print("[ERROR] pristine: не удалось извлечь ToUnicode из шаблона", file=sys.stderr)
@@ -803,7 +883,7 @@ def _pristine_mode(args, target_path: Path) -> int:
     fio_all = " ".join(filter(None, [args.payer, args.recipient]))
     missing = []
     for ch in set(fio_all):
-        if ch in (' ', '.', ',', '-', '‑'):
+        if ch in (' ', '.', ',', '-', '\u2011'):
             continue
         if ord(ch) not in native_uni_to_cid:
             missing.append(ch)
@@ -811,8 +891,16 @@ def _pristine_mode(args, target_path: Path) -> int:
         print(f"[ERROR] pristine: символы отсутствуют в шаблоне: {' '.join(sorted(missing))}", file=sys.stderr)
         native_upper = sorted(chr(u) for u in native_uni_to_cid if 0x0410 <= u <= 0x042F)
         print(f"  Доступные заглавные: {' '.join(native_upper)}", file=sys.stderr)
-        print(f"  Совет: используйте ФИО только из этих букв", file=sys.stderr)
         return 1
+
+    bfchar_pairs = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]
+    _conflict_chars = {'г', 'Г', 'Е', 'Ж'}
+    _fio_conflicts = _conflict_chars & set(fio_all)
+    if _fio_conflicts:
+        print(f"[WARN] pristine: ФИО содержит конфликтные символы {_fio_conflicts}. "
+              f"Текст-экстракция для этих букв будет неточной.", file=sys.stderr)
+    tgt_data = _inject_bfchar_into_tounicode(tgt_data, bfchar_pairs)
+    native_uni_to_cid = parse_tounicode(bytes(tgt_data))
 
     phone = args.phone
     if phone is None:
@@ -820,10 +908,8 @@ def _pristine_mode(args, target_path: Path) -> int:
             from vtb_cmap import gen_phone
             phone = gen_phone()
         except Exception:
-            phone = "+7 (900) 000‑00‑00"
+            phone = "+7 (900) 000\u201100\u201100"
 
-    date_str = None
-    meta_date = None
     if args.date:
         date_str = args.date
         if args.time:
@@ -880,46 +966,6 @@ def _pristine_mode(args, target_path: Path) -> int:
 
     out_arr = bytearray(out)
     update_creation_date(out_arr, meta_date)
-
-    # Добавляем 3 фиксированных bfchar записи — верификатор требует их
-    # Значения из эмпирически проходящих чеков: 0221→К, 0222→Р, 023F→К
-    _BFCHAR_FIXED = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]  # К, Р, К
-    _tu_pat = re.compile(rb'(stream\r?\n)(.*?)(endstream)', re.DOTALL)
-    for _tm in _tu_pat.finditer(bytes(out_arr)):
-        try:
-            _dec = zlib.decompress(_tm.group(2))
-            if b'CMapName' not in _dec and b'beginbfrange' not in _dec:
-                continue
-            if b'beginbfchar' in _dec:
-                break  # уже есть bfchar — не трогаем
-            _bfblock = b"\n3 beginbfchar\n"
-            for _cid, _uni in _BFCHAR_FIXED:
-                _bfblock += f"<{_cid:04X}> <{_uni:04X}>\n".encode()
-            _bfblock += b"endbfchar\n"
-            _endcmap = _dec.find(b"endcmap")
-            if _endcmap < 0:
-                continue
-            _new_dec = _dec[:_endcmap] + _bfblock + _dec[_endcmap:]
-            _new_compressed = zlib.compress(_new_dec, 9)
-            _old_start = _tm.start(2)
-            _old_end = _tm.end(2)
-            out_arr[_old_start:_old_end] = _new_compressed
-            _len_diff = len(_new_compressed) - (_old_end - _old_start)
-            # Обновляем /Length для этого потока
-            _before = bytes(out_arr[:_tm.start()])
-            _len_m = re.search(rb'/Length\s+(\d+)', _before[::-1])
-            if not _len_m:
-                _len_m2 = list(re.finditer(rb'/Length\s+(\d+)', _before))
-                if _len_m2:
-                    _lm = _len_m2[-1]
-                    _old_len_str = _lm.group(1)
-                    _new_len_val = len(_new_compressed)
-                    _new_len_str = str(_new_len_val).encode().ljust(len(_old_len_str))[:len(_old_len_str)]
-                    out_arr[_lm.start(1):_lm.end(1)] = _new_len_str
-            print(f"[pristine] Добавлены 3 bfchar записи (Н/Р/К) в ToUnicode", file=sys.stderr)
-            break
-        except (zlib.error, Exception):
-            continue
 
     id_from_pdf = _extract_id_from_pdf(Path(args.id_from)) if args.id_from else None
     id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', out_arr)
@@ -978,7 +1024,6 @@ def _pristine_mode(args, target_path: Path) -> int:
                 _valid_incs = _decimal_safe_incs(hex1[pos])
                 inc = _valid_incs[_within % len(_valid_incs)]
             else:
-                _safe_positions_idf = [0]
                 _counter_file_idf = Path(__file__).parent / ".docid_counter"
                 try:
                     _slot_idx = int(_counter_file_idf.read_text().strip()) % 9
@@ -1002,6 +1047,7 @@ def _pristine_mode(args, target_path: Path) -> int:
             out_arr[id_m.start(1):id_m.end(1)] = new_enc
             out_arr[id_m.start(2):id_m.end(2)] = new_enc
 
+    out_arr = _rebuild_xref(out_arr)
     out_path = Path(args.output).resolve()
     out_path.write_bytes(out_arr)
     temp_pdf.unlink(missing_ok=True)
@@ -1010,7 +1056,8 @@ def _pristine_mode(args, target_path: Path) -> int:
     print(f"   База: {target_path.name}")
     print(f"   Дата в чеке: {date_str}")
     print(f"   Document ID: {id_method}")
-    print(f"   Режим: PRISTINE — шрифт/ToUnicode/W/BaseFont НЕ модифицированы")
+    bfc_desc = ", ".join(f"{c:04X}→{u:04X}({chr(u)})" for c, u in bfchar_pairs)
+    print(f"   bfchar: {bfc_desc}")
     print(f"   Размер: {len(out_arr)} bytes ({len(out_arr)/1024:.1f} KB)")
     meta = _check_metadata(bytes(out_arr))
     print("   Метаданные: CreationDate=" + (meta.get("CreationDate") or "—") +
