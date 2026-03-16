@@ -24,12 +24,9 @@ from io import BytesIO
 BASE = Path(__file__).parent
 DONOR = BASE / "база_чеков" / "vtb" / "СБП" / "check (3).pdf"
 
-# 16-03-26 — актуальный шаблон (проходит целостность, приоритет 0)
-# 15-03-26 — предыдущий шаблон (резерв, приоритет 1)
+# 15-03-26 — единственный проверенный шаблон (BaseFont=AAWQMC, bfrange=46)
 # 13-03-26 — старый шаблон (резерв)
 TARGET_13 = [
-    BASE / "база_чеков" / "vtb" / "СБП" / "16-03-26_00-00.pdf",
-    Path.home() / "Downloads" / "16-03-26_00-00.pdf",
     BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf",
     BASE / "15-03-26_00-00.pdf",
     Path.home() / "Downloads" / "15-03-26_00-00.pdf",
@@ -40,7 +37,7 @@ TARGET_17 = [
     Path.home() / "Downloads" / "13-03-26_00-00 17.pdf",
     BASE / "база_чеков" / "vtb" / "СБП" / "13-03-26_00-00 17.pdf",
 ]
-TARGET = BASE / "база_чеков" / "vtb" / "СБП" / "16-03-26_00-00.pdf"  # fallback
+TARGET = BASE / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf"  # fallback
 
 # check(3).pdf ToUnicode (из beginbfrange):
 #   Uppercase А-Я:  Unicode 0x0410-0x042F → CID 0x021C-0x023B
@@ -1596,6 +1593,8 @@ def main() -> int:
 
     out_arr = bytearray(out)
     update_creation_date(out_arr, meta_date)
+    _bfchar_fixed = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]
+    out_arr = _inject_bfchar_into_tounicode(out_arr, _bfchar_fixed)
     id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', out_arr)
     if id_m:
         import random as _random
@@ -1609,7 +1608,6 @@ def main() -> int:
             # Итого: N_шаблонов × 20 позиций × 15 инкрементов уникальных ID.
             _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
             _valid_templates = [
-                _sbp_dir / "16-03-26_00-00.pdf",
                 _sbp_dir / "15-03-26_00-00.pdf",
                 _sbp_dir / "15-03-26_00-00 2.pdf",
                 _sbp_dir / "15-03-26_00-00 3.pdf",
