@@ -1,0 +1,31 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.openhtmltopdf:openhtmltopdf-pdfbox:1.0.10'
+    implementation 'com.openhtmltopdf:openhtmltopdf-core:1.0.10'
+    implementation 'com.openhtmltopdf:openhtmltopdf-svg-support:1.0.10'
+}
+
+application {
+    mainClass = 'VtbGenerator'
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': 'VtbGenerator'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+sourceCompatibility = '1.8'
+targetCompatibility = '1.8'

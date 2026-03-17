@@ -798,6 +798,27 @@ def _rebuild_xref(data: bytearray) -> bytearray:
     return result
 
 
+def _extract_available_latin(data: bytes) -> set[str]:
+    """Извлечь доступные Latin буквы из bfrange шаблона."""
+    m12 = re.search(rb'12 0 obj\s*<<(.*?)>>\s*stream\r?\n(.*?)endstream', data, re.DOTALL)
+    if not m12:
+        return set()
+    try:
+        lm = re.search(rb'/Length\s+(\d+)', m12.group(1))
+        dl = int(lm.group(1))
+        tu = zlib.decompress(m12.group(2)[:dl]).decode('latin-1')
+    except Exception:
+        return set()
+    result = set()
+    for rm in re.finditer(r'<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>', tu):
+        s, e, u = int(rm.group(1), 16), int(rm.group(2), 16), int(rm.group(3), 16)
+        for i in range(e - s + 1):
+            uni = u + i
+            if 0x0041 <= uni <= 0x005A:
+                result.add(chr(uni))
+    return result
+
+
 def _inject_bfchar_into_tounicode(data: bytearray, bfchar_pairs: list[tuple[int, int]]) -> bytearray:
     """Инъецировать bfchar записи в ToUnicode CMap stream с дельта-обновлением xref."""
     raw = bytes(data)
@@ -822,9 +843,10 @@ def _inject_bfchar_into_tounicode(data: bytearray, bfchar_pairs: list[tuple[int,
         new_dec_str = dec_str[:insert_pos] + bfchar_block + dec_str[insert_pos:]
         new_compressed = zlib.compress(new_dec_str.encode('latin-1'), 9)
         old_compressed = m.group(1)
-        delta = len(new_compressed) - len(old_compressed)
+        new_with_eol = new_compressed + b'\r\n'
+        delta = len(new_with_eol) - len(old_compressed)
         stream_end = m.start(1) + len(old_compressed)
-        result = bytearray(raw[:m.start(1)] + new_compressed + raw[stream_end:])
+        result = bytearray(raw[:m.start(1)] + new_with_eol + raw[stream_end:])
         length_pat = re.compile(rb'/Length\s+(\d+)')
         for lm in length_pat.finditer(bytes(result), max(0, m.start() - 200)):
             if lm.start() < m.start():
@@ -857,8 +879,8 @@ def _inject_bfchar_into_tounicode(data: bytearray, bfchar_pairs: list[tuple[int,
 
 def _pristine_mode(args, target_path: Path) -> int:
     """Кристально чистый режим: минимальные изменения в PDF.
-    Модифицирует: content stream (текст), CreationDate, Document ID, +3 bfchar.
-    НЕ модифицирует: шрифт, /W, BaseFont, FontDescriptor, font stream, CIDToGIDMap."""
+    Модифицирует: content stream (текст), CreationDate, Document ID.
+    НЕ модифицирует: шрифт, /W, BaseFont, FontDescriptor, font stream, CIDToGIDMap, ToUnicode."""
     from datetime import datetime
     from vtb_patch_from_config import patch_from_values
     from vtb_test_generator import update_creation_date
@@ -903,13 +925,8 @@ def _pristine_mode(args, target_path: Path) -> int:
         print(f"  Доступные заглавные: {' '.join(native_upper)}", file=sys.stderr)
         return 1
 
-    bfchar_pairs = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]
-    _conflict_chars = {'г', 'Г', 'Е', 'Ж'}
-    _fio_conflicts = _conflict_chars & set(fio_all)
-    if _fio_conflicts:
-        print(f"[WARN] pristine: ФИО содержит конфликтные символы {_fio_conflicts}. "
-              f"Текст-экстракция для этих букв будет неточной.", file=sys.stderr)
-    tgt_data = _inject_bfchar_into_tounicode(tgt_data, bfchar_pairs)
+    # bfchar НЕ добавляем: CID 0x0221=Е, 0x0222=Ж, 0x023F=г уже имеют
+    # корректные bfrange маппинги. Их перезапись ломает text extraction.
 
     phone = args.phone
     if phone is None:
@@ -944,9 +961,11 @@ def _pristine_mode(args, target_path: Path) -> int:
             from datetime import datetime as _dt
             from vtb_cmap import gen_sbp_operation_id
             dt = _dt.strptime(f"{args.date}, {args.time}", "%d.%m.%Y, %H:%M")
+            _avail_latin = _extract_available_latin(tgt_data)
             operation_id = gen_sbp_operation_id(
                 dt.date(), f"{dt.hour:02d}:{dt.minute:02d}",
-                direction="A", recipient_bank=args.bank or "",
+                direction="B", recipient_bank=args.bank or "",
+                available_latin=_avail_latin or None,
             )
         except Exception:
             pass
@@ -983,9 +1002,7 @@ def _pristine_mode(args, target_path: Path) -> int:
         if id_from_pdf:
             hex1 = (id_from_pdf if isinstance(id_from_pdf, str) else id_from_pdf.decode()).upper()
         else:
-            _valid_templates = [p for p in _pristine_bases if p.exists()]
-            if not _valid_templates:
-                _valid_templates = [target_path]
+            _valid_templates = [target_path]
             _safe_positions = [0]
             _slots_per_tpl = len(_safe_positions) * 9
             _total_slots = len(_valid_templates) * _slots_per_tpl
@@ -1065,8 +1082,7 @@ def _pristine_mode(args, target_path: Path) -> int:
     print(f"   База: {target_path.name}")
     print(f"   Дата в чеке: {date_str}")
     print(f"   Document ID: {id_method}")
-    bfc_desc = ", ".join(f"{c:04X}→{u:04X}({chr(u)})" for c, u in bfchar_pairs)
-    print(f"   bfchar: {bfc_desc}")
+    print(f"   bfchar: нет (ToUnicode не модифицирован)")
     print(f"   Размер: {len(out_arr)} bytes ({len(out_arr)/1024:.1f} KB)")
     meta = _check_metadata(bytes(out_arr))
     print("   Метаданные: CreationDate=" + (meta.get("CreationDate") or "—") +
@@ -1243,6 +1259,7 @@ def main() -> int:
     _case_fallback_unis: set[int] = set()  # записи uni_to_new_cid добавленные через case-fallback (не менять ToUnicode)
     new_cid_widths: list[tuple[int, int]] = []
     w_patch: dict[int, tuple[int, int]] = {}  # REPLACE: cid -> (old_w, new_w)
+    _skip_font_mod = False
 
     if args.replace:
         from find_reusable_cids import find_reusable
@@ -1395,6 +1412,7 @@ def main() -> int:
             if args.hybrid_safe and not extra_unis:
                 # Все буквы уже нативные в базовом PDF — инъекция не нужна, продолжаем патчинг
                 print(f"[INFO] hybrid-safe: все буквы ФИО нативные в базе, инъекция глифов не требуется.", file=sys.stderr)
+                _skip_font_mod = True
             else:
                 print(f"[ERROR] REPLACE: слоты не найдены. Используйте ADD.", file=sys.stderr)
                 return 1
@@ -1477,30 +1495,35 @@ def main() -> int:
         print("[ERROR] Не удалось получить маппинг Ф,Ч,Ю", file=sys.stderr)
         return 1
 
-    out_buf = BytesIO()
-    base_font.save(out_buf)
-    new_font_bytes = out_buf.getvalue()
-    base_font.close()
-    donor_font.close()
+    if _skip_font_mod:
+        base_font.close()
+        donor_font.close()
+        print("[INFO] Font stream не модифицирован (нет инъекции глифов).", file=sys.stderr)
+    else:
+        out_buf = BytesIO()
+        base_font.save(out_buf)
+        new_font_bytes = out_buf.getvalue()
+        base_font.close()
+        donor_font.close()
 
-    new_compressed = _compress_stream(new_font_bytes)
-    delta = len(new_compressed) - tgt_stream_len
-    tgt_data[tgt_stream_start : tgt_stream_start + tgt_stream_len] = new_compressed
-    tgt_data[tgt_len_pos : tgt_len_pos + len(str(tgt_stream_len))] = str(len(new_compressed)).encode()
-    if delta != 0:
-        xref_m = re.search(rb"xref\r?\n(\d+)\s+(\d+)\r?\n((?:\d{10}\s+\d{5}\s+[nf]\s*\r?\n)+)", tgt_data)
-        if xref_m:
-            entries = bytearray(xref_m.group(3))
-            for em in re.finditer(rb"(\d{10})(\s+\d{5}\s+[nf]\s*\r?\n)", entries):
-                offset = int(em.group(1))
-                if offset > tgt_stream_start:
-                    entries[em.start(1) : em.start(1) + 10] = f"{offset + delta:010d}".encode()
-            tgt_data[xref_m.start(3) : xref_m.end(3)] = bytes(entries)
-        startxref_m = re.search(rb"startxref\r?\n(\d+)\r?\n", tgt_data)
-        if startxref_m and tgt_stream_start < int(startxref_m.group(1)):
-            p = startxref_m.start(1)
-            old_p = int(startxref_m.group(1))
-            tgt_data[p : p + len(str(old_p))] = str(old_p + delta).encode()
+        new_compressed = _compress_stream(new_font_bytes)
+        delta = len(new_compressed) - tgt_stream_len
+        tgt_data[tgt_stream_start : tgt_stream_start + tgt_stream_len] = new_compressed
+        tgt_data[tgt_len_pos : tgt_len_pos + len(str(tgt_stream_len))] = str(len(new_compressed)).encode()
+        if delta != 0:
+            xref_m = re.search(rb"xref\r?\n(\d+)\s+(\d+)\r?\n((?:\d{10}\s+\d{5}\s+[nf]\s*\r?\n)+)", tgt_data)
+            if xref_m:
+                entries = bytearray(xref_m.group(3))
+                for em in re.finditer(rb"(\d{10})(\s+\d{5}\s+[nf]\s*\r?\n)", entries):
+                    offset = int(em.group(1))
+                    if offset > tgt_stream_start:
+                        entries[em.start(1) : em.start(1) + 10] = f"{offset + delta:010d}".encode()
+                tgt_data[xref_m.start(3) : xref_m.end(3)] = bytes(entries)
+            startxref_m = re.search(rb"startxref\r?\n(\d+)\r?\n", tgt_data)
+            if startxref_m and tgt_stream_start < int(startxref_m.group(1)):
+                p = startxref_m.start(1)
+                old_p = int(startxref_m.group(1))
+                tgt_data[p : p + len(str(old_p))] = str(old_p + delta).encode()
 
     from copy_font_cmap import _parse_tounicode_from_stream, _find_font_and_tounicode, _build_tounicode_stream
 
@@ -1523,19 +1546,20 @@ def main() -> int:
     from vtb_patch_from_config import _parse_cid_widths as _pcw_orig
     original_cid_widths = _pcw_orig(bytes(tgt_data))
 
-    if args.replace and w_patch and not args.preserve_w:
-        _patch_w_in_place(tgt_data, w_patch)
-    if new_cid_widths:
-        w_m = re.search(rb"/W\s*\[(.*?)\]\s*/CIDToGIDMap", tgt_data, re.DOTALL)
-        if w_m:
-            widths_str = " ".join(str(w) for _, w in new_cid_widths)
-            first_cid = new_cid_widths[0][0]
-            insert = f" {first_cid} [{widths_str}]".encode()
-            tail = w_m.group(1).rstrip()
-            new_content = tail + insert
-            tgt_data[w_m.start(1) : w_m.end(1)] = new_content
-        cid_to_gid_patch = {cid: cid for cid, _ in new_cid_widths}
-        _find_and_patch_cidtogid(tgt_data, cid_to_gid_patch)
+    if not _skip_font_mod:
+        if args.replace and w_patch and not args.preserve_w:
+            _patch_w_in_place(tgt_data, w_patch)
+        if new_cid_widths:
+            w_m = re.search(rb"/W\s*\[(.*?)\]\s*/CIDToGIDMap", tgt_data, re.DOTALL)
+            if w_m:
+                widths_str = " ".join(str(w) for _, w in new_cid_widths)
+                first_cid = new_cid_widths[0][0]
+                insert = f" {first_cid} [{widths_str}]".encode()
+                tail = w_m.group(1).rstrip()
+                new_content = tail + insert
+                tgt_data[w_m.start(1) : w_m.end(1)] = new_content
+            cid_to_gid_patch = {cid: cid for cid, _ in new_cid_widths}
+            _find_and_patch_cidtogid(tgt_data, cid_to_gid_patch)
 
     from vtb_patch_from_config import patch_from_values
     from vtb_test_generator import update_creation_date
@@ -1556,8 +1580,18 @@ def main() -> int:
 
     id_from_pdf = _extract_id_from_pdf(Path(args.id_from)) if args.id_from else None
 
-    _bfchar_pre = [(0x0221, 0x041A), (0x0222, 0x0420), (0x023F, 0x041A)]
-    tgt_data = _inject_bfchar_into_tounicode(tgt_data, _bfchar_pre)
+    # Динамические bfchar: только для CID где глиф был заменён инъекцией.
+    # Без bfchar text extraction показывает символ из bfrange (Е/Ж/г) вместо инъектированного.
+    # Case-fallback записи НЕ добавляем (их CID уже имеет близкий маппинг).
+    if not _skip_font_mod:
+        _injected_bfchar = []
+        for uni, cid_hex in uni_to_new_cid.items():
+            if uni not in _case_fallback_unis:
+                _injected_bfchar.append((int(cid_hex, 16), uni))
+        if _injected_bfchar:
+            tgt_data = _inject_bfchar_into_tounicode(tgt_data, _injected_bfchar)
+            _bfc_desc = ", ".join(f"0x{c:04X}→{chr(u)}" for c, u in _injected_bfchar)
+            print(f"[INFO] bfchar (динамические): {_bfc_desc}", file=sys.stderr)
 
     temp_pdf = BASE / ".temp_13_03_mod.pdf"
     temp_pdf.write_bytes(tgt_data)
@@ -1578,10 +1612,12 @@ def main() -> int:
             from vtb_cmap import gen_sbp_operation_id
             dt = _dt.strptime(f"{args.date}, {args.time}", "%d.%m.%Y, %H:%M")
             op_time_moscow = f"{dt.hour:02d}:{dt.minute:02d}"
+            _avail_latin = _extract_available_latin(tgt_data)
             operation_id = gen_sbp_operation_id(
                 dt.date(), op_time_moscow,
-                direction="A",
+                direction="B",
                 recipient_bank=args.bank or "",
+                available_latin=_avail_latin or None,
             )
         except Exception:
             pass
@@ -1616,34 +1652,10 @@ def main() -> int:
             # Явно передан --id-from: используем тот ID (меняем 1 символ для уникальности)
             hex1 = (id_from_pdf if isinstance(id_from_pdf, str) else id_from_pdf.decode()).upper()
         else:
-            # Ротируем через все валидные эталоны из базы.
-            # Для каждого эталона меняем 1 символ в безопасной позиции.
-            # Безопасные позиции: 0-7 и 20-31 (8-19 заморожены ботом, проверено эмпирически).
-            # Итого: N_шаблонов × 20 позиций × 15 инкрементов уникальных ID.
-            _sbp_dir = BASE / "база_чеков" / "vtb" / "СБП"
-            _valid_templates = [
-                _sbp_dir / "15-03-26_00-00.pdf",
-                _sbp_dir / "15-03-26_00-00 2.pdf",
-                _sbp_dir / "15-03-26_00-00 3.pdf",
-                _sbp_dir / "15-03-26_00-00 4.pdf",
-                _sbp_dir / "15-03-26_00-00 5.pdf",
-                _sbp_dir / "15-03-26_00-00 6.pdf",
-                _sbp_dir / "15-03-26_00-00 7.pdf",
-                _sbp_dir / "15-03-26_22-51.pdf",
-                _sbp_dir / "15-03-26_22-52.pdf",
-                _sbp_dir / "15-03-26_21-39.pdf",
-                _sbp_dir / "15-03-26_21-41.pdf",
-            ]
-            # Оставляем только существующие файлы
-            _valid_templates = [p for p in _valid_templates if p.exists()]
-            # Fallback: любой файл из BASE или Downloads с "15-03-26" в имени
-            if not _valid_templates:
-                for _fb in [BASE / "15-03-26_00-00.pdf", Path.home() / "Downloads" / "15-03-26_00-00.pdf"]:
-                    if _fb.exists():
-                        _valid_templates.append(_fb)
-                        break
-            if not _valid_templates:
-                _valid_templates = [target_path]
+            # Document ID MUST come from the same template as the content base.
+            # Different templates have different structural fingerprints (font, CIDToGIDMap, /W),
+            # and the verifier cross-references Document ID with internal structure.
+            _valid_templates = [target_path]
 
             # Только эмпирически подтверждённые безопасные позиции для 15-03-26 ID:
             # pos0 (✅ PASS). pos26 — убрана (чек не прошёл проверку).

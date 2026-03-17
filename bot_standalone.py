@@ -51,9 +51,11 @@ except Exception:
     pass
 
 from pdf_patcher import patch_pdf_file, patch_amount as pdf_patch_amount, format_amount_display
+from alfa_transgran_patch import patch_transgran, extract_transgran_fields
 from vtb_patch_from_config import patch_from_values, patch_amount_only
 from vtb_cmap import get_unsupported_chars, format_unsupported_error, suggest_replacement, FALLBACK_TIPS
 from vtb_sber_reference import scan_vtb_unsupported_chars
+from vtb_test_generator import update_creation_date
 from receipt_db import (
     receipt_supports_chars,
     get_missing_chars_in_receipt,
@@ -106,6 +108,9 @@ MAIN_MENU_KB = [
 
 CHANGELOG_TEXT = (
     "📝 Последние изменения\n\n"
+    "• 🌐 Альфа Трансгран — новый режим для трансграничных чеков Альфа-Банка. "
+    "Замена суммы, комиссии, курса, имени, телефона и номера операции. "
+    "Сохраняет структуру, меняет Document ID.\n\n"
     "• Система заявок — после создания чека можно оформить заявку. "
     "В разделе «Заявки» — список, нажмите на заявку и выберите статус: В работе или Оплачено.\n\n"
     "• Полная замена ВТБ — режим «Все поля»: замена суммы, даты, ФИО плательщика/получателя, телефона и банка. "
@@ -372,6 +377,166 @@ def run_check_caps(payer: str, recipient: str) -> tuple[bool, str]:
         return False, f"Ошибка: {e}"
 
 
+def _decimal_safe_incs(hex_char: str) -> list[int]:
+    """Инкременты 1..15, результат — цифра 0-9. Верификатор VTB требует decimal в pos=0."""
+    base = int(hex_char.upper(), 16)
+    return [i for i in range(1, 16) if (base + i) % 16 < 10]
+
+
+def _change_one_char_in_id(data: bytearray) -> None:
+    """Изменить ровно один символ в /ID. pos=0, результат 0-9 (как в add_glyphs — VTB верификатор)."""
+    id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', data)
+    if not id_m:
+        return
+    hex1 = id_m.group(1).decode().upper()
+    pos = 0
+    incs = _decimal_safe_incs(hex1[pos])
+    if not incs:
+        return
+    inc = incs[0]
+    idx = "0123456789ABCDEF".find(hex1[pos])
+    new_c = "0123456789ABCDEF"[(idx + inc) % 16]
+    new1 = hex1[:pos] + new_c + hex1[pos + 1:]
+    slot_len = id_m.end(1) - id_m.start(1)
+    new_enc = new1.encode().ljust(slot_len)[:slot_len]
+    data[id_m.start(1) : id_m.end(1)] = new_enc
+    data[id_m.start(2) : id_m.end(2)] = new_enc
+
+
+def run_sbp_generate_15_03(
+    payer: str,
+    recipient: str,
+    amount: int,
+    date_str: str,
+    bank: str = "Т-Банк",
+    account: str | None = None,
+) -> tuple[bool, bytes | None, str]:
+    """Генерация с шаблоном 15-03-26. Целостность: content-only если ФИО влезает, иначе add_glyphs + keep operation_id."""
+    _sbp = _BOT_DIR / "база_чеков" / "vtb" / "СБП"
+    _tpl = _sbp / "15-03-26_00-00.pdf"
+    if not _tpl.exists():
+        return False, None, "Шаблон 15-03-26_00-00.pdf не найден"
+    req = {c for c in chars_from_text_fields(payer or "", recipient or "", "+7 (999) 000-00-00")}
+    req.discard(" ")
+    try:
+        from receipt_db import get_receipt_chars, get_missing_chars_in_receipt, _normalize_char
+    except ImportError:
+        return False, None, ""
+    req = {_normalize_char(c) for c in req}
+    missing = get_missing_chars_in_receipt(_tpl, req) if req else set()
+    if not date_str or date_str.strip().lower() in ("now", "сейчас"):
+        dt = datetime.now()
+        date_part = dt.strftime("%d.%m.%Y")
+        time_part = dt.strftime("%H:%M")
+    else:
+        parts = date_str.strip().split(",")
+        date_part = parts[0].strip()
+        time_part = parts[1].strip() if len(parts) > 1 else datetime.now().strftime("%H:%M")
+    date_str_full = f"{date_part}, {time_part}"
+    meta_date = datetime.strptime(date_str_full, "%d.%m.%Y, %H:%M").strftime("D:%Y%m%d%H%M00+03'00'")
+    phone = f"+7 ({__import__('random').randint(900, 999)}) {__import__('random').randint(100, 999)}-{__import__('random').randint(10, 99)}-{__import__('random').randint(10, 99)}-{__import__('random').randint(10, 99)}"
+    if not missing:
+        data = bytearray(_tpl.read_bytes())
+        try:
+            out = patch_from_values(
+                data, _tpl,
+                date_str=date_str_full, payer=payer or "Иван Иванович И.", recipient=recipient or "Иван Иванович И.",
+                phone=phone, bank=bank or "Т-Банк", amount=amount, operation_id=None, keep_metadata=True,
+                account_last4=account if account and re.match(r"^\d{4}$", account) else None,
+            )
+        except ValueError as e:
+            return False, None, str(e)
+        out_arr = bytearray(out)
+        update_creation_date(out_arr, meta_date)
+        _change_one_char_in_id(out_arr)
+        return True, bytes(out_arr), ""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir=str(_BOT_DIR)) as tf:
+        out_path = tf.name
+    try:
+        cmd = [
+            os.sys.executable, str(_ADD_GLYPHS_SCRIPT),
+            "--replace", "--hybrid-safe", "--target", str(_tpl), "--id-from", str(_tpl),
+            "--keep-operation-id", "--payer", payer or "Иван Иванович И.", "--recipient", recipient or "Иван Иванович И.",
+            "--bank", bank or "Т-Банк", "--amount", str(amount), "--date", date_part, "--time", time_part, "-o", out_path,
+        ]
+        if account and re.match(r"^\d{4}$", account):
+            cmd.extend(["--account", account])
+        proc = subprocess.run(cmd, cwd=str(_BOT_DIR), capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return False, None, (proc.stderr or proc.stdout or "").strip()[:500]
+        if Path(out_path).exists():
+            return True, Path(out_path).read_bytes(), ""
+        return False, None, "PDF не создан"
+    except subprocess.TimeoutExpired:
+        return False, None, "Таймаут"
+    except Exception as e:
+        return False, None, str(e)
+    finally:
+        try:
+            Path(out_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def run_sbp_generate_verified(
+    payer: str,
+    recipient: str,
+    amount: int,
+    date_str: str,
+    bank: str = "Т-Банк",
+    account: str | None = None,
+) -> tuple[bool, bytes | None, str]:
+    """Генерация чека БЕЗ модификации шрифта (content-only).
+    Донор: check(3).pdf с полным алфавитом. operation_id — от донора.
+    Цель: пройти проверку целостности.
+    """
+    _sbp = _BOT_DIR / "база_чеков" / "vtb" / "СБП"
+    _donor = _sbp / "check (3).pdf"
+    if not _donor.exists():
+        return False, None, "Донор check (3).pdf не найден"
+    try:
+        from receipt_db import get_receipt_chars, _normalize_char
+    except ImportError:
+        return False, None, "receipt_db недоступен"
+    req = {_normalize_char(c) for c in chars_from_text_fields(payer or "", recipient or "", f"+7 (999) 000-00-00")}
+    donor_chars = get_receipt_chars(_donor)
+    if req and not (req <= donor_chars):
+        missing = req - donor_chars
+        return False, None, f"В доноре нет букв: {''.join(sorted(missing))}"
+    if not date_str or date_str.strip().lower() in ("now", "сейчас"):
+        dt = datetime.now()
+        date_part = dt.strftime("%d.%m.%Y")
+        time_part = dt.strftime("%H:%M")
+    else:
+        parts = date_str.strip().split(",")
+        date_part = parts[0].strip()
+        time_part = parts[1].strip() if len(parts) > 1 else datetime.now().strftime("%H:%M")
+    date_str_full = f"{date_part}, {time_part}"
+    meta_date = datetime.strptime(date_str_full, "%d.%m.%Y, %H:%M").strftime("D:%Y%m%d%H%M00+03'00'")
+    phone = f"+7 ({__import__('random').randint(900, 999)}) {__import__('random').randint(100, 999)}-{__import__('random').randint(10, 99)}-{__import__('random').randint(10, 99)}"
+    data = bytearray(_donor.read_bytes())
+    try:
+        out = patch_from_values(
+            data,
+            _donor,
+            date_str=date_str_full,
+            payer=payer or "Иван Иванович И.",
+            recipient=recipient or "Иван Иванович И.",
+            phone=phone,
+            bank=bank or "Т-Банк",
+            amount=amount,
+            operation_id=None,
+            keep_metadata=True,
+            account_last4=account if account and re.match(r"^\d{4}$", account) else None,
+        )
+    except ValueError as e:
+        return False, None, str(e)
+    out_arr = bytearray(out)
+    update_creation_date(out_arr, meta_date)
+    _change_one_char_in_id(out_arr)
+    return True, bytes(out_arr), ""
+
+
 def run_sbp_generate(
     payer: str,
     recipient: str,
@@ -381,11 +546,15 @@ def run_sbp_generate(
     account: str | None = None,
     operation_id: str | None = None,
 ) -> tuple[bool, bytes | None, str]:
-    """Генерация чека СБП через add_glyphs_to_13_03.py. Возвращает (ok, pdf_bytes, err).
-    date_str: "DD.MM.YYYY" или "DD.MM.YYYY, HH:MM" или "now"
-    """
+    """Генерация чека СБП. Сначала шаблон 15-03-26 (целостность), затем check(3), затем add_glyphs."""
+    ok, pdf_bytes, err = run_sbp_generate_15_03(payer, recipient, amount, date_str, bank, account)
+    if ok and pdf_bytes:
+        return True, pdf_bytes, ""
+    ok, pdf_bytes, err = run_sbp_generate_verified(payer, recipient, amount, date_str, bank, account)
+    if ok and pdf_bytes:
+        return True, pdf_bytes, ""
     if not _ADD_GLYPHS_SCRIPT.exists():
-        return False, None, f"Скрипт не найден: {_ADD_GLYPHS_SCRIPT}"
+        return False, None, err or f"Скрипт не найден: {_ADD_GLYPHS_SCRIPT}"
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir=str(_BOT_DIR)) as tf:
         out_path = tf.name
     try:
@@ -398,9 +567,10 @@ def run_sbp_generate(
             parts = date_str.strip().split(",")
             date_part = parts[0].strip()
             time_part = parts[1].strip() if len(parts) > 1 else datetime.now().strftime("%H:%M")
-        # Используем 15-03-26 как базовый шаблон и источник ID (актуальный, проходит проверку)
-        _template_15 = str(_BOT_DIR / "база_чеков" / "vtb" / "СБП" / "15-03-26_00-00.pdf")
-        _template_exists = Path(_template_15).exists()
+        # 16-03-26 — актуальный шаблон ID (15-03-26 исчерпан: все 9 decimal-слотов израсходованы)
+        # Каждый шаблон даёт ровно 9 уникальных decimal-ID (pos0, incs 1..15 дающих 0-9)
+        _template_id = str(_BOT_DIR / "база_чеков" / "vtb" / "СБП" / "16-03-26_00-00.pdf")
+        _template_exists = Path(_template_id).exists()
         cmd = [
             os.sys.executable, str(_ADD_GLYPHS_SCRIPT),
             "--replace", "--hybrid-safe", "--auto-base",
@@ -413,7 +583,7 @@ def run_sbp_generate(
             "-o", out_path,
         ]
         if _template_exists:
-            cmd.extend(["--id-from", _template_15])
+            cmd.extend(["--id-from", _template_id])
         if account and re.match(r"^\d{4}$", account):
             cmd.extend(["--account", account])
         if operation_id:
@@ -1170,6 +1340,136 @@ def _handle_vtb_full_input(token: str, uid: int, chat_id: int, text: str, msg: d
         _run_vtb_full_patch(token, uid, chat_id, state, tg_req)
 
 
+def _alfa_tg_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: str, tg_req) -> None:
+    """Следующий шаг режима «Альфа Трансгран». Поля с кнопкой «Оставить текущим»."""
+    KEEP_PROMPTS = {
+        "at_amount": ("1️⃣ Сумма перевода (сейчас: {amount}):\nВведите новую сумму, напр. 3 036 RUR", "at_keep_amount"),
+        "at_commission": ("2️⃣ Комиссия (сейчас: {commission}):\nВведите новую, напр. 50 RUR", "at_keep_commission"),
+        "at_rate": ("3️⃣ Курс конвертации (сейчас: {rate}):\nВведите новый, напр. 1 RUR = 0.1130 TJS", "at_keep_rate"),
+        "at_credited": ("4️⃣ Сумма зачисления (сейчас: {credited}):\nВведите новую, напр. 343,06 TJS", "at_keep_credited"),
+        "at_phone": ("5️⃣ Телефон (сейчас: {phone}):", "at_keep_phone"),
+        "at_name": ("6️⃣ Получатель (сейчас: {name}):", "at_keep_name"),
+        "at_operation_id": ("7️⃣ Номер операции (сейчас: {operation_id}):", "at_keep_opid"),
+    }
+    state["awaiting"] = aw
+    if aw in KEEP_PROMPTS:
+        tmpl, cb = KEEP_PROMPTS[aw]
+        fields = state.get("at_fields", {})
+        p = tmpl.format(**{k: fields.get(k, '—') for k in ['amount', 'commission', 'rate', 'credited', 'phone', 'name', 'operation_id']})
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": p,
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "📌 Оставить текущим", "callback_data": cb}]]}),
+        })
+    else:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": prompt})
+
+
+def _run_alfa_transgran_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Выполнить патч трансграничного чека Альфа-Банка и отправить PDF."""
+    inp = state["file_path"]
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    try:
+        pdf_data = Path(inp).read_bytes()
+        fields = state.get("at_fields", {})
+
+        kwargs = {}
+        for key, label in [
+            ("at_amount", "amount"),
+            ("at_commission", "commission"),
+            ("at_rate", "rate"),
+            ("at_credited", "credited"),
+            ("at_phone", "phone"),
+            ("at_name", "name"),
+            ("at_operation_id", "operation_id"),
+        ]:
+            new_val = state.get(key)
+            if new_val:
+                old_val = fields.get(label, "")
+                if old_val:
+                    kwargs[label] = f"{old_val}={new_val}"
+
+        if not kwargs:
+            send("❌ Нет замен — все поля оставлены текущими.")
+            return
+
+        ok, err, new_data = patch_transgran(pdf_data, **kwargs)
+        try:
+            os.unlink(inp)
+        except OSError:
+            pass
+        del USER_STATE[uid]
+
+        if not ok or new_data is None:
+            send(f"❌ Ошибка: {err}")
+            return
+
+        out_name = Path(state["file_name"]).stem + "_transgran.pdf"
+        changes = [f"• {k}" for k in kwargs]
+        caption = f"✅ Трансгран готов\n" + "\n".join(changes)
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, new_data)})
+        USER_STATE[uid] = {
+            "awaiting": "report_choice",
+            "amount_from": 0,
+            "amount_to": 0,
+            "bank": "alfa_transgran",
+            "pdf_name": out_name,
+        }
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "📋 Отчёт:",
+            "reply_markup": json.dumps({
+                "inline_keyboard": [
+                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+                ],
+            }),
+        })
+    except Exception as e:
+        send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
+
+
+def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
+    """Обработка пошагового ввода для Альфа Трансгран."""
+    state = USER_STATE[uid]
+    awaiting = state.get("awaiting", "")
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    def next_step(aw: str, prompt: str = ""):
+        _alfa_tg_send_next(state, aw, prompt, chat_id, token, tg_req)
+
+    skip_words = ("оставить", "текущим", "оставить текущим", "пропустить", "-", "=")
+
+    FLOW = [
+        ("at_amount",       "at_commission"),
+        ("at_commission",   "at_rate"),
+        ("at_rate",         "at_credited"),
+        ("at_credited",     "at_phone"),
+        ("at_phone",        "at_name"),
+        ("at_name",         "at_operation_id"),
+        ("at_operation_id", None),
+    ]
+
+    for step_aw, next_aw in FLOW:
+        if awaiting != step_aw:
+            continue
+        t = text.strip()
+        if t.lower() in skip_words:
+            state[step_aw] = None
+        else:
+            state[step_aw] = t
+        if next_aw:
+            next_step(next_aw)
+        else:
+            send("⏳ Обрабатываю чек...")
+            _run_alfa_transgran_patch(token, uid, chat_id, state, tg_req)
+        return
+
+
 def _do_stmt_apply(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
     """Применить патч выписки и отправить PDF."""
     try:
@@ -1438,6 +1738,7 @@ def run_bot(token: str) -> None:
                                         {"text": "🏦 Альфа-Банк", "callback_data": "bank_alfa"},
                                         {"text": "🏛 ВТБ", "callback_data": "bank_vtb"},
                                     ],
+                                    [{"text": "🌐 Альфа Трансгран", "callback_data": "bank_alfa_transgran"}],
                                     [{"text": "🔍 Авто", "callback_data": "bank_auto"}],
                                     [{"text": "❌ Отмена", "callback_data": "cancel"}],
                                 ],
@@ -1448,6 +1749,11 @@ def run_bot(token: str) -> None:
                     # Режим выписки: текст
                     if uid in USER_STATE and USER_STATE[uid].get("mode", "").startswith("statement_"):
                         _handle_stmt_text(token, uid, chat_id, text, tg_request)
+                        continue
+
+                    # Альфа Трансгран: пошаговый ввод
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("at_"):
+                        _handle_alfa_transgran_input(token, uid, chat_id, text, msg, tg_request)
                         continue
 
                     # ВТБ «Все поля»: пошаговый ввод
@@ -2082,6 +2388,61 @@ def run_bot(token: str) -> None:
                         else:
                             tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
                             _run_vtb_full_patch(token, uid, cid, state, tg_request)
+                        continue
+                    # Альфа Трансгран: callback handlers
+                    if q["data"] == "bank_alfa_transgran":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        state = USER_STATE[uid]
+                        state["bank"] = "alfa_transgran"
+                        try:
+                            pdf_data = Path(state["file_path"]).read_bytes()
+                            fields = extract_transgran_fields(pdf_data)
+                        except Exception:
+                            fields = {}
+                        state["at_fields"] = fields
+                        field_lines = []
+                        for label, key in [("Сумма перевода", "amount"), ("Комиссия", "commission"),
+                                           ("Курс", "rate"), ("Зачисление", "credited"),
+                                           ("Телефон", "phone"), ("Получатель", "name"),
+                                           ("Номер операции", "operation_id")]:
+                            field_lines.append(f"  {label}: {fields.get(key, '—')}")
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": (
+                                "🌐 Альфа Трансгран\n\n"
+                                "Текущие поля чека:\n" + "\n".join(field_lines) + "\n\n"
+                                "Введите новые значения пошагово.\n"
+                                "Для каждого поля можно «Оставить текущим»."
+                            ),
+                        })
+                        _alfa_tg_send_next(state, "at_amount", "", q["message"]["chat"]["id"], token, tg_request)
+                        continue
+                    if q["data"] in ("at_keep_amount", "at_keep_commission", "at_keep_rate", "at_keep_credited", "at_keep_phone", "at_keep_name", "at_keep_opid"):
+                        if uid not in USER_STATE:
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Сессия истекла"})
+                            continue
+                        state = USER_STATE[uid]
+                        cid = q["message"]["chat"]["id"]
+                        keep_flow = {
+                            "at_keep_amount": ("at_amount", "at_commission"),
+                            "at_keep_commission": ("at_commission", "at_rate"),
+                            "at_keep_rate": ("at_rate", "at_credited"),
+                            "at_keep_credited": ("at_credited", "at_phone"),
+                            "at_keep_phone": ("at_phone", "at_name"),
+                            "at_keep_name": ("at_name", "at_operation_id"),
+                            "at_keep_opid": ("at_operation_id", None),
+                        }
+                        field_key, next_aw = keep_flow[q["data"]]
+                        state[field_key] = None
+                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "✅ Оставлено текущим"})
+                        if next_aw:
+                            _alfa_tg_send_next(state, next_aw, "", cid, token, tg_request)
+                        else:
+                            tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
+                            _run_alfa_transgran_patch(token, uid, cid, state, tg_request)
                         continue
                     if uid not in USER_STATE:
                         tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})

@@ -25,19 +25,30 @@ DONORS_DIR = BASE / "база_чеков" / "vtb" / "СБП"
 UNIVERSAL_DONOR = BASE / "universal_donor.pdf"  # См. build_universal_donor.py
 
 
+def _decimal_safe_incs(hex_char: str) -> list[int]:
+    """Инкременты 1..15, результат — цифра 0-9. Верификатор VTB требует decimal в pos=0."""
+    base = int(hex_char.upper(), 16)
+    return [i for i in range(1, 16) if (base + i) % 16 < 10]
+
+
 def change_one_char_in_id(data: bytearray) -> None:
-    """Изменить ровно один символ в /ID."""
+    """Изменить ровно один символ в /ID. pos=0, результат 0-9 (как в add_glyphs — VTB верификатор)."""
     id_m = re.search(rb'/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]', data)
     if not id_m:
         return
-    hex1 = id_m.group(1).decode()
-    c = hex1[-1]
-    chars = "0123456789ABCDEF"
-    idx = chars.find(c.upper())
-    new_c = chars[(idx + 1) % 16]
-    new1 = hex1[:-1] + new_c
-    data[id_m.start(1) : id_m.end(1)] = new1.encode()
-    data[id_m.start(2) : id_m.end(2)] = new1.encode()
+    hex1 = id_m.group(1).decode().upper()
+    pos = 0
+    incs = _decimal_safe_incs(hex1[pos])
+    if not incs:
+        return
+    inc = incs[0]
+    idx = "0123456789ABCDEF".find(hex1[pos])
+    new_c = "0123456789ABCDEF"[(idx + inc) % 16]
+    new1 = hex1[:pos] + new_c + hex1[pos + 1:]
+    slot_len = id_m.end(1) - id_m.start(1)
+    new_enc = new1.encode().ljust(slot_len)[:slot_len]
+    data[id_m.start(1) : id_m.end(1)] = new_enc
+    data[id_m.start(2) : id_m.end(2)] = new_enc
 
 
 def get_donors_from_base() -> list[Path]:
@@ -75,6 +86,8 @@ def main() -> int:
     ap.add_argument("--message", "-m", help="Сообщение получателю (заменит тестовый текст)")
     ap.add_argument("--date", default=None, help="Дата DD.MM.YYYY, HH:MM или 'now'")
     ap.add_argument("--operation-id", "-o", help="ID операции СБП (по умолчанию — из шаблона)")
+    ap.add_argument("--bank", "-b", help="Банк получателя (напр. Сбербанк, Т-Банк)")
+    ap.add_argument("--account", help="4 цифры счёта (напр. 9483)")
     ap.add_argument("--keep-id", action="store_true", help="Не менять Document ID (для теста: оставить как в шаблоне)")
     ap.add_argument("--report", action="store_true", help="Вывести отчёт выравнивания")
     args = ap.parse_args()
@@ -164,10 +177,12 @@ def main() -> int:
             payer=args.payer,
             recipient=args.recipient,
             phone=args.phone,
+            bank=args.bank,
             amount=args.amount,
             message=args.message,
             operation_id=args.operation_id if args.operation_id else None,
             keep_metadata=True,
+            account_last4=args.account if args.account and re.match(r"^\d{4}$", args.account) else None,
         )
     except ValueError as e:
         print(f"[ERROR] {e}", file=sys.stderr)

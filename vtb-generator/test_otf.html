@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Чек-PDF</title>
+<style>
+@page {
+    size: 281.2125pt 437.25pt;
+    margin: 0;
+}
+* { margin: 0; padding: 0; }
+body {
+    font-family: 'SF Pro Display', sans-serif;
+    color: #222222;
+    width: 281.2125pt;
+    height: 437.25pt;
+    position: relative;
+}
+
+.logo {
+    position: absolute;
+    top: 24pt;
+    left: 106.10625pt;
+    width: 69pt;
+    height: 24pt;
+}
+
+.sep {
+    position: absolute;
+    left: 24pt;
+    width: 233.25pt;
+    height: 0.75pt;
+    background-color: #3a83f1;
+}
+.sep-top { top: 64pt; }
+.sep-bottom { top: 334pt; }
+
+.title {
+    position: absolute;
+    top: 81.64pt;
+    left: 0;
+    width: 281.2125pt;
+    text-align: center;
+    font-size: 10.5pt;
+    letter-spacing: -0.225pt;
+}
+
+.subtitle {
+    position: absolute;
+    top: 99.64pt;
+    left: 0;
+    width: 281.2125pt;
+    text-align: center;
+    font-size: 10.5pt;
+    letter-spacing: -0.225pt;
+}
+
+.label {
+    position: absolute;
+    left: 24.75pt;
+    font-size: 9pt;
+    letter-spacing: -0.15pt;
+    color: #222222;
+}
+
+.val {
+    position: absolute;
+    right: 24pt;
+    font-size: 9pt;
+    letter-spacing: -0.15pt;
+    color: #222222;
+    text-align: right;
+}
+
+.green { color: #008050; }
+
+.amount-label {
+    position: absolute;
+    top: 352.13pt;
+    left: 24.75pt;
+    font-size: 13.5pt;
+    letter-spacing: -0.15pt;
+}
+.amount-value {
+    position: absolute;
+    top: 352.13pt;
+    right: 24pt;
+    font-size: 13.5pt;
+    letter-spacing: -0.15pt;
+    text-align: right;
+}
+
+.stamp-box {
+    position: absolute;
+    bottom: 7pt;
+    left: 52.125pt;
+    width: 177pt;
+    height: 29.25pt;
+    border: 1.5pt solid #7fabec;
+}
+
+.stamp1 {
+    position: absolute;
+    bottom: 26pt;
+    left: 0;
+    width: 281.2125pt;
+    text-align: center;
+    font-size: 9pt;
+    letter-spacing: -0.075pt;
+    color: #7fabec;
+}
+.stamp2 {
+    position: absolute;
+    bottom: 15pt;
+    left: 0;
+    width: 281.2125pt;
+    text-align: center;
+    font-size: 9pt;
+    letter-spacing: -0.075pt;
+    color: #7fabec;
+}
+</style>
+</head>
+<body>
+
+<img class="logo" src="vtb_logo.svg" alt=""/>
+
+<div class="sep sep-top"></div>
+
+<div class="title">Исходящий перевод СБП</div>
+<div class="subtitle">Тест Тестович К.</div>
+
+<div class="label" style="top: 128.25pt;">Статус</div>
+<div class="val green" style="top: 127.5pt;">Выполнено</div>
+
+<div class="label" style="top: 152.25pt;">Дата операции</div>
+<div class="val" style="top: 151.5pt;">17.03.2026, 01:25</div>
+
+<div class="label" style="top: 176.25pt;">Счет списания</div>
+<div class="val" style="top: 175.5pt;">*9426</div>
+
+<div class="label" style="top: 200.25pt;">Имя плательщика</div>
+<div class="val" style="top: 199.5pt;">Тест Тестович К.</div>
+
+<div class="label" style="top: 224.25pt;">Получатель</div>
+<div class="val" style="top: 223.5pt;">Тест Тестович К.</div>
+
+<div class="label" style="top: 248.25pt;">Телефон получателя</div>
+<div class="val" style="top: 247.5pt;">+7 (900) 000-00-00</div>
+
+<div class="label" style="top: 272.25pt;">Банк получателя</div>
+<div class="val" style="top: 271.5pt;">Т-Банк</div>
+
+<div class="label" style="top: 296.25pt;">ID операции в СБП</div>
+<div class="val" style="top: 295.5pt;">TEST123</div>
+<div class="val" style="top: 307.5pt;"></div>
+
+<div class="sep sep-bottom"></div>
+
+<div class="amount-label">Сумма операции</div>
+<div class="amount-value">10 ₽</div>
+
+<div class="stamp-box"></div>
+<div class="stamp1">Банк ВТБ (ПАО)</div>
+<div class="stamp2">Операция выполнена</div>
+
+</body>
+</html>
