@@ -109,6 +109,10 @@ MAIN_MENU_KB = [
 
 CHANGELOG_TEXT = (
     "📝 Последние изменения\n\n"
+    "• 🏦 Выписка Альфа-Банк — блоковое редактирование выписки. "
+    "3 блока: Операции, Сводка (авто-расчёт), Реквизиты. "
+    "Автозаполнение из чека, проверка доступных символов в шрифте. "
+    "Побайтовый CID-патчинг с сохранением структуры и выравнивания.\n\n"
     "• 🌍 ВТБ Трансгран (UZS) — режим для трансграничных чеков ВТБ. "
     "Замена суммы, телефона, даты. Зачисление считается автоматически (сумма × курс). "
     "Сохраняет структуру PDF, правильное выравнивание, меняет Document ID.\n\n"
@@ -1122,6 +1126,329 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
             send("❌ Номер счёта — 4 цифры (например 9426)")
 
 
+# ── Выписка Альфа-Банк ──────────────────────────────────────────────────
+
+def _alfa_stmt_show_blocks(token: str, chat_id: int, state: dict, tg_req) -> None:
+    """Show all 3 blocks and editing buttons."""
+    from alfa_statement_service import format_block1, format_block2, format_block3
+    changes = state.get("changes", {})
+    txt = (
+        "🏦 Выписка Альфа-Банк\n\n"
+        + format_block1(changes) + "\n\n"
+        + format_block2(changes) + "\n\n"
+        + format_block3(changes)
+    )
+    kb = [
+        [{"text": "💳 Блок 1 — Операции", "callback_data": "alfa_stmt_b1"}],
+        [{"text": "📊 Блок 2 — Сводка", "callback_data": "alfa_stmt_b2"}],
+        [{"text": "👤 Блок 3 — Реквизиты", "callback_data": "alfa_stmt_b3"}],
+        [{"text": "📎 Заполнить из чека", "callback_data": "alfa_stmt_from_check"}],
+        [{"text": "✅ Создать PDF", "callback_data": "alfa_stmt_generate"},
+         {"text": "⬅️ Назад", "callback_data": "main_back"}],
+    ]
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt,
+           "reply_markup": json.dumps({"inline_keyboard": kb})})
+
+
+def _alfa_stmt_show_block_edit(token: str, chat_id: int, msg_id: int, block_num: int, tg_req) -> None:
+    """Show fields for a specific block, ready to edit."""
+    from alfa_statement_service import (
+        BLOCK1_DEFAULTS, BLOCK2_DEFAULTS, BLOCK3_DEFAULTS, BLOCK_LABELS)
+    if block_num == 1:
+        fields = BLOCK1_DEFAULTS
+        title = "💳 Блок 1 — Операции"
+        hint = (
+            "Введите замены в формате:\n"
+            "ключ=значение\n\n"
+            "Ключи: код_расход, телефон, тел_конец, "
+            "сумма_расход, код_приход, получатель, сумма_приход\n\n"
+            "Пример:\nсумма_расход=15 000,00\nсумма_приход=15 000,00\nтелефон=+7 (999) 123-45-"
+        )
+    elif block_num == 2:
+        fields = BLOCK2_DEFAULTS
+        title = "📊 Блок 2 — Сводка"
+        hint = (
+            "Введите суммы (авто-расчёт):\n"
+            "входящий=СУММА\nпоступления=СУММА\nрасходы=СУММА\n\n"
+            "Исходящий/лимит/баланс считаются автоматически:\n"
+            "исходящий = входящий + поступления - расходы\n\n"
+            "Пример:\nвходящий=500\nпоступления=15000\nрасходы=10000\n\n"
+            "Или вручную:\nисходящий=5500\nлимит=5500\nбаланс=5500"
+        )
+    else:
+        fields = BLOCK3_DEFAULTS
+        title = "👤 Блок 3 — Реквизиты"
+        hint = (
+            "Введите замены:\n"
+            "Ключи: счёт, имя, отчество, индекс, город, дом\n\n"
+            "Пример:\nимя=Иванов Иван\nотчество=Иванович\nиндекс=123456\nгород=Москва"
+        )
+    lines = [f"{title}\n\nТекущие значения:"]
+    for k, v in fields.items():
+        label = BLOCK_LABELS.get(k, k)
+        lines.append(f"  {label}: {v}")
+    lines.append(f"\n{hint}")
+    kb = [[{"text": "⬅️ К блокам", "callback_data": "alfa_stmt_blocks"}]]
+    tg_req(token, "editMessageText", {
+        "chat_id": chat_id, "message_id": msg_id,
+        "text": "\n".join(lines),
+        "reply_markup": json.dumps({"inline_keyboard": kb}),
+    })
+
+
+_BLOCK2_KEY_MAP = {
+    "входящий": "входящий_остаток", "входящий_остаток": "входящий_остаток",
+    "поступления": "поступления",
+    "расходы": "расходы",
+    "исходящий": "исходящий_остаток", "исходящий_остаток": "исходящий_остаток",
+    "лимит": "платежный_лимит", "платежный_лимит": "платежный_лимит",
+    "баланс": "текущий_баланс", "текущий_баланс": "текущий_баланс",
+}
+_BLOCK3_KEY_MAP = {
+    "счёт": "номер_счета", "счет": "номер_счета", "номер_счета": "номер_счета",
+    "имя": "клиент_имя", "клиент_имя": "клиент_имя", "фио": "клиент_имя",
+    "отчество": "клиент_отчество", "клиент_отчество": "клиент_отчество",
+    "индекс": "индекс",
+    "город": "город",
+    "дом": "дом_кв", "дом_кв": "дом_кв", "квартира": "дом_кв",
+}
+_BLOCK1_KEY_MAP = {
+    "код_расход": "код_операции_расход", "код_операции_расход": "код_операции_расход",
+    "телефон": "телефон",
+    "тел_конец": "телефон_окончание", "телефон_окончание": "телефон_окончание",
+    "сумма_расход": "сумма_расход", "расход": "сумма_расход",
+    "код_приход": "код_операции_приход", "код_операции_приход": "код_операции_приход",
+    "получатель": "получатель_сокр", "получатель_сокр": "получатель_сокр",
+    "сумма_приход": "сумма_приход", "приход": "сумма_приход",
+}
+
+
+def _handle_alfa_stmt_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
+    """Handle text input in alfa_stmt editing mode."""
+    state = USER_STATE.get(uid)
+    if not state:
+        return
+    block = state.get("editing_block")
+    if not block:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "Выберите блок для редактирования."})
+        return
+
+    from alfa_statement_service import (
+        validate_text, parse_amount, recalc_balances, _fmt_amount,
+        BLOCK2_DEFAULTS, format_block1, format_block2, format_block3,
+    )
+
+    changes = state.setdefault("changes", {})
+    key_map = {1: _BLOCK1_KEY_MAP, 2: _BLOCK2_KEY_MAP, 3: _BLOCK3_KEY_MAP}[block]
+    applied = []
+    warnings = []
+
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if "=" not in line:
+            continue
+        raw_key, _, raw_val = line.partition("=")
+        raw_key = raw_key.strip().lower()
+        raw_val = raw_val.strip()
+        field_key = key_map.get(raw_key)
+        if not field_key:
+            warnings.append(f"Неизвестный ключ: {raw_key}")
+            continue
+
+        missing = validate_text(raw_val)
+        if missing:
+            warnings.append(f"⚠️ Недоступные символы для «{raw_key}»: {''.join(missing)}")
+            continue
+
+        if field_key in ("входящий_остаток", "поступления", "расходы",
+                         "исходящий_остаток", "платежный_лимит", "текущий_баланс",
+                         "сумма_расход", "сумма_приход"):
+            parsed = parse_amount(raw_val)
+            if parsed is not None:
+                raw_val = _fmt_amount(parsed)
+
+        changes[field_key] = raw_val
+        applied.append(f"✅ {raw_key} = {raw_val}")
+
+    # Auto-recalculate Block 2 if we have the three input values
+    if block == 2:
+        вх = parse_amount(changes.get("входящий_остаток", BLOCK2_DEFAULTS["входящий_остаток"]))
+        пост = parse_amount(changes.get("поступления", BLOCK2_DEFAULTS["поступления"]))
+        расх = parse_amount(changes.get("расходы", BLOCK2_DEFAULTS["расходы"]))
+        has_manual = any(k in changes for k in ("исходящий_остаток", "платежный_лимит", "текущий_баланс"))
+        if вх is not None and пост is not None and расх is not None and not has_manual:
+            auto = recalc_balances(вх, пост, расх)
+            changes.update(auto)
+            applied.append(f"📊 Авто: исходящий={auto['исходящий_остаток']}, лимит={auto['платежный_лимит']}, баланс={auto['текущий_баланс']}")
+
+    msg_parts = []
+    if applied:
+        msg_parts.append("\n".join(applied))
+    if warnings:
+        msg_parts.append("\n".join(warnings))
+    if not applied and not warnings:
+        msg_parts.append("❌ Не удалось распознать. Формат: ключ=значение")
+
+    msg_parts.append("\nВведите ещё или вернитесь к блокам.")
+    kb = [[{"text": "⬅️ К блокам", "callback_data": "alfa_stmt_blocks"}]]
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "\n".join(msg_parts),
+           "reply_markup": json.dumps({"inline_keyboard": kb})})
+
+
+def _handle_alfa_stmt_upload(token: str, uid: int, chat_id: int, doc: dict, fname: str, tg_req) -> None:
+    """Handle check PDF upload for auto-fill."""
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Извлекаю данные из чека..."})
+    try:
+        fp = tg_get_file_path(token, doc["file_id"])
+        pdf_data = tg_get_file(token, fp)
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка загрузки: {e}"})
+        return
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+        tf.write(pdf_data)
+        check_path = tf.name
+    try:
+        from alfa_statement_service import (
+            extract_from_check, validate_text, format_block1, format_block2, format_block3,
+        )
+        extracted = extract_from_check(Path(check_path))
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка извлечения: {e}"})
+        try:
+            os.unlink(check_path)
+        except OSError:
+            pass
+        return
+    try:
+        os.unlink(check_path)
+    except OSError:
+        pass
+
+    if not extracted:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⚠️ Не удалось извлечь данные из чека. Заполните вручную."})
+        return
+
+    state = USER_STATE.get(uid, {})
+    changes = state.setdefault("changes", {})
+
+    warn_lines = []
+    for key, val in extracted.items():
+        missing = validate_text(val)
+        if missing:
+            warn_lines.append(f"⚠️ «{key}»: недоступные символы {''.join(missing)}")
+        else:
+            changes[key] = val
+
+    parts = ["📎 Извлечено из чека:\n"]
+    from alfa_statement_service import BLOCK_LABELS
+    for k, v in extracted.items():
+        label = BLOCK_LABELS.get(k, k)
+        parts.append(f"  {label}: {v}")
+    if warn_lines:
+        parts.append("\n" + "\n".join(warn_lines))
+    parts.append("\nПросмотрите и отредактируйте блоки.")
+
+    state["mode"] = "alfa_stmt"
+    state.pop("editing_block", None)
+    kb = [
+        [{"text": "💳 Блок 1", "callback_data": "alfa_stmt_b1"},
+         {"text": "📊 Блок 2", "callback_data": "alfa_stmt_b2"},
+         {"text": "👤 Блок 3", "callback_data": "alfa_stmt_b3"}],
+        [{"text": "✅ Создать PDF", "callback_data": "alfa_stmt_generate"},
+         {"text": "⬅️ Назад", "callback_data": "main_back"}],
+    ]
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "\n".join(parts),
+           "reply_markup": json.dumps({"inline_keyboard": kb})})
+
+
+def _handle_alfa_stmt_callback(token: str, uid: int, q: dict, tg_req) -> None:
+    """Handle callback queries for alfa_stmt flow."""
+    data = q["data"]
+    chat_id = q["message"]["chat"]["id"]
+    msg_id = q["message"]["message_id"]
+
+    if data == "alfa_stmt_start":
+        USER_STATE[uid] = {"mode": "alfa_stmt", "changes": {}}
+        _alfa_stmt_show_blocks(token, chat_id, USER_STATE[uid], tg_req)
+        return
+
+    if data == "alfa_stmt_blocks":
+        state = USER_STATE.get(uid)
+        if not state or not state.get("mode", "").startswith("alfa_stmt"):
+            USER_STATE[uid] = {"mode": "alfa_stmt", "changes": {}}
+        USER_STATE[uid].pop("editing_block", None)
+        _alfa_stmt_show_blocks(token, chat_id, USER_STATE[uid], tg_req)
+        return
+
+    if data in ("alfa_stmt_b1", "alfa_stmt_b2", "alfa_stmt_b3"):
+        block_num = int(data[-1])
+        state = USER_STATE.setdefault(uid, {"mode": "alfa_stmt", "changes": {}})
+        state["mode"] = "alfa_stmt"
+        state["editing_block"] = block_num
+        _alfa_stmt_show_block_edit(token, chat_id, msg_id, block_num, tg_req)
+        return
+
+    if data == "alfa_stmt_from_check":
+        state = USER_STATE.setdefault(uid, {"mode": "alfa_stmt", "changes": {}})
+        state["mode"] = "alfa_stmt_check"
+        tg_req(token, "editMessageText", {
+            "chat_id": chat_id, "message_id": msg_id,
+            "text": "📎 Отправьте PDF-файл чека.\n\nДанные будут извлечены и подставлены в блоки.",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "⬅️ К блокам", "callback_data": "alfa_stmt_blocks"}]
+            ]}),
+        })
+        return
+
+    if data == "alfa_stmt_generate":
+        state = USER_STATE.get(uid)
+        if not state:
+            tg_req(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Сессия истекла"})
+            return
+        tg_req(token, "editMessageText", {
+            "chat_id": chat_id, "message_id": msg_id,
+            "text": "⏳ Генерирую выписку...",
+        })
+        try:
+            from alfa_statement_service import patch_alfa_statement
+            changes = state.get("changes", {})
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                out_path = tf.name
+            ok, err = patch_alfa_statement(changes, Path(out_path))
+            if not ok:
+                tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
+                del USER_STATE[uid]
+                return
+            with open(out_path, "rb") as f:
+                pdf_bytes = f.read()
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            del USER_STATE[uid]
+            summary = []
+            for k, v in changes.items():
+                from alfa_statement_service import BLOCK_LABELS
+                label = BLOCK_LABELS.get(k, k)
+                summary.append(f"  {label}: {v}")
+            caption = "✅ Выписка Альфа-Банк готова"
+            if summary:
+                caption += "\n\nИзменения:\n" + "\n".join(summary[:10])
+                if len(summary) > 10:
+                    caption += f"\n  ... и ещё {len(summary) - 10}"
+            tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption},
+                   files={"document": ("выписка_альфа.pdf", pdf_bytes)})
+        except Exception as e:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+            if uid in USER_STATE:
+                del USER_STATE[uid]
+        return
+
+
 def _handle_stmt_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
     """Обработка текста в режиме выписки."""
     state = USER_STATE[uid]
@@ -1757,6 +2084,9 @@ def run_bot(token: str) -> None:
                             continue
                         state = USER_STATE.get(uid, {})
                         mode = state.get("mode", "")
+                        if mode == "alfa_stmt_check":
+                            _handle_alfa_stmt_upload(token, uid, msg["chat"]["id"], doc, fname, tg_request)
+                            continue
                         if mode == "statement_edit":
                             tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Скачиваю выписку..."})
                             try:
@@ -1889,6 +2219,11 @@ def run_bot(token: str) -> None:
                                 ],
                             }),
                         })
+                        continue
+
+                    # Выписка Альфа-Банк: текст
+                    if uid in USER_STATE and USER_STATE[uid].get("mode", "").startswith("alfa_stmt"):
+                        _handle_alfa_stmt_text(token, uid, chat_id, text, tg_request)
                         continue
 
                     # Режим выписки: текст
@@ -2308,12 +2643,16 @@ def run_bot(token: str) -> None:
                             "text": "📄 Создание выписки\n\nВыберите вариант:",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
+                                    [{"text": "🏦 Выписка Альфа-Банк", "callback_data": "alfa_stmt_start"}],
                                     [{"text": "✏️ Редактирование своей выписки", "callback_data": "stmt_edit"}],
                                     [{"text": "📄 Выписка по чеку", "callback_data": "stmt_receipt"}],
                                     [{"text": "⬅️ Назад", "callback_data": "main_back"}],
                                 ],
                             }),
                         })
+                        continue
+                    if q["data"].startswith("alfa_stmt"):
+                        _handle_alfa_stmt_callback(token, uid, q, tg_request)
                         continue
                     if q["data"] == "stmt_edit":
                         USER_STATE[uid] = {"mode": "statement_edit", "step": "upload"}
@@ -2360,7 +2699,7 @@ def run_bot(token: str) -> None:
                         tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": "ФИО не заменяется. Введите другие замены или Далее."})
                         continue
                     if q["data"] == "main_back":
-                        if uid in USER_STATE and USER_STATE[uid].get("mode", "").startswith("statement_"):
+                        if uid in USER_STATE and USER_STATE[uid].get("mode", "").startswith(("statement_", "alfa_stmt")):
                             if "file_path" in USER_STATE[uid]:
                                 try:
                                     os.unlink(USER_STATE[uid]["file_path"])
