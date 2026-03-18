@@ -52,6 +52,7 @@ except Exception:
 
 from pdf_patcher import patch_pdf_file, patch_amount as pdf_patch_amount, format_amount_display
 from alfa_transgran_patch import patch_transgran, extract_transgran_fields
+from vtb_transgran_patch import patch_vtb_transgran, extract_fields as extract_vtb_transgran_fields, parse_rate, format_credited, format_amount_rub
 from vtb_patch_from_config import patch_from_values, patch_amount_only
 from vtb_cmap import get_unsupported_chars, format_unsupported_error, suggest_replacement, FALLBACK_TIPS
 from vtb_sber_reference import scan_vtb_unsupported_chars
@@ -108,7 +109,10 @@ MAIN_MENU_KB = [
 
 CHANGELOG_TEXT = (
     "📝 Последние изменения\n\n"
-    "• 🌐 Альфа Трансгран — новый режим для трансграничных чеков Альфа-Банка. "
+    "• 🌍 ВТБ Трансгран (UZS) — режим для трансграничных чеков ВТБ. "
+    "Замена суммы, телефона, даты. Зачисление считается автоматически (сумма × курс). "
+    "Сохраняет структуру PDF, правильное выравнивание, меняет Document ID.\n\n"
+    "• 🌐 Альфа Трансгран — режим для трансграничных чеков Альфа-Банка. "
     "Замена суммы, комиссии, курса, имени, телефона и номера операции. "
     "Сохраняет структуру, меняет Document ID.\n\n"
     "• Система заявок — после создания чека можно оформить заявку. "
@@ -1470,6 +1474,146 @@ def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, 
         return
 
 
+def _vtb_tg_send_next(state: dict, aw: str, chat_id: int, token: str, tg_req) -> None:
+    """Следующий шаг режима «ВТБ Трансгран». Поля с кнопкой «Оставить текущим»."""
+    fields = state.get("vt_fields", {})
+    KEEP_PROMPTS = {
+        "vt_amount": ("1️⃣ Сумма операции (сейчас: {amount}):\nВведите новую сумму числом (напр. 10000)", "vt_keep_amount"),
+        "vt_phone": ("2️⃣ Телефон получателя (сейчас: {phone}):\nВведите новый номер", "vt_keep_phone"),
+        "vt_date": ("3️⃣ Дата и время (сейчас: {date}):\nВведите новые, напр. 18.03.2026, 02:44", "vt_keep_date"),
+    }
+    state["awaiting"] = aw
+    if aw in KEEP_PROMPTS:
+        tmpl, cb = KEEP_PROMPTS[aw]
+        p = tmpl.format(**{k: fields.get(k, '—') for k in ['amount', 'phone', 'date']})
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": p,
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "📌 Оставить текущим", "callback_data": cb}]]}),
+        })
+
+
+def _run_vtb_transgran_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Выполнить патч трансграничного чека ВТБ и отправить PDF."""
+    inp = state["file_path"]
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    try:
+        pdf_data = Path(inp).read_bytes()
+        fields = state.get("vt_fields", {})
+
+        kwargs: dict = {}
+        new_amount = state.get("vt_amount")
+        new_phone = state.get("vt_phone")
+        new_date = state.get("vt_date")
+
+        if new_amount:
+            try:
+                kwargs["amount"] = int(new_amount.replace(" ", "").replace("₽", "").strip())
+            except ValueError:
+                send(f"❌ Неверный формат суммы: {new_amount}")
+                return
+
+        if new_phone:
+            kwargs["phone"] = new_phone.strip()
+
+        if new_date:
+            kwargs["date"] = new_date.strip()
+
+        if not kwargs:
+            send("❌ Нет замен — все поля оставлены текущими.")
+            return
+
+        if "amount" not in kwargs:
+            old_amt = fields.get("amount", "")
+            m = re.search(r'([\d\s]+)', old_amt.replace('\xa0', ' '))
+            if m:
+                kwargs["amount"] = int(m.group(1).replace(" ", ""))
+
+        ok, info, new_data = patch_vtb_transgran(pdf_data, **kwargs)
+        try:
+            os.unlink(inp)
+        except OSError:
+            pass
+        del USER_STATE[uid]
+
+        if not ok or new_data is None:
+            send(f"❌ Ошибка: {info}")
+            return
+
+        out_name = Path(state["file_name"]).stem + "_transgran.pdf"
+
+        rate_str = fields.get("rate", "")
+        parsed = parse_rate(rate_str) if rate_str else None
+        summary_lines = []
+        if "amount" in kwargs:
+            summary_lines.append(f"• Сумма: {format_amount_rub(kwargs['amount'])}")
+            if parsed:
+                from decimal import Decimal
+                rate_val, currency = parsed
+                credited_val = Decimal(kwargs["amount"]) * rate_val
+                summary_lines.append(f"• Зачисление: {format_credited(credited_val, currency)} (авто)")
+        if new_phone:
+            summary_lines.append(f"• Телефон: {new_phone}")
+        if new_date:
+            summary_lines.append(f"• Дата: {new_date}")
+
+        caption = "✅ ВТБ Трансгран готов\n" + "\n".join(summary_lines)
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, new_data)})
+        USER_STATE[uid] = {
+            "awaiting": "report_choice",
+            "amount_from": 0,
+            "amount_to": kwargs.get("amount", 0),
+            "bank": "vtb_transgran",
+            "pdf_name": out_name,
+        }
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "📋 Отчёт:",
+            "reply_markup": json.dumps({
+                "inline_keyboard": [
+                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+                ],
+            }),
+        })
+    except Exception as e:
+        send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
+
+
+def _handle_vtb_transgran_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
+    """Обработка пошагового ввода для ВТБ Трансгран."""
+    state = USER_STATE[uid]
+    awaiting = state.get("awaiting", "")
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    skip_words = ("оставить", "текущим", "оставить текущим", "пропустить", "-", "=")
+
+    FLOW = [
+        ("vt_amount", "vt_phone"),
+        ("vt_phone",  "vt_date"),
+        ("vt_date",   None),
+    ]
+
+    for step_aw, next_aw in FLOW:
+        if awaiting != step_aw:
+            continue
+        t = text.strip()
+        if t.lower() in skip_words:
+            state[step_aw] = None
+        else:
+            state[step_aw] = t
+        if next_aw:
+            _vtb_tg_send_next(state, next_aw, chat_id, token, tg_req)
+        else:
+            send("⏳ Обрабатываю чек...")
+            _run_vtb_transgran_patch(token, uid, chat_id, state, tg_req)
+        return
+
+
 def _do_stmt_apply(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
     """Применить патч выписки и отправить PDF."""
     try:
@@ -1739,6 +1883,7 @@ def run_bot(token: str) -> None:
                                         {"text": "🏛 ВТБ", "callback_data": "bank_vtb"},
                                     ],
                                     [{"text": "🌐 Альфа Трансгран", "callback_data": "bank_alfa_transgran"}],
+                                    [{"text": "🌍 ВТБ Трансгран (UZS)", "callback_data": "bank_vtb_transgran"}],
                                     [{"text": "🔍 Авто", "callback_data": "bank_auto"}],
                                     [{"text": "❌ Отмена", "callback_data": "cancel"}],
                                 ],
@@ -1754,6 +1899,11 @@ def run_bot(token: str) -> None:
                     # Альфа Трансгран: пошаговый ввод
                     if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("at_"):
                         _handle_alfa_transgran_input(token, uid, chat_id, text, msg, tg_request)
+                        continue
+
+                    # ВТБ Трансгран: пошаговый ввод
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("vt_"):
+                        _handle_vtb_transgran_input(token, uid, chat_id, text, msg, tg_request)
                         continue
 
                     # ВТБ «Все поля»: пошаговый ввод
@@ -2388,6 +2538,58 @@ def run_bot(token: str) -> None:
                         else:
                             tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
                             _run_vtb_full_patch(token, uid, cid, state, tg_request)
+                        continue
+                    # ВТБ Трансгран: callback handlers
+                    if q["data"] == "bank_vtb_transgran":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        state = USER_STATE[uid]
+                        state["bank"] = "vtb_transgran"
+                        try:
+                            pdf_data = Path(state["file_path"]).read_bytes()
+                            fields = extract_vtb_transgran_fields(pdf_data)
+                        except Exception:
+                            fields = {}
+                        state["vt_fields"] = fields
+                        field_lines = []
+                        for label, key in [("Сумма операции", "amount"), ("Курс обмена", "rate"),
+                                           ("Зачисление", "credited"), ("Телефон", "phone"),
+                                           ("Дата", "date"), ("Получатель", "name"),
+                                           ("Банк", "bank"), ("Страна", "country")]:
+                            field_lines.append(f"  {label}: {fields.get(key, '—')}")
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": (
+                                "🌍 ВТБ Трансгран (UZS)\n\n"
+                                "Текущие поля чека:\n" + "\n".join(field_lines) + "\n\n"
+                                "Зачисление считается автоматически (сумма × курс).\n"
+                                "Имя получателя не меняется.\n\n"
+                                "Введите новые значения пошагово."
+                            ),
+                        })
+                        _vtb_tg_send_next(state, "vt_amount", q["message"]["chat"]["id"], token, tg_request)
+                        continue
+                    if q["data"] in ("vt_keep_amount", "vt_keep_phone", "vt_keep_date"):
+                        if uid not in USER_STATE:
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Сессия истекла"})
+                            continue
+                        state = USER_STATE[uid]
+                        cid = q["message"]["chat"]["id"]
+                        keep_flow = {
+                            "vt_keep_amount": ("vt_amount", "vt_phone"),
+                            "vt_keep_phone":  ("vt_phone",  "vt_date"),
+                            "vt_keep_date":   ("vt_date",   None),
+                        }
+                        field_key, next_aw = keep_flow[q["data"]]
+                        state[field_key] = None
+                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "✅ Оставлено текущим"})
+                        if next_aw:
+                            _vtb_tg_send_next(state, next_aw, cid, token, tg_request)
+                        else:
+                            tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
+                            _run_vtb_transgran_patch(token, uid, cid, state, tg_request)
                         continue
                     # Альфа Трансгран: callback handlers
                     if q["data"] == "bank_alfa_transgran":
