@@ -105,28 +105,42 @@ def _calc_advance(text: str, uni2cid: dict, widths: dict, font_size: float, kern
     return total
 
 
-def _gen_operation_id(available_latin: set = None):
+def _day_of_year(date_str: str) -> int:
+    """Возвращает номер дня в году для даты ДД.ММ.ГГГГ."""
+    import datetime
+    try:
+        d = datetime.datetime.strptime(date_str, '%d.%m.%Y')
+        return d.timetuple().tm_yday
+    except Exception:
+        return 76
+
+
+def _gen_operation_id(available_latin: set = None, date_str: str = None):
     """Генерирует operation ID похожий на оригинал.
-    
-    Для 15-03-26 доноров: формат B + цифры + K + цифры (без G)
-    Для 17-03-26 доноров: формат B + цифры + G + цифры
+
+    15-03 стиль (K): B60[day][10 random digits]K0B1014001  — K на позиции 15
+    17-03 стиль (G): B60[day][12 random digits]G1011001    — G на позиции 17
+    Форматы установлены путём обратной разработки реальных VTB чеков.
     """
-    if available_latin and 'K' in available_latin and 'G' not in available_latin:
-        letter = 'K'
+    use_g = available_latin and 'G' in available_latin
+    use_k = available_latin and 'K' in available_latin
+
+    day = _day_of_year(date_str) if date_str else 76
+    day_str = f'{day:02d}'
+
+    rand_digits = lambda n: ''.join(random.choice('0123456789') for _ in range(n))
+
+    if use_g and not use_k:
+        # 17-03 стиль: G на позиции 17, суффикс G1011001
+        middle = rand_digits(12)
+        op = f'B60{day_str}{middle}G1011001'
     else:
-        letter = 'G'
-    prefix = 'B'
-    body = ''
-    letter_placed = False
-    for i in range(24):
-        if not letter_placed and i == 15:
-            body += letter
-            letter_placed = True
-        else:
-            body += random.choice('0123456789')
-    if not letter_placed:
-        body += letter
-    return prefix + body
+        # 15-03 стиль: K на позиции 15, суффикс K0B1014001
+        middle = rand_digits(10)
+        op = f'B60{day_str}{middle}K0B1014001'
+
+    assert len(op) == 25, f"Operation ID length error: {len(op)} != 25 for {op!r}"
+    return op
 
 
 def patch(donor_path: str, output_path: str, *,
@@ -139,6 +153,7 @@ def patch(donor_path: str, output_path: str, *,
           amount: int = None,
           account: str = None,
           op_id: str = None,
+          keep_op_id: bool = False,
           doc_id_changes: int = 1):
     """
     Патчит PDF-донор, меняя только текст в TJ-массивах.
@@ -281,14 +296,27 @@ def patch(donor_path: str, output_path: str, *,
         bank_fmt = bank.replace('-', '\u2011')
         replacements[15] = bank_fmt
     
-    # Operation ID: only replace if explicitly provided, otherwise keep donor's original
+    # Operation ID handling
+    available_latin = {ch for ch in uni2cid if 'A' <= ch <= 'Z'}
     if op_id:
-        if len(op_id) > 25:
-            replacements[17] = op_id[:25]
-            replacements[18] = op_id[25:]
+        new_op_id = op_id
+        if len(new_op_id) > 25:
+            replacements[17] = new_op_id[:25]
+            replacements[18] = new_op_id[25:]
         else:
-            replacements[17] = op_id
-    # If op_id not provided, blocks 17 and 18 stay unchanged (donor's authentic ID)
+            replacements[17] = new_op_id
+        print(f"  Операция ID: {new_op_id} (явный)")
+    elif keep_op_id:
+        # Leave blocks 17/18 unchanged — donor's real operation ID stays
+        print(f"  Операция ID: сохранён из донора (реальный VTB)")
+    else:
+        new_op_id = _gen_operation_id(available_latin=available_latin, date_str=date)
+        if len(new_op_id) > 25:
+            replacements[17] = new_op_id[:25]
+            replacements[18] = new_op_id[25:]
+        else:
+            replacements[17] = new_op_id
+        print(f"  Операция ID: {new_op_id} (свежий, стиль: {'G@17' if 'G' in available_latin else 'K@15'})")
     
     if amount is not None:
         amt_str = f"{amount:,}".replace(',', ' ')
@@ -329,8 +357,8 @@ def patch(donor_path: str, output_path: str, *,
         # Build new TJ
         new_tj = _encode_text_to_tj(new_text, uni2cid, kern)
         
-        # Build new Tm
-        new_tm = f'1 0 0 1 {new_x:.5g} {b["y"]:.5f} Tm'.encode()
+        # Build new Tm — 5 decimal places (matching patch_from_values format)
+        new_tm = f'1 0 0 1 {new_x:.5f} {b["y"]:.5f} Tm'.encode()
         
         # Build complete new BT..ET block
         old_block = b['raw']
@@ -339,9 +367,10 @@ def patch(donor_path: str, output_path: str, *,
         tm_in_block = re.search(rb'1 0 0 1 [\d.]+ [\d.]+ Tm', old_block)
         new_block = old_block[:tm_in_block.start()] + new_tm + old_block[tm_in_block.end():]
         
-        # Replace TJ
-        tj_in_block = re.search(rb'\[.*?\]\s*TJ', new_block, re.DOTALL)
-        new_block = new_block[:tj_in_block.start()] + new_tj + new_block[tj_in_block.end():]
+        # Replace TJ — use SPACE before [ (matching add_glyphs / patch_from_values format)
+        # Original donor uses Tm\n[ but VTB generator produces Tm [ (space)
+        tj_in_block = re.search(rb'\s*\[.*?\]\s*TJ', new_block, re.DOTALL)
+        new_block = new_block[:tj_in_block.start()] + b' ' + new_tj + new_block[tj_in_block.end():]
         
         patches.append((b['start'], b['end'], new_block))
 
@@ -378,23 +407,25 @@ def patch(donor_path: str, output_path: str, *,
     # Replace stream content only
     data[cs_start2:endstream_pos2] = new_compressed
 
-    # --- 8. Patch Document ID (safe positions: 0, 4, 20, 24, 28) ---
-    # Only tested-safe positions are used to avoid breaking bot recognition
-    SAFE_ID_POSITIONS = [0, 4, 20, 24, 28]
+    # --- 8. Patch Document ID ---
+    # CRITICAL rule (from CHECK_VERIFICATION_RULES.md):
+    # - Change EXACTLY position 0 in the hex ID
+    # - Result MUST be a decimal digit (0-9) — VTB verifier requires this
     if doc_id_changes > 0:
         id_m = re.search(rb'/ID\s*\[<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\]', bytes(data))
         if id_m:
-            old_id = id_m.group(1).decode()
-            new_id_chars = list(old_id)
-            valid_positions = [p for p in SAFE_ID_POSITIONS if p < len(new_id_chars)]
-            positions = random.sample(valid_positions, min(doc_id_changes, len(valid_positions)))
-            for p in positions:
-                old_ch = new_id_chars[p].upper()
-                choices = [c for c in '0123456789ABCDEF' if c != old_ch]
-                new_id_chars[p] = random.choice(choices)
-            new_id = ''.join(new_id_chars).upper()
-            data[id_m.start(1):id_m.end(1)] = new_id.encode()
-            data[id_m.start(2):id_m.end(2)] = new_id.encode()
+            old_id = id_m.group(1).decode().upper()
+            pos = 0
+            old_ch = old_id[pos]
+            base = int(old_ch, 16)
+            # Find increments that result in a decimal digit (0-9)
+            valid_incs = [i for i in range(1, 16) if (base + i) % 16 < 10]
+            if valid_incs:
+                inc = valid_incs[0]  # Use first valid increment (deterministic)
+                new_ch = '0123456789ABCDEF'[(base + inc) % 16]
+                new_id = new_ch + old_id[1:]
+                data[id_m.start(1):id_m.end(1)] = new_id.encode()
+                data[id_m.start(2):id_m.end(2)] = new_id.encode()
 
     # --- 9. Patch creation date ---
     if date and time:
@@ -488,12 +519,21 @@ def main():
     parser.add_argument('--amount', type=int, help='Сумма')
     parser.add_argument('--account', help='Номер счёта (4 цифры)')
     parser.add_argument('--op-id', help='ID операции (25+ символов)')
+    parser.add_argument('--keep-op-id', action='store_true', help='Сохранить реальный op_id донора (не генерировать)')
     parser.add_argument('--doc-id-changes', type=int, default=1, help='Сколько символов менять в Document ID')
     parser.add_argument('-o', '--output', default='чек_patched.pdf', help='Выходной файл')
     args = parser.parse_args()
     
+    donor_path = args.donor
+    # Auto-select 17-03 donor when date is 17.03 and default donor is still 15-03
+    if args.donor == str(DEFAULT_DONOR) and args.date and '17.03' in args.date:
+        donor17 = BASE_DIR / '17-03-26_00-00.pdf'
+        if donor17.exists():
+            donor_path = str(donor17)
+            print(f"  Авто-донор: 17-03-26_00-00.pdf (дата 17.03)")
+
     result = patch(
-        donor_path=args.donor,
+        donor_path=donor_path,
         output_path=args.output,
         payer=args.payer,
         recipient=args.recipient,
@@ -504,6 +544,7 @@ def main():
         amount=args.amount,
         account=args.account,
         op_id=args.op_id,
+        keep_op_id=args.keep_op_id,
         doc_id_changes=args.doc_id_changes,
     )
     print(f"✓ Создан: {result}")

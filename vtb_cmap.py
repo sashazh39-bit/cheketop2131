@@ -329,8 +329,11 @@ def gen_sbp_operation_id(
                 break
 
     routing = "".join(random.choices("0123456789", k=6))          # 6 случайных цифр
-    nnn = random.randint(1, 17)
-    counter = f"0B{nnn:03d}{random.randint(0,9)}001"               # "0BNNNX001" — формат ВТБ (B=Latin)
+    # Суффикс из анализа 10+ реальных VTB op_id:
+    # K@15 стиль: "0B10XX001" (XX = 10-19)
+    # Пример: K + 0B1014001, K + 0B1018001, N + 0B1016001
+    xx = random.randint(10, 19)
+    counter = f"0B10{xx:02d}001"                                   # "0B10XXXXXX001" — точный VTB формат
 
     prefix = f"{direction}{bank_code}{julian:02d}{hhmm}"           # 9 символов
     # Итого 25 символов — "1700501" уже есть в PDF как отдельная строка, не добавляем
