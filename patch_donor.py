@@ -226,6 +226,8 @@ def patch(donor_path: str, output_path: str, *,
             'start': bt, 'end': et + 2,
             'x': float(tm_m.group(1)) if tm_m else 0,
             'y': float(tm_m.group(2)) if tm_m else 0,
+            'x_str': tm_m.group(1).decode() if tm_m else '0',
+            'y_str': tm_m.group(2).decode() if tm_m else '0',
             'size': float(tf_m.group(1)) if tf_m else 0,
             'kern': float(kern_m.group(1)) if kern_m else 0,
             'text': text,
@@ -357,8 +359,19 @@ def patch(donor_path: str, output_path: str, *,
         # Build new TJ
         new_tj = _encode_text_to_tj(new_text, uni2cid, kern)
         
-        # Build new Tm — 5 decimal places (matching patch_from_values format)
-        new_tm = f'1 0 0 1 {new_x:.5f} {b["y"]:.5f} Tm'.encode()
+        # Build new Tm — preserve original Y format exactly, format X like patch_from_values
+        def _fmt_coord(val, orig_str):
+            """Format coordinate preserving original decimal style."""
+            s = f'{val:.5f}'
+            # Strip trailing zeros to match original format (e.g. 227.25 not 227.25000)
+            if '.' in orig_str:
+                orig_decimals = len(orig_str.split('.')[1])
+                s = f'{val:.{orig_decimals}f}'
+            elif '.' not in orig_str:
+                s = str(int(round(val)))
+            return s
+        x_str = _fmt_coord(new_x, b['x_str'])
+        new_tm = f'1 0 0 1 {x_str} {b["y_str"]} Tm'.encode()
         
         # Build complete new BT..ET block
         old_block = b['raw']
