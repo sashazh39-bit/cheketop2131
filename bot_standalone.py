@@ -32,6 +32,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -1762,6 +1763,290 @@ def _run_alfa_transgran_patch(token: str, uid: int, chat_id: int, state: dict, t
         send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
 
 
+def _handle_alfa_sbp_input(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
+    """Пошаговый ввод полей Альфа СБП (все поля)."""
+    state = USER_STATE[uid]
+    step = state.get("alfa_sbp_step", 0)
+    fields = state.setdefault("alfa_sbp_fields", {})
+    field_list = state.get("_alfa_sbp_field_list", [
+        ("amount", "💰 Сумма перевода (число, например: 5000)"),
+        ("date_time", "📅 Дата и время (например: 20.03.2026 14:30:00 мск)"),
+        ("recipient", "👤 Получатель (например: Александр Евгеньевич Ж)"),
+        ("phone", "📱 Телефон получателя (например: +7 (900) 351-70-80)"),
+        ("bank", "🏦 Банк получателя (например: ВТБ, Сбербанк, Т-Банк)"),
+        ("account", "💳 Последние 4 цифры счёта (например: 1234)"),
+    ])
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    if step >= len(field_list):
+        return
+
+    field_key, _ = field_list[step]
+    t = text.strip()
+
+    if t != "-":
+        if field_key == "amount":
+            nums = re.findall(r"\d+", t)
+            if not nums:
+                send("❌ Введите число (например: 5000)")
+                return
+            fields["amount"] = int("".join(nums))
+        elif field_key == "account":
+            digits = re.findall(r"\d+", t)
+            last4 = "".join(digits)
+            if len(last4) < 4:
+                send("❌ Нужно ровно 4 цифры (например: 1234)")
+                return
+            last4 = last4[-4:]
+            fields["account_last4"] = last4
+        else:
+            fields[field_key] = t
+
+    step += 1
+    state["alfa_sbp_step"] = step
+
+    if step < len(field_list):
+        _, prompt_next = field_list[step]
+        send(f"✅ Принято.\n\nШаг {step + 1}/{len(field_list)}: {prompt_next}\nОтправьте - чтобы пропустить.")
+    else:
+        summary_lines = []
+        for fk, label in field_list:
+            val = fields.get(fk) or fields.get("account_last4" if fk == "account" else fk)
+            summary_lines.append(f"  {label.split('(')[0].strip()}: {val or '(без изменений)'}")
+        summary = "\n".join(summary_lines)
+        send(f"📋 Параметры:\n{summary}\n\n⏳ Генерирую PDF...")
+        _run_alfa_sbp_full_patch(token, uid, chat_id, state, tg_req)
+
+
+def _run_alfa_sbp_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Применяет все замены к Альфа СБП чеку (CID + zero-delta для счёта)."""
+    import shutil
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    fields = state.get("alfa_sbp_fields", {})
+    inp_path = Path(state["file_path"])
+
+    try:
+        data = inp_path.read_bytes()
+
+        uni_to_cid = {}
+        cid_to_uni = {}
+        for m in re.finditer(rb'<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n', data, re.DOTALL):
+            raw = data[m.end(): m.end() + int(m.group(2))]
+            try:
+                dec = zlib.decompress(raw)
+            except zlib.error:
+                continue
+            if b'beginbfchar' in dec:
+                for mm in re.finditer(rb'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', dec):
+                    cid = int(mm.group(1), 16)
+                    uni = int(mm.group(2), 16)
+                    cid_to_uni[cid] = chr(uni)
+                    uni_to_cid[chr(uni)] = mm.group(1).decode().upper().zfill(4)
+                break
+            if b'beginbfrange' in dec:
+                for mm in re.finditer(rb'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', dec):
+                    s = int(mm.group(1), 16)
+                    e = int(mm.group(2), 16)
+                    u = int(mm.group(3), 16)
+                    for i in range(e - s + 1):
+                        cid_to_uni[s + i] = chr(u + i)
+                        uni_to_cid[chr(u + i)] = f'{s + i:04X}'
+                break
+
+        current_texts = []
+        for m in re.finditer(rb'<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n', data, re.DOTALL):
+            sl = int(m.group(2))
+            ss = m.end()
+            try:
+                dec = zlib.decompress(data[ss:ss + sl])
+            except zlib.error:
+                continue
+            if b'BT' not in dec:
+                continue
+            for tj in re.finditer(rb'<([0-9A-Fa-f]+)>\s*Tj', dec):
+                hexstr = tj.group(1).decode()
+                txt = ''
+                for i in range(0, len(hexstr), 4):
+                    cid = int(hexstr[i:i + 4], 16)
+                    txt += cid_to_uni.get(cid, '?')
+                current_texts.append(txt)
+            break
+
+        def find_text(pattern):
+            for t in current_texts:
+                if re.search(pattern, t.replace('\xa0', ' ')):
+                    return t
+            return None
+
+        current_amount_text = find_text(r'\d+\s*RUR')
+        current_datetime_text = find_text(r'\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2}')
+        current_date_formed = find_text(r'\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}\s+мск')
+        current_recipient = None
+        current_phone = None
+        current_bank = None
+        current_account = None
+
+        label_order = [t.replace('\xa0', ' ').strip() for t in current_texts]
+        for i, tc in enumerate(label_order):
+            if tc == 'Получатель' and i + 1 < len(label_order):
+                current_recipient = current_texts[i + 1]
+            elif 'телефона получателя' in tc and i + 1 < len(label_order):
+                current_phone = current_texts[i + 1]
+            elif tc == 'Банк получателя' and i + 1 < len(label_order):
+                current_bank = current_texts[i + 1]
+            elif 'Счёт списания' in tc and i + 1 < len(label_order):
+                current_account = current_texts[i + 1]
+
+        replacements = []
+
+        if "amount" in fields and current_amount_text:
+            old_amt = current_amount_text.replace('\xa0', ' ').strip()
+            new_amt_num = fields["amount"]
+            new_amt_str = f"{new_amt_num:,}".replace(",", "\xa0") + "\xa0RUR\xa0"
+            replacements.append((old_amt, new_amt_str))
+
+        if "date_time" in fields:
+            new_dt = fields["date_time"]
+            if current_datetime_text:
+                old_dt = current_datetime_text.replace('\xa0', ' ').strip()
+                new_dt_clean = new_dt.replace(' ', '\xa0')
+                if not new_dt_clean.endswith('\xa0'):
+                    new_dt_clean += '\xa0'
+                replacements.append((old_dt, new_dt_clean))
+            if current_date_formed:
+                old_df = current_date_formed.replace('\xa0', ' ').strip()
+                dt_parts = new_dt.split()
+                if len(dt_parts) >= 2:
+                    formed = dt_parts[0] + '\xa0' + dt_parts[1][:5] + '\xa0мск'
+                    replacements.append((old_df, formed))
+
+        if "recipient" in fields and current_recipient:
+            old_r = current_recipient.replace('\xa0', ' ').strip()
+            new_r = fields["recipient"].replace(' ', '\xa0')
+            if old_r.endswith(' '):
+                new_r += '\xa0'
+            replacements.append((old_r, new_r))
+
+        if "phone" in fields and current_phone:
+            old_p = current_phone.replace('\xa0', ' ').strip()
+            new_p = fields["phone"].replace(' ', '\xa0')
+            replacements.append((old_p, new_p))
+
+        if "bank" in fields and current_bank:
+            old_b = current_bank.replace('\xa0', ' ').strip()
+            new_b = fields["bank"].replace(' ', '\xa0')
+            replacements.append((old_b, new_b))
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as out_fp:
+            out_path = out_fp.name
+
+        applied_text = False
+        if replacements:
+            try:
+                from cid_patch_amount import patch_replacements
+                text_reps = [(old.replace('\xa0', ' '), new.replace('\xa0', ' '))
+                             for old, new in replacements if old.replace('\xa0', ' ') != new.replace('\xa0', ' ')]
+                if text_reps:
+                    applied_text = patch_replacements(inp_path, Path(out_path), text_reps)
+            except Exception as e:
+                send(f"⚠️ Ошибка текстовых замен: {e}")
+
+        if not applied_text:
+            shutil.copy2(str(inp_path), out_path)
+
+        if "account_last4" in fields:
+            try:
+                from patch_account_last4 import patch_account_last4 as do_patch_account
+
+                acct_20 = None
+                if current_account:
+                    digits_found = re.findall(r'\d+', current_account.replace('\xa0', ''))
+                    full = ''.join(digits_found)
+                    if len(full) == 20:
+                        acct_20 = full
+
+                if not acct_20:
+                    acct_20 = "40817810980480002476"
+
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp_path = tmp.name
+
+                ok = do_patch_account(
+                    input_pdf=out_path,
+                    output_pdf=tmp_path,
+                    old_account=acct_20,
+                    new_last4=fields["account_last4"],
+                )
+                if ok:
+                    shutil.move(tmp_path, out_path)
+                else:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    send("⚠️ Не удалось заменить счёт (возможно, номер не найден в PDF)")
+            except Exception as e:
+                send(f"⚠️ Ошибка замены счёта: {e}")
+
+        try:
+            os.unlink(state["file_path"])
+        except OSError:
+            pass
+        del USER_STATE[uid]
+
+        out_name = Path(state.get("file_name", "чек.pdf")).stem + "_patched.pdf"
+        with open(out_path, "rb") as f:
+            out_bytes = f.read()
+
+        caption_parts = []
+        if "amount" in fields:
+            caption_parts.append(f"Сумма: {fields['amount']} RUR")
+        if "account_last4" in fields:
+            caption_parts.append(f"Счёт: ****{fields['account_last4']}")
+        if "recipient" in fields:
+            caption_parts.append(f"Получатель: {fields['recipient']}")
+        caption = "✅ Готово! " + ", ".join(caption_parts) if caption_parts else "✅ Готово!"
+
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+
+        USER_STATE[uid] = {
+            "awaiting": "report_choice",
+            "amount_from": 0,
+            "amount_to": fields.get("amount", 0),
+            "bank": "alfa_sbp_full",
+            "pdf_name": out_name,
+        }
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "📋 Отчёт:",
+            "reply_markup": json.dumps({
+                "inline_keyboard": [
+                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+                ],
+            }),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        send(f"❌ Ошибка: {e}\n\nПопробуйте снова или отправьте чек заново.")
+        try:
+            os.unlink(state.get("file_path", ""))
+        except OSError:
+            pass
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+
+
 def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
     """Обработка пошагового ввода для Альфа Трансгран."""
     state = USER_STATE[uid]
@@ -2205,13 +2490,14 @@ def run_bot(token: str) -> None:
                         USER_STATE[uid] = {"file_path": path, "file_name": fname}
                         tg_request(token, "sendMessage", {
                             "chat_id": msg["chat"]["id"],
-                            "text": "📎 Чек получен. Выберите банк:",
+                            "text": "📎 Чек получен. Выберите банк:\n\n• Альфа-Банк / ВТБ / Авто — замена только суммы\n• Альфа СБП (все поля) — сумма, дата, получатель, телефон, банк, счёт",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [
                                         {"text": "🏦 Альфа-Банк", "callback_data": "bank_alfa"},
                                         {"text": "🏛 ВТБ", "callback_data": "bank_vtb"},
                                     ],
+                                    [{"text": "🏦 Альфа СБП (все поля)", "callback_data": "bank_alfa_sbp_full"}],
                                     [{"text": "🌐 Альфа Трансгран", "callback_data": "bank_alfa_transgran"}],
                                     [{"text": "🌍 ВТБ Трансгран (UZS)", "callback_data": "bank_vtb_transgran"}],
                                     [{"text": "🔍 Авто", "callback_data": "bank_auto"}],
@@ -2219,6 +2505,11 @@ def run_bot(token: str) -> None:
                                 ],
                             }),
                         })
+                        continue
+
+                    # Альфа СБП все поля: пошаговый ввод
+                    if uid in USER_STATE and USER_STATE[uid].get("mode") == "alfa_sbp_full":
+                        _handle_alfa_sbp_input(token, uid, chat_id, text, tg_request)
                         continue
 
                     # Выписка Альфа-Банк: текст
@@ -2930,6 +3221,36 @@ def run_bot(token: str) -> None:
                             tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
                             _run_vtb_transgran_patch(token, uid, cid, state, tg_request)
                         continue
+                    # Альфа СБП все поля: callback
+                    if q["data"] == "bank_alfa_sbp_full":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        USER_STATE[uid]["mode"] = "alfa_sbp_full"
+                        USER_STATE[uid]["alfa_sbp_step"] = 0
+                        USER_STATE[uid]["alfa_sbp_fields"] = {}
+                        _ALFA_SBP_FIELDS = [
+                            ("amount", "💰 Сумма перевода (число, например: 5000)"),
+                            ("date_time", "📅 Дата и время (например: 20.03.2026 14:30:00 мск)"),
+                            ("recipient", "👤 Получатель (например: Александр Евгеньевич Ж)"),
+                            ("phone", "📱 Телефон получателя (например: +7 (900) 351-70-80)"),
+                            ("bank", "🏦 Банк получателя (например: ВТБ, Сбербанк, Т-Банк)"),
+                            ("account", "💳 Последние 4 цифры счёта (например: 1234)"),
+                        ]
+                        USER_STATE[uid]["_alfa_sbp_field_list"] = _ALFA_SBP_FIELDS
+                        _, prompt = _ALFA_SBP_FIELDS[0]
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": (
+                                "🏦 Альфа-Банк СБП — замена всех полей\n\n"
+                                "Введите новые значения пошагово.\n"
+                                "Отправьте - чтобы оставить поле без изменений.\n\n"
+                                f"Шаг 1/{len(_ALFA_SBP_FIELDS)}: {prompt}"
+                            ),
+                        })
+                        continue
+
                     # Альфа Трансгран: callback handlers
                     if q["data"] == "bank_alfa_transgran":
                         if uid not in USER_STATE:
