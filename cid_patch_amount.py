@@ -68,11 +68,16 @@ def patch_replacements(
             new_hex = _encode_cid(new_val, uni_to_cid)
             if not new_hex or old_hex not in new_dec:
                 continue
+            is_lower = any(c in b'abcdef' for c in old_hex)
+            if is_lower:
+                new_hex = new_hex.lower()
             new_dec = new_dec.replace(old_hex, new_hex)
             total_replaced += 1
             print(f"[OK] {old_val} -> {new_val}")
         if new_dec != dec:
-            new_raw = zlib.compress(new_dec, 9)
+            orig_raw = bytes(data[stream_start : stream_start + stream_len])
+            level = _detect_zlib_level(orig_raw)
+            new_raw = zlib.compress(new_dec, level)
             mods.append((stream_start, stream_len, len_num_start, dec, new_raw))
 
     if not mods:
@@ -113,12 +118,31 @@ def patch_replacements(
     return True
 
 
+def _detect_zlib_level(raw: bytes) -> int:
+    """Определяет уровень zlib-сжатия по заголовку потока."""
+    if len(raw) >= 2 and raw[0] == 0x78:
+        if raw[1] == 0x9C: return 6
+        if raw[1] == 0xDA: return 9
+        if raw[1] == 0x5E: return 4
+        if raw[1] == 0x01: return 1
+    return 6
+
+
 def _find_old_hex(old_val: str, uni_to_cid: dict, dec: bytes) -> bytes | None:
+    """Case-insensitive поиск hex CID в потоке. Возвращает hex в том регистре, в каком он в потоке."""
     variants = [old_val, old_val + " ", old_val + "\u00a0"]
     for v in variants:
         h = _encode_cid(v, uni_to_cid, use_homoglyph=False)
-        if h and h in dec:
+        if not h:
+            continue
+        if h in dec:
             return h
+        h_lower = h.lower()
+        if h_lower in dec:
+            return h_lower
+        h_upper = h.upper()
+        if h_upper in dec:
+            return h_upper
     return None
 
 
@@ -189,7 +213,8 @@ def patch_amount(in_path: Path, out_path: Path, old_amount: str, new_amount: str
         new_dec = dec.replace(old_hex, new_hex)
         if new_dec == dec:
             continue
-        new_raw = zlib.compress(new_dec, 9)
+        level = _detect_zlib_level(bytes(data[stream_start:stream_end]))
+        new_raw = zlib.compress(new_dec, level)
         delta = len(new_raw) - stream_len
 
         # 1. Заменить stream (concat вместо slice — избегаем BufferError при resize)

@@ -29,10 +29,17 @@ from pathlib import Path
 
 _WEIGHTS = [7, 1, 3, 7, 1, 3, 7, 1, 3, 7, 1, 3, 7, 1, 3, 7, 1, 3, 7, 1, 3, 7, 1]
 
-_VTB_BIKS = [
+_KNOWN_BIKS = [
+    # Альфа-Банк
+    "044525593", "044030786", "046015762", "040349556",
     "043602607", "044525187", "044525411", "044030707",
+    # ВТБ
     "040507601", "046015602", "042007702", "040349585",
     "044525745", "046577964", "042748844",
+    # Сбер
+    "044525225", "044030653", "046015602",
+    # Т-Банк
+    "044525974",
 ]
 
 
@@ -43,11 +50,11 @@ def _check_account(bik: str, account: str) -> bool:
 
 
 def _find_bik(account: str) -> str | None:
-    for bik in _VTB_BIKS:
+    for bik in _KNOWN_BIKS:
         if _check_account(bik, account):
             return bik
-    for rkc in range(1000):
-        bik = f"04{rkc:07d}"
+    for suffix in range(1000):
+        bik = f"04{'0' * 4}{suffix:03d}"
         if _check_account(bik, account):
             return bik
     return None
@@ -218,8 +225,7 @@ def patch_account_last4(
                     current_account = text_clean[:20]
                     old_hex = _encode_cid_hex(current_account, uni_to_cid)
                     print(f"  Найден текущий счёт: {current_account}")
-                    # Пересчитываем для текущего
-                    new_account = build_valid_account(old_account, new_last4, bik)
+                    new_account = build_valid_account(current_account, new_last4, bik)
                     break
             break
 
