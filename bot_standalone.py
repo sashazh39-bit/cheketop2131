@@ -1254,9 +1254,10 @@ def _sw_handle_callback(token: str, uid: int, q: dict, tg_req) -> None:
         if not suggestions:
             tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "Не удалось подобрать ФИО. Введите вручную."})
             return
+        state["_suggestions"] = suggestions
         kb = []
-        for s in suggestions:
-            kb.append([{"text": f"✅ {s}", "callback_data": f"sw_pick_{s[:50]}"}])
+        for i, s in enumerate(suggestions):
+            kb.append([{"text": f"✅ {s}", "callback_data": f"sw_pick_{i}"}])
         kb.append([{"text": "✏️ Ввести вручную", "callback_data": "sw_manual"}])
         tg_req(token, "sendMessage", {
             "chat_id": chat_id,
@@ -1269,27 +1270,37 @@ def _sw_handle_callback(token: str, uid: int, q: dict, tg_req) -> None:
         field = get_current_field(state)
         if not field:
             return
-        current = state.get("current_values", {}).get(field["key"], "")
-        suggestions = suggest_address(current)
+        current_addr = state.get("current_values", {}).get(field["key"], "")
+        bank_name = state.get("bank", "alfa")
+        suggestions = suggest_address(current_addr, bank=bank_name)
         if not suggestions:
             tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "Не удалось подобрать адрес. Введите вручную."})
             return
+        state["_suggestions"] = suggestions
         kb = []
-        for s in suggestions:
-            kb.append([{"text": f"✅ {s[:50]}", "callback_data": f"sw_pick_{s[:50]}"}])
+        for i, s in enumerate(suggestions):
+            display = s.replace("\n", ", ")[:60]
+            kb.append([{"text": f"✅ {display}", "callback_data": f"sw_pick_{i}"}])
         kb.append([{"text": "✏️ Ввести вручную", "callback_data": "sw_manual"}])
         tg_req(token, "sendMessage", {
             "chat_id": chat_id,
-            "text": f"💡 Предложения адреса:\n\nТекущий: {current}",
+            "text": f"💡 Предложения адреса:\n\nТекущий: {current_addr}",
             "reply_markup": json.dumps({"inline_keyboard": kb}),
         })
         return
 
     if data.startswith("sw_pick_"):
-        picked = data[8:]
+        idx_str = data[8:]
+        suggestions = state.get("_suggestions", [])
+        try:
+            idx = int(idx_str)
+            picked = suggestions[idx] if idx < len(suggestions) else idx_str
+        except (ValueError, IndexError):
+            picked = idx_str
         field = get_current_field(state)
         if field:
             state.setdefault("changes", {})[field["key"]] = picked
+        state.pop("_suggestions", None)
         advance_field(state)
         _sw_send_step(token, chat_id, state, tg_req)
         return
@@ -1307,6 +1318,79 @@ def _sw_handle_callback(token: str, uid: int, q: dict, tg_req) -> None:
     if data == "sw_generate":
         _sw_generate(token, uid, chat_id, state, tg_req)
         return
+
+
+def _translate_wizard_to_alfa_keys(
+    changes: dict, current: dict, operations: list[dict],
+) -> dict[str, str]:
+    """Translate wizard field keys to patch_alfa_statement keys."""
+    translated: dict[str, str] = {}
+    if "номер_счета" in changes:
+        translated["номер_счета"] = changes["номер_счета"]
+    if "клиент" in changes:
+        fio_parts = changes["клиент"].split()
+        if len(fio_parts) >= 2:
+            translated["клиент_имя"] = " ".join(fio_parts[:2])
+        if len(fio_parts) >= 3:
+            translated["клиент_отчество"] = fio_parts[2]
+    if "адрес" in changes:
+        addr = changes["адрес"]
+        import re as _re
+        idx_m = _re.match(r"(\d+)", addr)
+        if idx_m:
+            translated["индекс"] = idx_m.group(1)
+        city_m = _re.search(
+            r"(?:ОБЛАСТЬ\s+\S+,\s*\n?\s*)(\S+)|,\s*([А-ЯЁ][а-яё]+)\s*,\s*УЛИЦА",
+            addr,
+        )
+        if city_m:
+            translated["город"] = (city_m.group(1) or city_m.group(2)).strip().rstrip(",")
+        apt_m = _re.search(r"д\.\s*(.+?)$", addr, _re.DOTALL)
+        if apt_m:
+            translated["дом_кв"] = apt_m.group(1).strip()
+    if "текущий_баланс" in changes:
+        translated["текущий_баланс"] = changes["текущий_баланс"]
+
+    for i, op in enumerate(operations):
+        prefix = f"op_{i}_"
+        if f"{prefix}номер_операции" in changes:
+            if i == 0:
+                translated["код_операции_расход"] = changes[f"{prefix}номер_операции"]
+            elif i == 1:
+                translated["код_операции_приход"] = changes[f"{prefix}номер_операции"]
+        if f"{prefix}телефон" in changes:
+            phone = changes[f"{prefix}телефон"]
+            if len(phone) >= 4:
+                translated["телефон"] = phone[:-2]
+                translated["телефон_окончание"] = phone[-2:]
+            else:
+                translated["телефон"] = phone
+        if f"{prefix}сумма" in changes:
+            if i == 0:
+                translated["сумма_расход"] = changes[f"{prefix}сумма"]
+            elif i == 1:
+                translated["сумма_приход"] = changes[f"{prefix}сумма"]
+    return translated
+
+
+def _build_alfa_cid_extra_pairs(changes: dict, current: dict) -> list[tuple[str, str]]:
+    """Build CID replacement pairs for fields not handled by patch_alfa_statement (dates, periods)."""
+    pairs: list[tuple[str, str]] = []
+    extra_keys = [
+        "дата_формирования", "дата_открытия", "период_с", "период_по",
+    ]
+    for key in extra_keys:
+        if key in changes:
+            old_v = current.get(key)
+            if old_v and old_v != changes[key]:
+                pairs.append((old_v, changes[key]))
+
+    for key in list(changes.keys()):
+        if key.startswith("op_") and key.endswith("_дата"):
+            old_v = current.get(key)
+            if old_v and old_v != changes[key]:
+                pairs.append((old_v, changes[key]))
+    return pairs
 
 
 def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
@@ -1376,12 +1460,13 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
             out_name = Path(state.get("file_name", "выписка.pdf")).stem + "_patched.pdf"
         else:
             try:
-                from alfa_statement_service import patch_alfa_statement
+                from alfa_statement_service import patch_alfa_statement, BASE_PDF
+                from cid_patch_amount import patch_replacements
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
                     out_path = tf.name
-                merged = {}
-                merged.update(changes)
-                ok, err = patch_alfa_statement(merged, Path(out_path))
+
+                translated = _translate_wizard_to_alfa_keys(changes, current, state.get("operations", []))
+                ok, err = patch_alfa_statement(translated, Path(out_path))
                 if not ok:
                     tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
                     try:
@@ -1391,6 +1476,11 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                     if uid in USER_STATE:
                         del USER_STATE[uid]
                     return
+
+                cid_pairs = _build_alfa_cid_extra_pairs(changes, current)
+                if cid_pairs:
+                    patch_replacements(Path(out_path), Path(out_path), cid_pairs)
+
                 with open(out_path, "rb") as f:
                     pdf_bytes = f.read()
                 try:
@@ -1508,10 +1598,12 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
 def _sw_start_alfa_edit_after_upload(token: str, uid: int, chat_id: int, path: str, fname: str, tg_req) -> None:
     """After user uploads Alfa statement PDF: scan and start wizard."""
     from statement_wizard import init_wizard_state
-    from vyписка_service import scan_alfa_block1, scan_alfa_block2
+    from vyписка_service import scan_alfa_block1, scan_alfa_block2, scan_alfa_block3
     block1 = scan_alfa_block1(Path(path))
     block2_ops = scan_alfa_block2(Path(path))
+    block3 = scan_alfa_block3(Path(path))
     state = init_wizard_state("alfa", "sw_alfa_edit", block1, block2_ops, file_path=path, file_name=fname)
+    state["current_values"].update(block3)
     USER_STATE[uid] = state
     tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"✅ Выписка загружена.\n\n📋 Найдено полей: {len(block1)}\n📋 Операций: {len(block2_ops)}\n\nНачинаем пошаговое редактирование:"})
     _sw_send_step(token, chat_id, state, tg_req)
@@ -1521,39 +1613,30 @@ def _sw_start_alfa_from_check(token: str, uid: int, chat_id: int, path: str, fna
     """After user uploads check PDF for Alfa statement: extract and start wizard."""
     from statement_wizard import init_wizard_state
     from receipt_extractor import extract_from_receipt
-    from alfa_statement_service import BLOCK1_DEFAULTS, BLOCK2_DEFAULTS, BLOCK3_DEFAULTS
+    from alfa_statement_service import BASE_PDF
+    from vyписка_service import scan_alfa_block1, scan_alfa_block2, scan_alfa_block3
     extracted = extract_from_receipt(Path(path))
     try:
         os.unlink(path)
     except OSError:
         pass
-    block1_defaults = {
-        "номер_счета": BLOCK3_DEFAULTS.get("номер_счета", ""),
-        "дата_открытия": "",
-        "валюта": "RUR",
-        "тип_счета": "Текущий счёт",
-        "дата_формирования": "",
-        "клиент": BLOCK3_DEFAULTS.get("клиент_имя", "") + " " + BLOCK3_DEFAULTS.get("клиент_отчество", ""),
-        "адрес": "",
-    }
-    ops = []
-    if extracted.get("amount"):
-        op = {
-            "дата": extracted.get("date", ""),
-            "номер_операции": extracted.get("operation_id", ""),
-            "телефон": extracted.get("phone_recipient", ""),
-            "сумма": str(extracted.get("amount", "")),
-        }
-        ops.append(op)
-    state = init_wizard_state("alfa", "sw_alfa_check", block1_defaults, ops)
-    if extracted.get("amount"):
-        state["changes"]["op_0_сумма"] = str(extracted["amount"])
-    if extracted.get("operation_id"):
-        state["changes"]["op_0_номер_операции"] = extracted["operation_id"]
-    if extracted.get("phone_recipient"):
-        state["changes"]["op_0_телефон"] = extracted["phone_recipient"]
+    block1 = scan_alfa_block1(BASE_PDF)
+    block2_ops = scan_alfa_block2(BASE_PDF)
+    block3 = scan_alfa_block3(BASE_PDF)
     if extracted.get("date"):
-        state["changes"]["op_0_дата"] = extracted["date"]
+        for op in block2_ops:
+            op["дата"] = extracted["date"]
+    if extracted.get("operation_id"):
+        for op in block2_ops:
+            op["номер_операции"] = extracted["operation_id"]
+    if extracted.get("phone_recipient"):
+        for op in block2_ops:
+            op["телефон"] = extracted["phone_recipient"]
+    if extracted.get("amount"):
+        for op in block2_ops:
+            op["сумма"] = str(extracted["amount"])
+    state = init_wizard_state("alfa", "sw_alfa_check", block1, block2_ops)
+    state["current_values"].update(block3)
     USER_STATE[uid] = state
     parts = ["📎 Данные извлечены из чека:\n"]
     for k, v in extracted.items():
@@ -1565,25 +1648,15 @@ def _sw_start_alfa_from_check(token: str, uid: int, chat_id: int, path: str, fna
 
 
 def _sw_start_alfa_new(token: str, uid: int, chat_id: int, tg_req) -> None:
-    """Start Alfa statement from scratch using template defaults."""
+    """Start Alfa statement from scratch by scanning the Alfa template."""
     from statement_wizard import init_wizard_state
-    from alfa_statement_service import BLOCK1_DEFAULTS, BLOCK2_DEFAULTS, BLOCK3_DEFAULTS
-    block1_defaults = {
-        "номер_счета": BLOCK3_DEFAULTS.get("номер_счета", ""),
-        "дата_открытия": "",
-        "валюта": "RUR",
-        "тип_счета": "Текущий счёт",
-        "дата_формирования": "",
-        "клиент": BLOCK3_DEFAULTS.get("клиент_имя", "") + " " + BLOCK3_DEFAULTS.get("клиент_отчество", ""),
-        "адрес": f"{BLOCK3_DEFAULTS.get('индекс', '')}, РОССИЯ, {BLOCK3_DEFAULTS.get('город', '')}",
-    }
-    ops = [{
-        "дата": "",
-        "номер_операции": BLOCK1_DEFAULTS.get("код_операции_расход", ""),
-        "телефон": BLOCK1_DEFAULTS.get("телефон", "") + BLOCK1_DEFAULTS.get("телефон_окончание", ""),
-        "сумма": BLOCK1_DEFAULTS.get("сумма_расход", ""),
-    }]
-    state = init_wizard_state("alfa", "sw_alfa_new", block1_defaults, ops)
+    from alfa_statement_service import BASE_PDF
+    from vyписка_service import scan_alfa_block1, scan_alfa_block2, scan_alfa_block3
+    block1 = scan_alfa_block1(BASE_PDF)
+    block2_ops = scan_alfa_block2(BASE_PDF)
+    block3 = scan_alfa_block3(BASE_PDF)
+    state = init_wizard_state("alfa", "sw_alfa_new", block1, block2_ops)
+    state["current_values"].update(block3)
     USER_STATE[uid] = state
     tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "🔧 Создание выписки Альфа с нуля\n\nЗаполните все поля пошагово:"})
     _sw_send_step(token, chat_id, state, tg_req)
@@ -1605,30 +1678,28 @@ def _sw_start_vtb_from_check(token: str, uid: int, chat_id: int, path: str, fnam
     """After user uploads check PDF for VTB statement: extract and start wizard."""
     from statement_wizard import init_wizard_state
     from receipt_extractor import extract_from_receipt
-    from vyписка_service import BASE_OLD_FIO
+    from vyписка_service import scan_vtb_block1, scan_vtb_block2, BASE_STATEMENT
     extracted = extract_from_receipt(Path(path))
     try:
         os.unlink(path)
     except OSError:
         pass
-    block1_defaults = {
-        "фио": BASE_OLD_FIO,
-        "номер_счета": "",
-        "период_start": "",
-        "период_end": "",
-    }
-    ops = []
+    block1 = scan_vtb_block1(BASE_STATEMENT)
+    block2_ops = scan_vtb_block2(BASE_STATEMENT)
+    if extracted.get("date"):
+        for op in block2_ops:
+            op["дата"] = extracted["date"]
     if extracted.get("amount"):
-        op = {
-            "дата": extracted.get("date", ""),
-            "время": "",
-            "сумма": str(extracted.get("amount", "")),
-            "сумма_зачисление": str(extracted.get("amount", "")),
-            "комиссия": "0",
-            "описание": extracted.get("fio_recipient", "Перевод через СБП"),
-        }
-        ops.append(op)
-    state = init_wizard_state("vtb", "sw_vtb_check", block1_defaults, ops)
+        for op in block2_ops:
+            op["сумма"] = str(extracted["amount"])
+            op["сумма_зачисление"] = str(extracted["amount"])
+    if extracted.get("fio_recipient"):
+        desc_parts = []
+        desc_parts.append("Переводы через СБП.")
+        desc_parts.append(f"Перевод денежных средств. {extracted['fio_recipient']}.")
+        for op in block2_ops:
+            op["описание"] = " ".join(desc_parts)
+    state = init_wizard_state("vtb", "sw_vtb_check", block1, block2_ops)
     USER_STATE[uid] = state
     parts = ["📎 Данные из чека для выписки ВТБ:\n"]
     for k, v in extracted.items():
@@ -1640,24 +1711,12 @@ def _sw_start_vtb_from_check(token: str, uid: int, chat_id: int, path: str, fnam
 
 
 def _sw_start_vtb_new(token: str, uid: int, chat_id: int, tg_req) -> None:
-    """Start VTB statement from scratch using template defaults."""
+    """Start VTB statement from scratch by scanning the VTB template."""
     from statement_wizard import init_wizard_state
-    from vyписка_service import BASE_OLD_FIO
-    block1_defaults = {
-        "фио": BASE_OLD_FIO,
-        "номер_счета": "40817810590049129426",
-        "период_start": "",
-        "период_end": "",
-    }
-    ops = [{
-        "дата": "",
-        "время": "",
-        "сумма": "10.00",
-        "сумма_зачисление": "10.00",
-        "комиссия": "0",
-        "описание": "Перевод через СБП",
-    }]
-    state = init_wizard_state("vtb", "sw_vtb_new", block1_defaults, ops)
+    from vyписка_service import scan_vtb_block1, scan_vtb_block2, BASE_STATEMENT
+    block1 = scan_vtb_block1(BASE_STATEMENT)
+    block2_ops = scan_vtb_block2(BASE_STATEMENT)
+    state = init_wizard_state("vtb", "sw_vtb_new", block1, block2_ops)
     USER_STATE[uid] = state
     tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "🔧 Создание выписки ВТБ с нуля\n\nЗаполните все поля пошагово:"})
     _sw_send_step(token, chat_id, state, tg_req)

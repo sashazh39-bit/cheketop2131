@@ -328,19 +328,38 @@ def scan_alfa_block1(pdf_path: Path) -> dict[str, str]:
         doc.close()
     except Exception:
         return result
-    patterns = {
-        "номер_счета": r"Номер счет[аа]?\s*([\d]+)",
-        "дата_открытия": r"Дата открытия счет[аа]?\s*(\d{2}\.\d{2}\.\d{4})",
-        "валюта": r"Валюта счет[аа]?\s*([A-Z]{3})",
-        "тип_счета": r"Тип счет[аа]?\s*(.+?)(?:\n|Дата)",
-        "дата_формирования": r"Дата формирования\s*(\d{2}\.\d{2}\.\d{4})",
-        "клиент": r"Клиент\s*(.+?)(?:\n|Адрес)",
-        "адрес": r"Адрес регистрации\s*(.+?)(?:\n\n|\Z)",
-    }
-    for key, pat in patterns.items():
-        m = re.search(pat, text, re.DOTALL)
-        if m:
-            result[key] = m.group(1).strip()[:200]
+
+    m = re.search(r"Номер счет[аа]?\s*\n?\s*([\d]+)", text)
+    if m:
+        result["номер_счета"] = m.group(1).strip()
+
+    m = re.search(r"Дата открытия счет[аа]?\s*\n?\s*(\d{2}\.\d{2}\.\d{4})", text)
+    if m:
+        result["дата_открытия"] = m.group(1).strip()
+
+    m = re.search(r"Валюта счет[аа]?\s*\n?\s*([A-Z]{3})", text)
+    if m:
+        result["валюта"] = m.group(1).strip()
+
+    m = re.search(r"Тип счет[аа]?\s*\n?\s*(.+?)(?=\nДата\s+формирования|\Z)", text, re.DOTALL)
+    if m:
+        result["тип_счета"] = m.group(1).strip().split("\n")[0].strip()
+
+    m = re.search(r"Дата формирования\s*\n?\s*(?:выписки\s*\n?\s*)?(\d{2}\.\d{2}\.\d{4})", text)
+    if m:
+        result["дата_формирования"] = m.group(1).strip()
+
+    m = re.search(r"Клиент\s*\n(.+?)(?=\nАдрес)", text, re.DOTALL)
+    if m:
+        result["клиент"] = " ".join(m.group(1).split())
+
+    m = re.search(
+        r"Адрес регистрации\s*\n(.+?)(?=\nЗа период|\nОперации по|\nОбщая задолженность|\nТ\.Т\.)",
+        text, re.DOTALL,
+    )
+    if m:
+        result["адрес"] = m.group(1).strip()
+
     return result
 
 
@@ -355,22 +374,82 @@ def scan_alfa_block2(pdf_path: Path) -> list[dict[str, str]]:
         doc.close()
     except Exception:
         return ops
+
+    ops_section = text
+    ops_start = re.search(r"Операции по счету\n", text)
+    if ops_start:
+        ops_section = text[ops_start.end():]
+
     pat = re.compile(
-        r"(\d{2}\.\d{2}\.\d{4})\s+"
-        r"([A-Z]\d+)\s+"
-        r"(?:Перевод\s+.+?через.+?на\s+)?"
-        r"(\+7[\s\d\(\)\-]+)?\.?\s*"
-        r"[-−]\s*([\d\s]+[,\.]\d{2})\s*RUR",
+        r"(\d{2}\.\d{2}\.\d{4})\s*\n\s*"
+        r"([A-Z]\d{10,})\s*\n"
+        r"(.+?)\n"
+        r"(-?[\d\s]+[,.]\d{2})\s*RUR",
         re.DOTALL,
     )
-    for m in pat.finditer(text):
+    for m in pat.finditer(ops_section):
+        desc = m.group(3).strip()
+        phone = ""
+        pm = re.search(r"(\+7\s*\(?\d{3}\)?\s*\d{3}[\s-]*\d{2}[\s-]*\d{2})", desc)
+        if not pm:
+            pm = re.search(r"(\+7\s*\(?\d{3}\)?\s*\d{3}-\d{2}-\s*\n?\s*\d{2})", desc)
+        if pm:
+            phone = pm.group(1).replace("\n", "").strip()
+        amount = m.group(4).strip().lstrip("-").strip()
         ops.append({
             "дата": m.group(1),
             "номер_операции": m.group(2),
-            "телефон": (m.group(3) or "").strip(),
-            "сумма": m.group(4).strip(),
+            "телефон": phone,
+            "сумма": amount,
+            "описание": desc,
         })
+
+    if not ops:
+        simple = re.compile(
+            r"(\d{2}\.\d{2}\.\d{4})\s*\n\s*"
+            r"([A-Z]\d{5,})",
+        )
+        for m in simple.finditer(ops_section):
+            amt_m = re.search(r"(-?[\d\s]+[,.]\d{2})\s*RUR", ops_section[m.end():m.end() + 500])
+            ops.append({
+                "дата": m.group(1),
+                "номер_операции": m.group(2),
+                "телефон": "",
+                "сумма": amt_m.group(1).strip().lstrip("-").strip() if amt_m else "",
+            })
     return ops
+
+
+def scan_alfa_block3(pdf_path: Path) -> dict[str, str]:
+    """Извлечь поля Блока 3 (Баланс счёта) из выписки Альфа-Банк."""
+    result: dict[str, str] = {}
+    if fitz is None:
+        return result
+    try:
+        doc = fitz.open(str(pdf_path))
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return result
+
+    m = re.search(r"За период с\s*(\d{2}\.\d{2}\.\d{4})\s*по\s*(\d{2}\.\d{2}\.\d{4})", text)
+    if m:
+        result["период_с"] = m.group(1)
+        result["период_по"] = m.group(2)
+
+    balance_pats = {
+        "входящий_остаток": r"Входящий остаток\s*\n?\s*([\d\s]+[,.]\d{2})\s*RUR",
+        "поступления": r"Поступления\s*\n?\s*([\d\s]+[,.]\d{2})\s*RUR",
+        "расходы": r"Расходы\s*\n?\s*([\d\s]+[,.]\d{2})\s*RUR",
+        "исходящий_остаток": r"Исходящий остаток\s*\n?\s*([\d\s]+[,.]\d{2})\s*RUR",
+        "платежный_лимит": r"Платежный лимит\s*\n?\s*([\d\s]+[,.]\d{2})\s*RUR",
+        "текущий_баланс": r"Текущий баланс\s*\n?\s*([\d\s]+[,.]\d{2})\s*RUR",
+    }
+    for key, pat in balance_pats.items():
+        bm = re.search(pat, text)
+        if bm:
+            result[key] = bm.group(1).strip()
+    return result
 
 
 def scan_vtb_block1(pdf_path: Path) -> dict[str, str]:
@@ -387,23 +466,23 @@ def scan_vtb_block1(pdf_path: Path) -> dict[str, str]:
     m = re.search(r"([А-ЯЁа-яё]+\s+[А-ЯЁа-яё]+(?:\s+[А-ЯЁа-яё]+)?)\s*\n\s*Номер", text)
     if m:
         result["фио"] = m.group(1).strip()
-    m = re.search(r"Номер\s+счёта\s*(\d{20})", text)
+    m = re.search(r"Номер\s+счёта\s*\n?\s*(\d{20})", text)
     if m:
         result["номер_счета"] = m.group(1)
-    m = re.search(r"Период\s+выписки\s*(\d{2}\.\d{2}\.\d{4})\s*[-–]\s*(\d{2}\.\d{2}\.\d{4})", text)
+    m = re.search(r"Период\s+выписки\s*\n?\s*(\d{2}\.\d{2}\.\d{4})\s*[-–]\s*(\d{2}\.\d{2}\.\d{4})", text)
     if m:
         result["период_start"] = m.group(1)
         result["период_end"] = m.group(2)
-    m = re.search(r"Баланс на начало периода\s*([\d,.\s]+)\s*RUB", text)
+    m = re.search(r"Баланс на начало периода\s*\n?\s*([\d,.\s]+?)\s*RUB", text)
     if m:
         result["баланс_начало"] = m.group(1).strip()
-    m = re.search(r"Поступления\s*([\d,.\s]+)\s*RUB", text)
+    m = re.search(r"Поступления\s*\n?\s*([\d,.\s]+?)\s*RUB", text)
     if m:
         result["поступления"] = m.group(1).strip()
-    m = re.search(r"Расходные операции\s*([\d,.\s]+)\s*RUB", text)
+    m = re.search(r"Расходные операции\s*\n?\s*([\d,.\s]+?)\s*RUB", text)
     if m:
         result["расходные_операции"] = m.group(1).strip()
-    m = re.search(r"Баланс на конец периода\s*([\d,.\s]+)\s*RUB", text)
+    m = re.search(r"Баланс на конец периода\s*\n?\s*([\d,.\s]+?)\s*RUB", text)
     if m:
         result["баланс_конец"] = m.group(1).strip()
     return result
@@ -420,42 +499,56 @@ def scan_vtb_block2(pdf_path: Path) -> list[dict[str, str]]:
         doc.close()
     except Exception:
         return ops
+
     pat = re.compile(
         r"(\d{2}\.\d{2}\.\d{4})\s*\n\s*"
         r"(\d{2}:\d{2}:\d{2})\s+"
-        r"(\d{2}\.\d{2}\.\d{4})\s+"
-        r"([\d,.]+)\s+RUB\s+"
-        r"([\d,.]+)\s*\n\s*RUB\s*\n\s*"
-        r"(\d+)\s*\n\s*RUB\s*\n\s*"
+        r"\d{2}\.\d{2}\.\d{4}\s+"
+        r"(-?[\d,.]+)\s+RUB\s+"
+        r"(-?[\d,.]+)\s*\n\s*RUB\s*\n\s*"
+        r"(-?[\d,.]+)\s*\n\s*RUB\s*\n\s*"
         r"([\d,.]+)\s+"
-        r"(.+?)(?=\n\d{2}\.\d{2}\.\d{4}|\nБаланс|\Z)",
+        r"(.+?)(?=\n\d{2}\.\d{2}\.\d{4}\s*\n\s*\d{2}:|\nСпасибо|\nБаланс|\Z)",
         re.DOTALL,
     )
     for m in pat.finditer(text):
+        raw_desc = m.group(7).strip()
+        desc_clean = " ".join(raw_desc.split())[:200]
+        income_acct = m.group(4).strip()
+        expense_acct = m.group(5).strip()
+        commission = m.group(6).strip()
         ops.append({
             "дата": m.group(1),
             "время": m.group(2),
-            "сумма": m.group(4).strip(),
-            "сумма_зачисление": m.group(5).strip(),
-            "комиссия": m.group(6).strip(),
-            "комиссия_сумма": m.group(7).strip(),
-            "описание": m.group(8).strip()[:100],
+            "сумма": expense_acct,
+            "сумма_зачисление": income_acct,
+            "комиссия": commission,
+            "описание": desc_clean,
         })
+
     if not ops:
         simple_pat = re.compile(
-            r"(\d{2}\.\d{2}\.\d{4})\s+"
-            r"(\d{2}:\d{2}:\d{2})\s+.+?"
-            r"([\d,.]+)\s+RUB",
-            re.DOTALL,
+            r"(\d{2}\.\d{2}\.\d{4})\s*\n\s*"
+            r"(\d{2}:\d{2}:\d{2})\s+",
         )
         for m in simple_pat.finditer(text):
+            chunk = text[m.start():m.start() + 600]
+            amt_m = re.search(r"(-?[\d,.]+)\s+RUB", chunk)
+            desc_m = re.search(r"[\d,.]+\s+(.+?)(?=\n\d{2}\.\d{2}\.\d{4}|\nСпасибо|\nБаланс|\Z)", chunk, re.DOTALL)
+            amount = "0"
+            if amt_m:
+                amount = amt_m.group(1).strip().lstrip("-").strip()
+            desc = ""
+            if desc_m:
+                desc = " ".join(desc_m.group(1).split())[:200]
             ops.append({
                 "дата": m.group(1),
                 "время": m.group(2),
-                "сумма": m.group(3).strip(),
+                "сумма": amount,
                 "сумма_зачисление": "0",
                 "комиссия": "0",
-                "описание": "",
+                "комиссия_сумма": "0.00",
+                "описание": desc,
             })
     return ops
 
