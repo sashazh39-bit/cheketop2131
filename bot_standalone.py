@@ -1166,6 +1166,30 @@ def _sw_send_step(token: str, chat_id: int, state: dict, tg_req) -> None:
     current_val = state.get("current_values", {}).get(field["key"])
     msg = format_step_message(field, current_val, changes=state.get("changes", {}))
     kb = get_step_keyboard(field, current_val, "sw")
+
+    # Auto-fill button for operation description field
+    fkey = field["key"]
+    if fkey.endswith("_описание"):
+        fkey_parts = fkey.split("_")  # ["op", N, "описание"]
+        if len(fkey_parts) >= 2:
+            op_idx = fkey_parts[1]
+            cur = state.get("current_values", {})
+            chg = state.get("changes", {})
+            old_op_num = cur.get(f"op_{op_idx}_номер_операции", "")
+            new_op_num = chg.get(f"op_{op_idx}_номер_операции", old_op_num)
+            old_phone = cur.get(f"op_{op_idx}_телефон", "")
+            new_phone = chg.get(f"op_{op_idx}_телефон", old_phone)
+            if current_val and (old_op_num != new_op_num or old_phone != new_phone):
+                flat = current_val.replace("\n", "")
+                auto = flat.replace(old_op_num, new_op_num) if old_op_num else flat
+                old_phone_flat = old_phone.replace("\n", "")
+                new_phone_flat = new_phone.replace("\n", "")
+                if old_phone_flat:
+                    auto = auto.replace(old_phone_flat, new_phone_flat)
+                if auto != flat:
+                    state["_auto_desc"] = auto
+                    kb.insert(0, [{"text": "✅ Подставить автозначение", "callback_data": "sw_auto_desc"}])
+
     tg_req(token, "sendMessage", {
         "chat_id": chat_id, "text": msg,
         "parse_mode": "Markdown",
@@ -1245,6 +1269,15 @@ def _sw_handle_callback(token: str, uid: int, q: dict, tg_req) -> None:
         return
 
     if data == "sw_keep" or data == "sw_skip":
+        advance_field(state)
+        _sw_send_step(token, chat_id, state, tg_req)
+        return
+
+    if data == "sw_auto_desc":
+        auto = state.pop("_auto_desc", None)
+        field = get_current_field(state)
+        if field and auto:
+            state.setdefault("changes", {})[field["key"]] = auto
         advance_field(state)
         _sw_send_step(token, chat_id, state, tg_req)
         return
