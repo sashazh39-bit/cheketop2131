@@ -173,7 +173,9 @@ ALFA_OP_FIELDS = [
 ALFA_BLOCK3_FIELDS = [
     {"key": "период_с", "label": "📅 Период с", "block": 3},
     {"key": "период_по", "label": "📅 Период по", "block": 3},
-    {"key": "текущий_баланс", "label": "💰 Текущий баланс", "block": 3},
+    {"key": "текущий_баланс", "label": "💰 Текущий баланс (исходящий остаток = платежный лимит = баланс)", "block": 3},
+    {"key": "расходы", "label": "💸 Расходы (авто из операций, можно изменить)", "block": 3},
+    {"key": "поступления", "label": "💰 Поступления (авто из операций, можно изменить)", "block": 3},
 ]
 
 VTB_BLOCK1_FIELDS = [
@@ -332,11 +334,15 @@ def validate_input(field: dict, value: str, available_chars: set[str] | None = N
     return True, ""
 
 
-def suggest_fio(current_fio: str, available_chars: set[str] | None = None) -> list[str]:
-    """Suggest replacement FIO based on first letters and available chars (up to 10)."""
-    parts = current_fio.split()
+def suggest_fio(current_fio: str, available_chars: set[str] | None = None, multiline: bool = False) -> list[str]:
+    """Suggest replacement FIO based on first letters and available chars (up to 10).
+
+    If multiline=True, format as "Фамилия Имя\\nОтчество" for PDF line-break matching.
+    """
+    flat = current_fio.replace("\n", " ")
+    parts = flat.split()
     if not parts:
-        return ["Иванов Иван Иванович"]
+        return ["Иванов Иван\nИванович" if multiline else "Иванов Иван Иванович"]
 
     l_s = parts[0][0].upper() if parts[0] else "И"
     l_n = parts[1][0].upper() if len(parts) > 1 and parts[1] else "И"
@@ -346,12 +352,15 @@ def suggest_fio(current_fio: str, available_chars: set[str] | None = None) -> li
     names = NAMES_BY_LETTER.get(l_n, ["Иван"])
     patronymics = PATRONYMICS_BY_LETTER.get(l_p, ["Иванович"])
 
+    def _fmt(s, n, p):
+        return f"{s} {n}\n{p}" if multiline else f"{s} {n} {p}"
+
     seen: set[str] = set()
     candidates: list[str] = []
     for s in surnames:
         for n in names:
             for p in patronymics:
-                c = f"{s} {n} {p}"
+                c = _fmt(s, n, p)
                 if c not in seen:
                     seen.add(c)
                     candidates.append(c)
@@ -360,7 +369,7 @@ def suggest_fio(current_fio: str, available_chars: set[str] | None = None) -> li
 
     if available_chars:
         def fits(text: str) -> bool:
-            return all(ch in available_chars or ch.isspace() for ch in text)
+            return all(ch in available_chars or ch.isspace() or ch == "\n" for ch in text)
         filtered = [c for c in candidates if fits(c)]
         if len(filtered) >= max_results:
             return filtered[:max_results]
@@ -373,7 +382,7 @@ def suggest_fio(current_fio: str, available_chars: set[str] | None = None) -> li
                 for s in SURNAMES_BY_LETTER.get(sl, []):
                     for n in NAMES_BY_LETTER.get(nl, []):
                         for p in PATRONYMICS_BY_LETTER.get(nl, []):
-                            cand = f"{s} {n} {p}"
+                            cand = _fmt(s, n, p)
                             if cand not in seen and fits(cand):
                                 seen.add(cand)
                                 filtered.append(cand)
@@ -384,12 +393,15 @@ def suggest_fio(current_fio: str, available_chars: set[str] | None = None) -> li
 
 
 def _format_alfa_address(entry: dict[str, str]) -> str:
-    """Format an ADDRESS_DATABASE entry into Alfa statement address format."""
+    """Format an ADDRESS_DATABASE entry into Alfa statement address format.
+
+    Trailing spaces before \\n match the actual PDF template layout.
+    """
     return (
-        f"{entry['индекс']}, РОССИЯ,\n"
-        f"{entry['регион']} область,\n"
-        f"ОБЛАСТЬ {entry['регион']},\n"
-        f"{entry['город']}, УЛИЦА {entry['улица']}, д.\n"
+        f"{entry['индекс']}, РОССИЯ, \n"
+        f"{entry['регион']} область, \n"
+        f"ОБЛАСТЬ {entry['регион']}, \n"
+        f"{entry['город']}, УЛИЦА {entry['улица']}, д. \n"
         f"{entry['дом']}, кв. {entry['кв']}"
     )
 
@@ -593,17 +605,22 @@ def format_preview(state: dict) -> str:
             s = val(f"op_{i}_сумма")
             lines.append(f"  Оп.{i+1}: {d} | {n} | {p} | {s} RUR")
         lines.append("")
-        expenses = sum_operations_expense(state)
+        expenses_str = changes.get("расходы")
+        income_str_user = changes.get("поступления")
+        if expenses_str:
+            expenses = _parse_amount(expenses_str)
+        else:
+            expenses = sum_operations_expense(state)
+        if income_str_user:
+            income = _parse_amount(income_str_user)
+        else:
+            income_raw = current.get("поступления", "0")
+            income = _parse_amount(income_raw)
         bal_str = changes.get("текущий_баланс", current.get("текущий_баланс", "0"))
         try:
             bal = float(str(bal_str).replace(" ", "").replace("\xa0", "").replace(",", "."))
         except ValueError:
             bal = 0.0
-        income_str = current.get("поступления", "0")
-        try:
-            income = float(str(income_str).replace(" ", "").replace("\xa0", "").replace(",", "."))
-        except ValueError:
-            income = 0.0
         calc = calc_alfa_block3(bal, expenses, income)
         lines.append("📋 Блок 3 — Баланс счёта")
         lines.append(f"  Период: {val('период_с')} — {val('период_по')}")
@@ -667,21 +684,67 @@ def jump_to_block(state: dict, block_num: int) -> dict | None:
 
 # ── Replacement pair builder ─────────────────────────────────────────────
 
+_DATE_CONTEXT_KEYS = {"период_с", "период_по", "дата_формирования", "дата_открытия"}
+_BLOCK3_AUTO_KEYS = {"входящий_остаток", "расходы", "поступления", "исходящий_остаток", "платежный_лимит"}
+
+
 def build_replacement_pairs(state: dict) -> list[tuple[str, str]]:
     """Build (old_value, new_value) pairs from wizard changes for CID patching.
 
-    Deduplicates by old_value to prevent conflicting replacements when
-    multiple fields share the same original text (e.g., same date in
-    period_start, period_end, and operation_date).
+    Handles dates with context-aware patterns to avoid collisions when
+    multiple fields share the same original date string.
+    Block 3 auto-calculated fields are skipped here (handled separately).
     """
     changes = state.get("changes", {})
     current = state.get("current_values", {})
-    seen_old: dict[str, str] = {}
+    bank = state.get("bank", "alfa")
+    pairs: list[tuple[str, str]] = []
+    seen_old: set[str] = set()
+
+    if bank == "alfa":
+        old_start = current.get("период_с", "")
+        old_end = current.get("период_по", "")
+        new_start = changes.get("период_с", old_start)
+        new_end = changes.get("период_по", old_end)
+        if old_start and old_end and (new_start != old_start or new_end != old_end):
+            old_period = f"За период с {old_start} по {old_end}"
+            new_period = f"За период с {new_start} по {new_end}"
+            pairs.append((old_period, new_period))
+            seen_old.add(old_start)
+            if old_end != old_start:
+                seen_old.add(old_end)
+
+        if "дата_открытия" in changes:
+            old_do = current.get("дата_открытия", "")
+            new_do = changes["дата_открытия"]
+            if old_do and old_do != new_do:
+                old_ctx = f"счета\n{old_do}"
+                new_ctx = f"счета\n{new_do}"
+                pairs.append((old_ctx, new_ctx))
+                seen_old.add(old_do)
+
+        if "дата_формирования" in changes:
+            old_df = current.get("дата_формирования", "")
+            new_df = changes["дата_формирования"]
+            if old_df and old_df != new_df:
+                old_ctx = f"выписки\n{old_df}"
+                new_ctx = f"выписки\n{new_df}"
+                pairs.append((old_ctx, new_ctx))
+                seen_old.add(old_df)
+
     for key, new_val in changes.items():
+        if key in _DATE_CONTEXT_KEYS or key in _BLOCK3_AUTO_KEYS:
+            continue
+        if key == "текущий_баланс":
+            continue
         old_val = current.get(key)
         if old_val and old_val != new_val:
             old_s = str(old_val)
             new_s = str(new_val)
-            if old_s not in seen_old:
-                seen_old[old_s] = new_s
-    return list(seen_old.items())
+            if old_s in seen_old:
+                if not (key.startswith("op_") and key.endswith("_дата")):
+                    continue
+            seen_old.add(old_s)
+            pairs.append((old_s, new_s))
+
+    return pairs

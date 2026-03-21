@@ -30,18 +30,29 @@ def patch_replacements(
         print("[ERROR] ToUnicode CMap не найден", file=sys.stderr)
         return False
 
+    flat_replacements = []
+    for old_val, new_val in replacements:
+        if "\n" in old_val:
+            old_lines = old_val.split("\n")
+            new_lines = new_val.split("\n")
+            for i, old_line in enumerate(old_lines):
+                new_line = new_lines[i] if i < len(new_lines) else ""
+                if old_line and old_line != new_line:
+                    flat_replacements.append((old_line, new_line, old_val))
+        else:
+            flat_replacements.append((old_val, new_val, None))
+
     required_chars = set()
-    for _old, new_val in replacements:
+    for _old, new_val, _parent in flat_replacements:
         for c in new_val:
             cp = ord(c)
             if cp == 0x20:
                 required_chars.add(0x20)
                 required_chars.add(0xA0)
-            else:
+            elif cp >= 0x20:
                 required_chars.add(cp)
     data, uni_to_cid = _extend_tounicode_identity(data, required_chars, uni_to_cid)
 
-    # Собрать все content streams (start, len, len_num_start, decompressed)
     streams: list[tuple[int, int, int, bytes]] = []
     for m in re.finditer(rb"<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n", data, re.DOTALL):
         stream_len = int(m.group(2))
@@ -56,24 +67,34 @@ def patch_replacements(
             continue
         streams.append((stream_start, stream_len, m.start(2), dec))
 
-    # Применить замены к каждому stream
     mods: list[tuple[int, int, int, bytes, bytes]] = []
     total_replaced = 0
+    logged_parents: set[str] = set()
     for stream_start, stream_len, len_num_start, dec in streams:
         new_dec = dec
-        for old_val, new_val in replacements:
+        for old_val, new_val, parent in flat_replacements:
             old_hex = _find_old_hex(old_val, uni_to_cid, new_dec)
             if not old_hex:
                 continue
             new_hex = _encode_cid(new_val, uni_to_cid)
-            if not new_hex or old_hex not in new_dec:
+            if not new_hex:
+                continue
+            is_inner = not old_hex.startswith(b"<")
+            if is_inner:
+                new_hex = new_hex[1:-1]
+            if old_hex not in new_dec:
                 continue
             is_lower = any(c in b'abcdef' for c in old_hex)
             if is_lower:
                 new_hex = new_hex.lower()
             new_dec = new_dec.replace(old_hex, new_hex)
             total_replaced += 1
-            print(f"[OK] {old_val} -> {new_val}")
+            display = parent or old_val
+            if display not in logged_parents:
+                logged_parents.add(display)
+                short_old = display[:50].replace("\n", "\\n")
+                short_new = new_val[:50].replace("\n", "\\n")
+                print(f"[OK] {short_old} -> {short_new}")
         if new_dec != dec:
             orig_raw = bytes(data[stream_start : stream_start + stream_len])
             level = _detect_zlib_level(orig_raw)
@@ -129,7 +150,11 @@ def _detect_zlib_level(raw: bytes) -> int:
 
 
 def _find_old_hex(old_val: str, uni_to_cid: dict, dec: bytes) -> bytes | None:
-    """Case-insensitive поиск hex CID в потоке. Возвращает hex в том регистре, в каком он в потоке."""
+    """Case-insensitive поиск hex CID в потоке. Возвращает hex в том регистре, в каком он в потоке.
+
+    Tries full <hex> match first. Falls back to inner hex substring match
+    (without angle brackets) for cases where the text is part of a longer TJ string.
+    """
     variants = [old_val, old_val + " ", old_val + "\u00a0"]
     for v in variants:
         h = _encode_cid(v, uni_to_cid, use_homoglyph=False)
@@ -143,6 +168,16 @@ def _find_old_hex(old_val: str, uni_to_cid: dict, dec: bytes) -> bytes | None:
         h_upper = h.upper()
         if h_upper in dec:
             return h_upper
+    h_base = _encode_cid(old_val, uni_to_cid, use_homoglyph=False)
+    if not h_base:
+        return None
+    inner = h_base[1:-1]
+    if inner in dec:
+        return inner
+    if inner.lower() in dec:
+        return inner.lower()
+    if inner.upper() in dec:
+        return inner.upper()
     return None
 
 
@@ -297,16 +332,22 @@ def _extend_tounicode_identity(
     """
     missing = required_chars - set(uni_to_cid.keys())
     missing.discard(0x20)
-    # Подставить nbsp только если space ещё не в CMap (не перезаписывать!)
+    missing = {cp for cp in missing if cp >= 0x20}
     if 0x20 not in uni_to_cid and 0xA0 in uni_to_cid and 0x20 in required_chars:
         uni_to_cid[0x20] = uni_to_cid[0xA0]
-    # Homoglyph: использовать латиницу вместо кириллицы, если целевой символ есть
     for cp in list(missing):
         if cp in _CYRILLIC_FALLBACK:
             alt = _CYRILLIC_FALLBACK[cp]
             if alt in uni_to_cid:
                 uni_to_cid[cp] = uni_to_cid[alt]
                 missing.discard(cp)
+    existing_cids = set(uni_to_cid.values())
+    safe_missing = set()
+    for cp in missing:
+        cid_hex = f"{cp:04X}"
+        if cid_hex not in existing_cids:
+            safe_missing.add(cp)
+    missing = safe_missing
     if not missing:
         return data, uni_to_cid
 

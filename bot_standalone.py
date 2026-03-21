@@ -1222,6 +1222,10 @@ def _sw_handle_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> No
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": warning + "\nПопробуйте ещё раз или нажмите «Пропустить»."})
         return
 
+    if field.get("suggest_fio") and state.get("bank") == "alfa" and "\n" not in value:
+        parts = value.split()
+        if len(parts) >= 3:
+            value = f"{parts[0]} {parts[1]}\n{' '.join(parts[2:])}"
     state.setdefault("changes", {})[field["key"]] = value
     advance_field(state)
     _sw_send_step(token, chat_id, state, tg_req)
@@ -1250,18 +1254,20 @@ def _sw_handle_callback(token: str, uid: int, q: dict, tg_req) -> None:
         if not field:
             return
         current = state.get("current_values", {}).get(field["key"], "")
-        suggestions = suggest_fio(current)
+        is_multiline = state.get("bank") == "alfa"
+        suggestions = suggest_fio(current, multiline=is_multiline)
         if not suggestions:
             tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "Не удалось подобрать ФИО. Введите вручную."})
             return
         state["_suggestions"] = suggestions
         kb = []
         for i, s in enumerate(suggestions):
-            kb.append([{"text": f"✅ {s}", "callback_data": f"sw_pick_{i}"}])
+            display = s.replace("\n", " ")
+            kb.append([{"text": f"✅ {display}", "callback_data": f"sw_pick_{i}"}])
         kb.append([{"text": "✏️ Ввести вручную", "callback_data": "sw_manual"}])
         tg_req(token, "sendMessage", {
             "chat_id": chat_id,
-            "text": f"💡 Предложения ФИО:\n\nТекущее: {current}",
+            "text": f"💡 Предложения ФИО:\n\nТекущее: {current.replace(chr(10), ' ')}",
             "reply_markup": json.dumps({"inline_keyboard": kb}),
         })
         return
@@ -1320,93 +1326,50 @@ def _sw_handle_callback(token: str, uid: int, q: dict, tg_req) -> None:
         return
 
 
-def _translate_wizard_to_alfa_keys(
-    changes: dict, current: dict, operations: list[dict],
-) -> dict[str, str]:
-    """Translate wizard field keys to patch_alfa_statement keys."""
-    translated: dict[str, str] = {}
-    if "номер_счета" in changes:
-        translated["номер_счета"] = changes["номер_счета"]
-    if "клиент" in changes:
-        fio_parts = changes["клиент"].split()
-        if len(fio_parts) >= 2:
-            translated["клиент_имя"] = " ".join(fio_parts[:2])
-        if len(fio_parts) >= 3:
-            translated["клиент_отчество"] = fio_parts[2]
-    if "адрес" in changes:
-        translated["адрес_полный"] = changes["адрес"]
-    if "текущий_баланс" in changes:
-        translated["текущий_баланс"] = changes["текущий_баланс"]
-
-    for i, op in enumerate(operations):
-        prefix = f"op_{i}_"
-        if f"{prefix}номер_операции" in changes:
-            if i == 0:
-                translated["код_операции_расход"] = changes[f"{prefix}номер_операции"]
-            elif i == 1:
-                translated["код_операции_приход"] = changes[f"{prefix}номер_операции"]
-        if f"{prefix}телефон" in changes:
-            phone = changes[f"{prefix}телефон"]
-            if len(phone) >= 4:
-                translated["телефон"] = phone[:-2]
-                translated["телефон_окончание"] = phone[-2:]
-            else:
-                translated["телефон"] = phone
-        if f"{prefix}сумма" in changes:
-            if i == 0:
-                translated["сумма_расход"] = changes[f"{prefix}сумма"]
-            elif i == 1:
-                translated["сумма_приход"] = changes[f"{prefix}сумма"]
-    return translated
+def _parse_float_safe(val_str) -> float:
+    s = str(val_str).replace(" ", "").replace("\xa0", "")
+    if "," in s and "." in s:
+        if s.rindex(",") < s.rindex("."):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
 
 
-def _build_alfa_cid_extra_pairs(changes: dict, current: dict) -> list[tuple[str, str]]:
-    """Build CID replacement pairs for fields not handled by patch_alfa_statement.
-
-    Uses context-aware patterns to avoid date collisions when multiple fields
-    share the same original value.
-    """
-    pairs: list[tuple[str, str]] = []
-
-    old_start = current.get("период_с", "")
-    old_end = current.get("период_по", "")
-    new_start = changes.get("период_с", old_start)
-    new_end = changes.get("период_по", old_end)
-    if old_start and old_end and (new_start != old_start or new_end != old_end):
-        old_period = f"За период с {old_start} по {old_end}"
-        new_period = f"За период с {new_start} по {new_end}"
-        pairs.append((old_period, new_period))
-
-    if "дата_формирования" in changes:
-        old_df = current.get("дата_формирования", "")
-        new_df = changes["дата_формирования"]
-        if old_df and old_df != new_df:
-            old_ctx = f"выписки\n{old_df}"
-            new_ctx = f"выписки\n{new_df}"
-            pairs.append((old_ctx, new_ctx))
-
-    if "дата_открытия" in changes:
-        old_do = current.get("дата_открытия", "")
-        new_do = changes["дата_открытия"]
-        if old_do and old_do != new_do:
-            old_ctx = f"счета {old_do}"
-            new_ctx = f"счета {new_do}"
-            pairs.append((old_ctx, new_ctx))
-
-    for key in sorted(changes.keys()):
-        if key.startswith("op_") and key.endswith("_дата"):
-            old_v = current.get(key)
-            if old_v and old_v != changes[key]:
-                idx = key.split("_")[1]
-                op_code_key = f"op_{idx}_номер_операции"
-                op_code = changes.get(op_code_key, current.get(op_code_key, ""))
-                if op_code:
-                    old_ctx = f"{old_v}\n{op_code[:6]}"
-                    new_ctx = f"{changes[key]}\n{op_code[:6]}"
-                    pairs.append((old_ctx, new_ctx))
-                else:
-                    pairs.append((old_v, changes[key]))
-    return pairs
+def _apply_alfa_block3_calc(state, changes, current, out_path,
+                            sum_operations_expense, sum_operations_income_alfa,
+                            calc_alfa_block3, format_amount_rur, patch_replacements):
+    """Apply Block 3 auto-calculation for Alfa statements."""
+    from statement_wizard import _parse_amount
+    expenses_str = changes.get("расходы")
+    income_str = changes.get("поступления")
+    if expenses_str:
+        expenses = _parse_amount(expenses_str)
+    else:
+        expenses = sum_operations_expense(state)
+    if income_str:
+        income = _parse_amount(income_str)
+    else:
+        income = sum_operations_income_alfa(state)
+    bal = _parse_float_safe(changes.get("текущий_баланс", current.get("текущий_баланс", "0")))
+    calc = calc_alfa_block3(bal, expenses, income)
+    bal_pairs = []
+    seen_bal: set[str] = set()
+    for calc_key in ("входящий_остаток", "расходы", "поступления", "исходящий_остаток", "платежный_лимит", "текущий_баланс"):
+        old_v = current.get(calc_key)
+        new_v = format_amount_rur(calc[calc_key])
+        if old_v and old_v != new_v:
+            pair_key = old_v + " RUR"
+            if pair_key not in seen_bal:
+                seen_bal.add(pair_key)
+                bal_pairs.append((pair_key, new_v + " RUR"))
+    if bal_pairs:
+        patch_replacements(Path(out_path), Path(out_path), bal_pairs)
 
 
 def _mutate_doc_id(pdf_bytes: bytes) -> bytes:
@@ -1456,22 +1419,9 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
                     out_path = tf.name
                 patch_replacements(in_path, Path(out_path), replacement_pairs)
-                expenses = sum_operations_expense(state)
-                income = sum_operations_income_alfa(state)
-                bal_str = changes.get("текущий_баланс", current.get("текущий_баланс", "0"))
-                try:
-                    bal = float(str(bal_str).replace(" ", "").replace("\xa0", "").replace(",", "."))
-                except ValueError:
-                    bal = 0.0
-                calc = calc_alfa_block3(bal, expenses, income)
-                bal_pairs = []
-                for calc_key in ("входящий_остаток", "расходы", "исходящий_остаток", "платежный_лимит", "текущий_баланс"):
-                    old_v = current.get(calc_key)
-                    new_v = format_amount_rur(calc[calc_key])
-                    if old_v and old_v != new_v:
-                        bal_pairs.append((old_v, new_v))
-                if bal_pairs:
-                    patch_replacements(Path(out_path), Path(out_path), bal_pairs)
+                _apply_alfa_block3_calc(state, changes, current, out_path,
+                                        sum_operations_expense, sum_operations_income_alfa,
+                                        calc_alfa_block3, format_amount_rur, patch_replacements)
                 with open(out_path, "rb") as f:
                     pdf_bytes = f.read()
                 try:
@@ -1490,43 +1440,25 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
             out_name = Path(state.get("file_name", "выписка.pdf")).stem + "_patched.pdf"
         else:
             try:
-                from alfa_statement_service import patch_alfa_statement, BASE_PDF
+                from alfa_statement_service import BASE_PDF
                 from cid_patch_amount import patch_replacements
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
-                    out_path = tf.name
-
-                translated = _translate_wizard_to_alfa_keys(changes, current, state.get("operations", []))
-                ok, err = patch_alfa_statement(translated, Path(out_path))
-                if not ok:
-                    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
-                    try:
-                        os.unlink(out_path)
-                    except OSError:
-                        pass
+                if not BASE_PDF.exists():
+                    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Шаблон Альфа не найден"})
                     if uid in USER_STATE:
                         del USER_STATE[uid]
                     return
+                replacement_pairs = build_replacement_pairs(state) + raw_extra
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                    out_path = tf.name
+                if replacement_pairs:
+                    patch_replacements(BASE_PDF, Path(out_path), replacement_pairs)
+                else:
+                    import shutil
+                    shutil.copy2(BASE_PDF, out_path)
 
-                cid_pairs = _build_alfa_cid_extra_pairs(changes, current)
-                if cid_pairs:
-                    patch_replacements(Path(out_path), Path(out_path), cid_pairs)
-
-                expenses = sum_operations_expense(state)
-                income = sum_operations_income_alfa(state)
-                bal_str = changes.get("текущий_баланс", current.get("текущий_баланс", "0"))
-                try:
-                    bal = float(str(bal_str).replace(" ", "").replace("\xa0", "").replace(",", "."))
-                except ValueError:
-                    bal = 0.0
-                calc = calc_alfa_block3(bal, expenses, income)
-                bal_pairs = []
-                for calc_key in ("входящий_остаток", "расходы", "исходящий_остаток", "платежный_лимит", "текущий_баланс"):
-                    old_v = current.get(calc_key)
-                    new_v = format_amount_rur(calc[calc_key])
-                    if old_v and old_v != new_v:
-                        bal_pairs.append((old_v, new_v))
-                if bal_pairs:
-                    patch_replacements(Path(out_path), Path(out_path), bal_pairs)
+                _apply_alfa_block3_calc(state, changes, current, out_path,
+                                        sum_operations_expense, sum_operations_income_alfa,
+                                        calc_alfa_block3, format_amount_rur, patch_replacements)
 
                 with open(out_path, "rb") as f:
                     pdf_bytes = f.read()

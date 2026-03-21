@@ -351,7 +351,8 @@ def scan_alfa_block1(pdf_path: Path) -> dict[str, str]:
 
     m = re.search(r"Клиент\s*\n(.+?)(?=\nАдрес)", text, re.DOTALL)
     if m:
-        result["клиент"] = " ".join(m.group(1).split())
+        lines = [l.strip() for l in m.group(1).strip().split("\n") if l.strip()]
+        result["клиент"] = "\n".join(lines)
 
     m = re.search(
         r"Адрес регистрации\s*\n(.+?)(?=\nЗа период|\nОперации по|\nОбщая задолженность|\nТ\.Т\.)",
