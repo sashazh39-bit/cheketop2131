@@ -403,7 +403,7 @@ def patch_alfa_statement(
             ord('1'): '0011', ord('0'): '0012', ord(' '): '0010',
             ord(','): '0013', ord('R'): '0014', ord('U'): '0015',
         }
-        old_bold_hex = _encode_f3(current["сумма_приход"] + " RUR", f3_cmap)
+        old_bold_hex = _encode_f3(current.get("сумма_приход", "0,00") + " RUR", f3_cmap)
 
         # Collect streams to patch (can't modify data during re.finditer)
         pdf_data = bytes(data)
@@ -491,7 +491,7 @@ def patch_alfa_statement(
                 continue
 
             if field_key == "сумма_приход_tx":
-                new_text = (changes.get("сумма_приход", current["сумма_приход"]) + " RUR")
+                new_text = (changes.get("сумма_приход", current.get("сумма_приход", "0,00")) + " RUR")
                 right_edge = _RIGHT_EDGE_TX
                 new_x = _calc_tm_x_f3(new_text, right_edge, f3_cmap, f3_widths)
             elif field_key == "сумма_расход_tx":

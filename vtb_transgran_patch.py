@@ -230,8 +230,9 @@ def extract_fields(pdf_data: bytes) -> dict[str, str]:
 
 
 def parse_rate(rate_str: str) -> tuple[Decimal, str] | None:
-    """Парсит '1 ₽ = 137,96 UZS' → (Decimal('137.96'), 'UZS')."""
-    m = re.match(r'1\s*₽\s*=\s*([\d\s,.]+)\s+(\w+)', rate_str.replace('\xa0', ' '))
+    """Парсит '1 ₽ = 137,96 UZS' или '1 RUR = 0.1130 TJS' → (Decimal, currency)."""
+    s = rate_str.replace('\xa0', ' ')
+    m = re.match(r'1\s*(?:₽|RUR|RUB|руб\.?)\s*=\s*([\d\s,.]+)\s+(\w+)', s)
     if not m:
         return None
     rate_val = m.group(1).replace(' ', '').replace(',', '.')

@@ -12,8 +12,14 @@ from pathlib import Path
 
 def patch_document_id(pdf_path: Path, new_id_hex: str | None = None) -> bool:
     """
-    Заменить /ID [ <hex1> <hex2> ] на новый ID той же длины.
-    new_id_hex: 32 символа 0-9a-f, или None для генерации случайного.
+    Заменить /ID [ <hex1> <hex2> ] на два РАЗНЫХ новых ID той же длины.
+
+    Oracle BI Publisher всегда генерирует два разных ID:
+      ID[0] = постоянный идентификатор документа (creation ID)
+      ID[1] = идентификатор экземпляра/модификации (instance ID, меняется при сохранении)
+    Установка ID[0] == ID[1] — явный форензик-флаг подделки.
+
+    new_id_hex: если задан, используется как ID[0]; ID[1] генерируется независимо.
     """
     data = pdf_path.read_bytes()
     m = re.search(rb"/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]", data)
@@ -25,18 +31,84 @@ def patch_document_id(pdf_path: Path, new_id_hex: str | None = None) -> bool:
     if len(old2) != target_len:
         return False
 
+    # Generate ID[0]
     if new_id_hex is None:
-        new_id_hex = secrets.token_hex(target_len // 2)
-    new_id_hex = new_id_hex.lower()
-    if len(new_id_hex) != target_len:
-        raise ValueError(f"ID должен быть ровно {target_len} hex-символов, получено {len(new_id_hex)}")
-    if not re.match(r"^[0-9a-f]+$", new_id_hex):
+        new_id1 = secrets.token_hex(target_len // 2).lower()
+    else:
+        new_id1 = new_id_hex.lower()
+    if len(new_id1) != target_len:
+        raise ValueError(f"ID должен быть ровно {target_len} hex-символов, получено {len(new_id1)}")
+    if not re.match(r"^[0-9a-f]+$", new_id1):
         raise ValueError("ID должен содержать только 0-9 и a-f")
 
-    new_b = new_id_hex.encode("ascii")
-    data = data.replace(b"<" + old1 + b">", b"<" + new_b + b">", 1)
-    data = data.replace(b"<" + old2 + b">", b"<" + new_b + b">", 1)
+    # Generate ID[1] independently — must differ from ID[0]
+    new_id2 = secrets.token_hex(target_len // 2).lower()
+    while new_id2 == new_id1:
+        new_id2 = secrets.token_hex(target_len // 2).lower()
+
+    new_b1 = new_id1.encode("ascii")
+    new_b2 = new_id2.encode("ascii")
+    data = data.replace(b"<" + old1 + b">", b"<" + new_b1 + b">", 1)
+    data = data.replace(b"<" + old2 + b">", b"<" + new_b2 + b">", 1)
     pdf_path.write_bytes(data)
+    return True
+
+
+def patch_moddate(pdf_path: Path, date_str: str) -> bool:
+    """
+    Обновить /ModDate в Info-словаре PDF.
+
+    date_str: дата в формате ДД.ММ.ГГГГ (например '10.03.2026').
+    Новое значение: D:YYYYMMDD120000+03'00' (полдень, московское время).
+
+    Заменяет в raw-байтах без изменения длины файла (подстрока фиксированной длины).
+    Если длина меняется — обновляет xref и startxref.
+    """
+    parts = date_str.split(".")
+    if len(parts) != 3:
+        return False
+    dd, mm, yyyy = parts
+    new_moddate = f"D:{yyyy}{mm}{dd}120000+03'00'"
+
+    data = bytearray(pdf_path.read_bytes())
+    # Match /ModDate (D:YYYYMMDDHHmmSS+HH'mm') in PDF Info dict
+    m = re.search(rb"/ModDate\s*\(([^)]+)\)", data)
+    if not m:
+        return False
+
+    old_val = m.group(1)
+    new_val = new_moddate.encode("ascii")
+    old_full = m.group(0)
+    new_full = b"/ModDate (" + new_val + b")"
+
+    if old_full == new_full:
+        return True  # already correct
+
+    if len(new_full) == len(old_full):
+        data[m.start():m.end()] = new_full
+    else:
+        # Size change — replace and update xref if needed
+        delta = len(new_full) - len(old_full)
+        change_pos = m.start()
+        data = bytearray(bytes(data[:change_pos]) + new_full + bytes(data[m.end():]))
+
+        # Update /Length for the containing stream/object if present (Info is usually uncompressed)
+        # Update xref offsets for objects after change_pos
+        xref_m = re.search(rb"xref\r?\n(\d+)\s+(\d+)\r?\n((?:\d{10}\s+\d{5}\s+[nf]\s*\r?\n)+)", data)
+        if xref_m:
+            entries = bytearray(xref_m.group(3))
+            for em in re.finditer(rb"(\d{10})(\s+\d{5}\s+[nf]\s*\r?\n)", entries):
+                offset = int(em.group(1))
+                if offset > change_pos:
+                    entries[em.start(1):em.start(1)+10] = f"{offset + delta:010d}".encode()
+            data[xref_m.start(3):xref_m.end(3)] = bytes(entries)
+        sxref_m = re.search(rb"startxref\r?\n(\d+)\r?\n", data)
+        if sxref_m and change_pos < int(sxref_m.group(1)):
+            pos = sxref_m.start(1)
+            old_pos = int(sxref_m.group(1))
+            data[pos:pos+len(str(old_pos))] = str(old_pos + delta).encode()
+
+    pdf_path.write_bytes(bytes(data))
     return True
 
 
