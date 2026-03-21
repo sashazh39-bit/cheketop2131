@@ -1334,20 +1334,7 @@ def _translate_wizard_to_alfa_keys(
         if len(fio_parts) >= 3:
             translated["клиент_отчество"] = fio_parts[2]
     if "адрес" in changes:
-        addr = changes["адрес"]
-        import re as _re
-        idx_m = _re.match(r"(\d+)", addr)
-        if idx_m:
-            translated["индекс"] = idx_m.group(1)
-        city_m = _re.search(
-            r"(?:ОБЛАСТЬ\s+\S+,\s*\n?\s*)(\S+)|,\s*([А-ЯЁ][а-яё]+)\s*,\s*УЛИЦА",
-            addr,
-        )
-        if city_m:
-            translated["город"] = (city_m.group(1) or city_m.group(2)).strip().rstrip(",")
-        apt_m = _re.search(r"д\.\s*(.+?)$", addr, _re.DOTALL)
-        if apt_m:
-            translated["дом_кв"] = apt_m.group(1).strip()
+        translated["адрес_полный"] = changes["адрес"]
     if "текущий_баланс" in changes:
         translated["текущий_баланс"] = changes["текущий_баланс"]
 
@@ -1374,29 +1361,76 @@ def _translate_wizard_to_alfa_keys(
 
 
 def _build_alfa_cid_extra_pairs(changes: dict, current: dict) -> list[tuple[str, str]]:
-    """Build CID replacement pairs for fields not handled by patch_alfa_statement (dates, periods)."""
-    pairs: list[tuple[str, str]] = []
-    extra_keys = [
-        "дата_формирования", "дата_открытия", "период_с", "период_по",
-    ]
-    for key in extra_keys:
-        if key in changes:
-            old_v = current.get(key)
-            if old_v and old_v != changes[key]:
-                pairs.append((old_v, changes[key]))
+    """Build CID replacement pairs for fields not handled by patch_alfa_statement.
 
-    for key in list(changes.keys()):
+    Uses context-aware patterns to avoid date collisions when multiple fields
+    share the same original value.
+    """
+    pairs: list[tuple[str, str]] = []
+
+    old_start = current.get("период_с", "")
+    old_end = current.get("период_по", "")
+    new_start = changes.get("период_с", old_start)
+    new_end = changes.get("период_по", old_end)
+    if old_start and old_end and (new_start != old_start or new_end != old_end):
+        old_period = f"За период с {old_start} по {old_end}"
+        new_period = f"За период с {new_start} по {new_end}"
+        pairs.append((old_period, new_period))
+
+    if "дата_формирования" in changes:
+        old_df = current.get("дата_формирования", "")
+        new_df = changes["дата_формирования"]
+        if old_df and old_df != new_df:
+            old_ctx = f"выписки\n{old_df}"
+            new_ctx = f"выписки\n{new_df}"
+            pairs.append((old_ctx, new_ctx))
+
+    if "дата_открытия" in changes:
+        old_do = current.get("дата_открытия", "")
+        new_do = changes["дата_открытия"]
+        if old_do and old_do != new_do:
+            old_ctx = f"счета {old_do}"
+            new_ctx = f"счета {new_do}"
+            pairs.append((old_ctx, new_ctx))
+
+    for key in sorted(changes.keys()):
         if key.startswith("op_") and key.endswith("_дата"):
             old_v = current.get(key)
             if old_v and old_v != changes[key]:
-                pairs.append((old_v, changes[key]))
+                idx = key.split("_")[1]
+                op_code_key = f"op_{idx}_номер_операции"
+                op_code = changes.get(op_code_key, current.get(op_code_key, ""))
+                if op_code:
+                    old_ctx = f"{old_v}\n{op_code[:6]}"
+                    new_ctx = f"{changes[key]}\n{op_code[:6]}"
+                    pairs.append((old_ctx, new_ctx))
+                else:
+                    pairs.append((old_v, changes[key]))
     return pairs
+
+
+def _mutate_doc_id(pdf_bytes: bytes) -> bytes:
+    """Mutate PDF /ID to MD5 of content, so each output has a unique document ID."""
+    import hashlib
+    data = bytearray(pdf_bytes)
+    id_m = re.search(rb'/ID\s*\[\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*\]', bytes(data))
+    if not id_m:
+        return bytes(data)
+    h = hashlib.md5(bytes(data)).hexdigest().upper()
+    new_id = h.encode()
+    old1, old2 = id_m.group(1), id_m.group(2)
+    full_old = id_m.group(0)
+    full_new = full_old.replace(old1, new_id[:len(old1)].ljust(len(old1), b'0'), 1)
+    full_new = full_new.replace(old2, new_id[:len(old2)].ljust(len(old2), b'0'), 1)
+    data[id_m.start():id_m.end()] = full_new
+    return bytes(data)
 
 
 def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
     """Generate statement PDF from wizard state."""
     from statement_wizard import (
         build_replacement_pairs, sum_operations_expense, sum_operations_income,
+        sum_operations_income_alfa,
         calc_alfa_block3, calc_vtb_block3, format_amount_rur, format_amount_rub,
     )
     bank = state.get("bank", "alfa")
@@ -1423,16 +1457,12 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                     out_path = tf.name
                 patch_replacements(in_path, Path(out_path), replacement_pairs)
                 expenses = sum_operations_expense(state)
+                income = sum_operations_income_alfa(state)
                 bal_str = changes.get("текущий_баланс", current.get("текущий_баланс", "0"))
                 try:
                     bal = float(str(bal_str).replace(" ", "").replace("\xa0", "").replace(",", "."))
                 except ValueError:
                     bal = 0.0
-                income_str = current.get("поступления", "0")
-                try:
-                    income = float(str(income_str).replace(" ", "").replace("\xa0", "").replace(",", "."))
-                except ValueError:
-                    income = 0.0
                 calc = calc_alfa_block3(bal, expenses, income)
                 bal_pairs = []
                 for calc_key in ("входящий_остаток", "расходы", "исходящий_остаток", "платежный_лимит", "текущий_баланс"):
@@ -1480,6 +1510,23 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 cid_pairs = _build_alfa_cid_extra_pairs(changes, current)
                 if cid_pairs:
                     patch_replacements(Path(out_path), Path(out_path), cid_pairs)
+
+                expenses = sum_operations_expense(state)
+                income = sum_operations_income_alfa(state)
+                bal_str = changes.get("текущий_баланс", current.get("текущий_баланс", "0"))
+                try:
+                    bal = float(str(bal_str).replace(" ", "").replace("\xa0", "").replace(",", "."))
+                except ValueError:
+                    bal = 0.0
+                calc = calc_alfa_block3(bal, expenses, income)
+                bal_pairs = []
+                for calc_key in ("входящий_остаток", "расходы", "исходящий_остаток", "платежный_лимит", "текущий_баланс"):
+                    old_v = current.get(calc_key)
+                    new_v = format_amount_rur(calc[calc_key])
+                    if old_v and old_v != new_v:
+                        bal_pairs.append((old_v, new_v))
+                if bal_pairs:
+                    patch_replacements(Path(out_path), Path(out_path), bal_pairs)
 
                 with open(out_path, "rb") as f:
                     pdf_bytes = f.read()
@@ -1583,6 +1630,8 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                     del USER_STATE[uid]
                 return
             out_name = "выписка_втб.pdf"
+
+    pdf_bytes = _mutate_doc_id(pdf_bytes)
 
     if uid in USER_STATE:
         del USER_STATE[uid]

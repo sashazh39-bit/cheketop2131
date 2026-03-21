@@ -395,13 +395,16 @@ def scan_alfa_block2(pdf_path: Path) -> list[dict[str, str]]:
             pm = re.search(r"(\+7\s*\(?\d{3}\)?\s*\d{3}-\d{2}-\s*\n?\s*\d{2})", desc)
         if pm:
             phone = pm.group(1).replace("\n", "").strip()
-        amount = m.group(4).strip().lstrip("-").strip()
+        raw_amount = m.group(4).strip()
+        is_expense = raw_amount.startswith("-")
+        amount = raw_amount.lstrip("-").strip()
         ops.append({
             "дата": m.group(1),
             "номер_операции": m.group(2),
             "телефон": phone,
             "сумма": amount,
             "описание": desc,
+            "тип": "расход" if is_expense else "приход",
         })
 
     if not ops:
@@ -411,11 +414,14 @@ def scan_alfa_block2(pdf_path: Path) -> list[dict[str, str]]:
         )
         for m in simple.finditer(ops_section):
             amt_m = re.search(r"(-?[\d\s]+[,.]\d{2})\s*RUR", ops_section[m.end():m.end() + 500])
+            raw_a = amt_m.group(1).strip() if amt_m else ""
+            is_exp = raw_a.startswith("-")
             ops.append({
                 "дата": m.group(1),
                 "номер_операции": m.group(2),
                 "телефон": "",
-                "сумма": amt_m.group(1).strip().lstrip("-").strip() if amt_m else "",
+                "сумма": raw_a.lstrip("-").strip() if raw_a else "",
+                "тип": "расход" if is_exp else "приход",
             })
     return ops
 

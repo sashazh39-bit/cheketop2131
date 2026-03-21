@@ -36,6 +36,7 @@ BLOCK3_DEFAULTS = {
     "индекс": "238401",
     "город": "Славск",
     "дом_кв": "12В, кв. 56",
+    "адрес_полный": "238401, РОССИЯ,\nКалининградская область, \nОБЛАСТЬ Калининградская, \nСлавск, УЛИЦА Каштановая, д.\n12В, кв. 56",
 }
 
 BLOCK1_DEFAULTS = {
@@ -344,6 +345,11 @@ def patch_alfa_statement(
 
         elif key == "получатель_сокр":
             phase2_substring.append((current[key], new_val))
+
+        elif key == "адрес_полный":
+            old_addr = current.get("адрес_полный", "")
+            if old_addr and old_addr != new_val:
+                phase1_replacements.append((old_addr, new_val))
 
         elif key in ("номер_счета", "клиент_имя", "клиент_отчество",
                       "индекс", "город", "дом_кв", "код_операции_приход"):
