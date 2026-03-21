@@ -658,6 +658,169 @@ def _update_xref(data: bytearray, stream_start: int, delta: int) -> None:
         data[pos:pos + len(str(old_pos))] = str(old_pos + delta).encode()
 
 
+# ── Right-alignment post-patch ────────────────────────────────────────────
+
+# Right edges for Block 3 amounts and Block 2 tx amount, verified from
+# AM_1774109927283.pdf: right_edge = orig_tm_x + _text_width_pt(orig_text)
+_TM_RIGHT_EDGES: dict[float, float] = {
+    662.497: 566.979,  # входящий_остаток
+    645.447: 566.979,  # поступления
+    628.397: 566.979,  # расходы
+    611.347: 566.979,  # исходящий_остаток
+    594.297: 566.979,  # платежный_лимит
+    537.497: 566.979,  # текущий_баланс
+    427.104: 568.028,  # Block 2 op amount
+}
+
+# Tolerance for y-coordinate matching (floating point from different PDFs)
+_TM_Y_TOL = 0.1
+
+
+def adjust_amount_tm_positions(out_path: Path) -> None:
+    """Re-align Block 2/3 amount+RUR strings so RUR stays at its template right edge.
+
+    After CID text replacement the Tm x position is stale — the text grows
+    leftward but its Tm anchor stays at the original position.  This function
+    recalculates Tm x for each known amount y-position using CID glyph widths
+    so the combined 'amount RUR' string right-aligns to the same edge as the
+    template.
+    """
+    raw = out_path.read_bytes()
+    from cid_patch_amount import _parse_tounicode
+    uni_to_cid = _parse_tounicode(raw)
+    if not uni_to_cid:
+        return
+    cid_to_char: dict[str, str] = {v: chr(k) for k, v in uni_to_cid.items()}
+    cid_widths = _extract_font_widths(raw)
+    if not cid_widths:
+        return
+
+    # Collect all stream positions using an immutable snapshot so the regex
+    # iterator never holds a reference to the mutable bytearray.
+    stream_infos: list[tuple[int, int, int]] = []  # (stream_start, stream_len, len_num_start)
+    for m in re.finditer(rb"<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n", raw, re.DOTALL):
+        stream_len = int(m.group(2))
+        stream_start = m.end()
+        if stream_start + stream_len > len(raw):
+            continue
+        try:
+            dec = zlib.decompress(raw[stream_start:stream_start + stream_len])
+        except zlib.error:
+            continue
+        if b"BT" not in dec:
+            continue
+        stream_infos.append((stream_start, stream_len, m.start(2)))
+
+    if not stream_infos:
+        return
+
+    data = bytearray(raw)
+    modified = False
+
+    for stream_start, stream_len, len_num_start in reversed(stream_infos):
+        try:
+            dec = zlib.decompress(bytes(data[stream_start:stream_start + stream_len]))
+        except zlib.error:
+            continue
+        new_dec = _adjust_tms_in_stream(dec, cid_to_char, cid_widths)
+        if new_dec is dec:
+            continue
+
+        new_raw = zlib.compress(new_dec, 6)
+        delta = len(new_raw) - stream_len
+        old_len_str = str(stream_len).encode()
+        new_len_str = str(len(new_raw)).encode()
+        if len(new_len_str) != len(old_len_str):
+            delta += len(new_len_str) - len(old_len_str)
+        # Rebuild data without in-place resize (avoids BufferError)
+        data = bytearray(
+            bytes(data[:stream_start]) + new_raw + bytes(data[stream_start + stream_len:])
+        )
+        data[len_num_start:len_num_start + len(old_len_str)] = new_len_str
+        _update_xref(data, stream_start, delta)
+        modified = True
+
+    if modified:
+        out_path.write_bytes(bytes(data))
+
+
+def _decode_cid_tj(hex_bytes: bytes, cid_to_char: dict[str, str]) -> str:
+    """Decode a CID hex string (from a Tj operator) to Unicode text."""
+    hex_str = hex_bytes.decode("ascii", errors="replace")
+    result = []
+    for i in range(0, len(hex_str) - 3, 4):
+        cid_hex = hex_str[i:i + 4].upper()
+        result.append(cid_to_char.get(cid_hex, "\ufffd"))
+    return "".join(result)
+
+
+def _adjust_tms_in_stream(
+    dec: bytes, cid_to_char: dict[str, str], cid_widths: dict[int, int]
+) -> bytes:
+    """Return dec with Tm x values corrected for right-alignment at known y positions.
+
+    Returns the original dec object unchanged if no adjustments were needed.
+    """
+    tm_tj = re.compile(rb"([\d.]+) ([\d.]+) Tm\r?\n<([0-9A-Fa-f]+)> Tj")
+    replacements: list[tuple[bytes, bytes]] = []
+    for m in tm_tj.finditer(dec):
+        old_x_str = m.group(1)
+        y_str = m.group(2)
+        hex_content = m.group(3)
+        try:
+            tm_y = float(y_str)
+        except ValueError:
+            continue
+        right_edge = None
+        for known_y, edge in _TM_RIGHT_EDGES.items():
+            if abs(tm_y - known_y) < _TM_Y_TOL:
+                right_edge = edge
+                break
+        if right_edge is None:
+            continue
+        text = _decode_cid_tj(hex_content, cid_to_char)
+        if not any(ch.isdigit() for ch in text):
+            continue
+        w = _text_width_pt_from_cid(text, cid_to_char, cid_widths)
+        new_x = round(right_edge - w, 3)
+        new_x_str = f"{new_x:.3f}".encode()
+        # Only replace when same byte length (avoids stream length changes)
+        if len(new_x_str) != len(old_x_str):
+            continue
+        if new_x_str == old_x_str:
+            continue
+        old_tm = old_x_str + b" " + y_str + b" Tm"
+        new_tm = new_x_str + b" " + y_str + b" Tm"
+        replacements.append((old_tm, new_tm))
+
+    if not replacements:
+        return dec
+    result = dec
+    for old_tm, new_tm in replacements:
+        result = result.replace(old_tm, new_tm)
+    return result
+
+
+def _text_width_pt_from_cid(
+    text: str, cid_to_char: dict[str, str], cid_widths: dict[int, int],
+    font_size: float = 8.0,
+) -> float:
+    """Calculate text width (pt) using the CID width table.
+
+    cid_to_char maps cid_hex_str -> char, so we invert it to char -> cid_hex.
+    """
+    char_to_cid: dict[str, str] = {ch: cid_hex for cid_hex, ch in cid_to_char.items()}
+    total = 0
+    for ch in text:
+        cid_hex = char_to_cid.get(ch)
+        if cid_hex:
+            cid_num = int(cid_hex, 16)
+            total += cid_widths.get(cid_num, 556)
+        else:
+            total += 556
+    return total * font_size / 1000
+
+
 # ── Convenience: format blocks for display ────────────────────────────────
 
 def format_block1(vals: dict | None = None) -> str:

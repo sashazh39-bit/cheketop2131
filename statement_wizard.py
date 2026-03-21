@@ -274,16 +274,47 @@ def advance_field(state: dict) -> dict | None:
     return get_current_field(state)
 
 
-def format_step_message(field: dict, current_value: str | None) -> str:
-    """Format the prompt message for a wizard step."""
+def format_step_message(field: dict, current_value: str | None, changes: dict | None = None) -> str:
+    """Format the prompt message for a wizard step.
+
+    For Block 2 operation fields, includes a summary of values already
+    entered for the same operation so the user can cross-check.
+    """
     block = field.get("block", 0)
     block_names = {1: "Информация о счёте", 2: "Операции", 3: "Баланс счёта"}
     header = f"📋 Блок {block} — {block_names.get(block, '')}\n\n"
     label = field["label"]
+
+    context = ""
+    key = field.get("key", "")
+    if changes and key.startswith("op_") and block == 2:
+        key_parts = key.split("_")
+        if len(key_parts) >= 2:
+            op_idx = key_parts[1]
+            field_labels = {
+                "дата": "Дата",
+                "номер_операции": "Номер операции",
+                "телефон": "Телефон",
+                "сумма": "Сумма",
+                "описание": "Описание",
+            }
+            entered_lines = []
+            for sub_key, sub_label in field_labels.items():
+                full_key = f"op_{op_idx}_{sub_key}"
+                if full_key == key:
+                    continue
+                val = changes.get(full_key)
+                if val:
+                    short = val.replace("\n", " ")[:50]
+                    entered_lines.append(f"  {sub_label}: {short}")
+            if entered_lines:
+                op_num = int(op_idx) + 1
+                context = f"\n\n📌 Уже введено для Оп.{op_num}:\n" + "\n".join(entered_lines)
+
     if current_value:
-        msg = f"{header}{label}\n\nТекущее значение:\n`{current_value}`\n\nВведите новое значение или нажмите «Оставить»:"
+        msg = f"{header}{label}{context}\n\nТекущее значение:\n`{current_value}`\n\nВведите новое значение или нажмите «Оставить»:"
     else:
-        msg = f"{header}{label}\n\nЗначение не найдено.\n\nВведите значение или нажмите «Пропустить»:"
+        msg = f"{header}{label}{context}\n\nЗначение не найдено.\n\nВведите значение или нажмите «Пропустить»:"
     return msg
 
 
@@ -396,12 +427,23 @@ def _format_alfa_address(entry: dict[str, str]) -> str:
     """Format an ADDRESS_DATABASE entry into Alfa statement address format.
 
     Trailing spaces before \\n match the actual PDF template layout.
+    When the street name is longer than 8 characters, 'д.' moves to the
+    house/apt line so the street line does not overflow the text box.
     """
+    street = entry['улица']
+    if len(street) > 8:
+        return (
+            f"{entry['индекс']}, РОССИЯ, \n"
+            f"{entry['регион']} область, \n"
+            f"ОБЛАСТЬ {entry['регион']}, \n"
+            f"{entry['город']}, УЛИЦА {street}, \n"
+            f"д. {entry['дом']}, кв. {entry['кв']}"
+        )
     return (
         f"{entry['индекс']}, РОССИЯ, \n"
         f"{entry['регион']} область, \n"
         f"ОБЛАСТЬ {entry['регион']}, \n"
-        f"{entry['город']}, УЛИЦА {entry['улица']}, д. \n"
+        f"{entry['город']}, УЛИЦА {street}, д. \n"
         f"{entry['дом']}, кв. {entry['кв']}"
     )
 

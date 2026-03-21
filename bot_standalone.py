@@ -1164,7 +1164,7 @@ def _sw_send_step(token: str, chat_id: int, state: dict, tg_req) -> None:
         })
         return
     current_val = state.get("current_values", {}).get(field["key"])
-    msg = format_step_message(field, current_val)
+    msg = format_step_message(field, current_val, changes=state.get("changes", {}))
     kb = get_step_keyboard(field, current_val, "sw")
     tg_req(token, "sendMessage", {
         "chat_id": chat_id, "text": msg,
@@ -1422,6 +1422,11 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 _apply_alfa_block3_calc(state, changes, current, out_path,
                                         sum_operations_expense, sum_operations_income_alfa,
                                         calc_alfa_block3, format_amount_rur, patch_replacements)
+                try:
+                    from alfa_statement_service import adjust_amount_tm_positions
+                    adjust_amount_tm_positions(Path(out_path))
+                except Exception:
+                    pass
                 with open(out_path, "rb") as f:
                     pdf_bytes = f.read()
                 try:
@@ -1459,6 +1464,11 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 _apply_alfa_block3_calc(state, changes, current, out_path,
                                         sum_operations_expense, sum_operations_income_alfa,
                                         calc_alfa_block3, format_amount_rur, patch_replacements)
+                try:
+                    from alfa_statement_service import adjust_amount_tm_positions
+                    adjust_amount_tm_positions(Path(out_path))
+                except Exception:
+                    pass
 
                 with open(out_path, "rb") as f:
                     pdf_bytes = f.read()
