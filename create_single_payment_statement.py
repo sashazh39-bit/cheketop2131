@@ -14,7 +14,7 @@ for alt in [BASE / "Выписка_патч_13_03.pdf", BASE / "Выписка_�
         REFERENCE = alt
         break
 OUT_DIR = BASE / "база_выписок"
-OUT_PATH = OUT_DIR / "vyписка_один_платеж.pdf"
+OUT_PATH = OUT_DIR / "vtb_template.pdf"
 
 
 def main():

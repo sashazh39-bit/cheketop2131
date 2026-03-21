@@ -12,7 +12,7 @@ except ImportError:
     fitz = None
 
 BASE = Path(__file__).parent
-BASE_STATEMENT = BASE / "база_выписок" / "vyписка_один_платеж.pdf"
+BASE_STATEMENT = BASE / "база_выписок" / "vtb_template.pdf"
 # Эталон: ФИО и сумма одной операции для замены при выписке по чеку
 BASE_OLD_FIO = "Жеребятьев Александр Евгеньевич"
 BASE_AMOUNT = 6135
@@ -373,15 +373,110 @@ def scan_alfa_block2(pdf_path: Path) -> list[dict[str, str]]:
     return ops
 
 
+def scan_vtb_block1(pdf_path: Path) -> dict[str, str]:
+    """Извлечь поля Блока 1 (Информация о счёте) из выписки ВТБ."""
+    result: dict[str, str] = {}
+    if fitz is None:
+        return result
+    try:
+        doc = fitz.open(str(pdf_path))
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return result
+    m = re.search(r"([А-ЯЁа-яё]+\s+[А-ЯЁа-яё]+(?:\s+[А-ЯЁа-яё]+)?)\s*\n\s*Номер", text)
+    if m:
+        result["фио"] = m.group(1).strip()
+    m = re.search(r"Номер\s+счёта\s*(\d{20})", text)
+    if m:
+        result["номер_счета"] = m.group(1)
+    m = re.search(r"Период\s+выписки\s*(\d{2}\.\d{2}\.\d{4})\s*[-–]\s*(\d{2}\.\d{2}\.\d{4})", text)
+    if m:
+        result["период_start"] = m.group(1)
+        result["период_end"] = m.group(2)
+    m = re.search(r"Баланс на начало периода\s*([\d,.\s]+)\s*RUB", text)
+    if m:
+        result["баланс_начало"] = m.group(1).strip()
+    m = re.search(r"Поступления\s*([\d,.\s]+)\s*RUB", text)
+    if m:
+        result["поступления"] = m.group(1).strip()
+    m = re.search(r"Расходные операции\s*([\d,.\s]+)\s*RUB", text)
+    if m:
+        result["расходные_операции"] = m.group(1).strip()
+    m = re.search(r"Баланс на конец периода\s*([\d,.\s]+)\s*RUB", text)
+    if m:
+        result["баланс_конец"] = m.group(1).strip()
+    return result
+
+
+def scan_vtb_block2(pdf_path: Path) -> list[dict[str, str]]:
+    """Извлечь операции (Блок 2) из выписки ВТБ."""
+    ops: list[dict[str, str]] = []
+    if fitz is None:
+        return ops
+    try:
+        doc = fitz.open(str(pdf_path))
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return ops
+    pat = re.compile(
+        r"(\d{2}\.\d{2}\.\d{4})\s*\n\s*"
+        r"(\d{2}:\d{2}:\d{2})\s+"
+        r"(\d{2}\.\d{2}\.\d{4})\s+"
+        r"([\d,.]+)\s+RUB\s+"
+        r"([\d,.]+)\s*\n\s*RUB\s*\n\s*"
+        r"(\d+)\s*\n\s*RUB\s*\n\s*"
+        r"([\d,.]+)\s+"
+        r"(.+?)(?=\n\d{2}\.\d{2}\.\d{4}|\nБаланс|\Z)",
+        re.DOTALL,
+    )
+    for m in pat.finditer(text):
+        ops.append({
+            "дата": m.group(1),
+            "время": m.group(2),
+            "сумма": m.group(4).strip(),
+            "сумма_зачисление": m.group(5).strip(),
+            "комиссия": m.group(6).strip(),
+            "комиссия_сумма": m.group(7).strip(),
+            "описание": m.group(8).strip()[:100],
+        })
+    if not ops:
+        simple_pat = re.compile(
+            r"(\d{2}\.\d{2}\.\d{4})\s+"
+            r"(\d{2}:\d{2}:\d{2})\s+.+?"
+            r"([\d,.]+)\s+RUB",
+            re.DOTALL,
+        )
+        for m in simple_pat.finditer(text):
+            ops.append({
+                "дата": m.group(1),
+                "время": m.group(2),
+                "сумма": m.group(3).strip(),
+                "сумма_зачисление": "0",
+                "комиссия": "0",
+                "описание": "",
+            })
+    return ops
+
+
 def patch_vtb_statement(
     in_path: Path,
     out_path: Path,
-    block1_changes: dict,
-    block2_changes: dict,
-    balance_params: dict,
+    replacements: list[tuple[str, str]],
 ) -> tuple[bool, str]:
-    """Заглушка: патч выписки ВТБ. Требует шаблон vtb_template.pdf."""
-    vtb_tpl = Path(__file__).parent / "база_выписок" / "vtb_template.pdf"
-    if not vtb_tpl.exists():
-        return False, "Шаблон выписки ВТБ не найден (база_выписок/vtb_template.pdf)"
-    return False, "Патчинг выписки ВТБ в разработке — добавьте шаблон и повторите."
+    """Patch VTB statement PDF using CID replacements."""
+    if not in_path.exists():
+        return False, f"Файл не найден: {in_path}"
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from cid_patch_amount import patch_replacements
+        if replacements:
+            patch_replacements(in_path, out_path, replacements)
+        else:
+            import shutil
+            shutil.copy2(in_path, out_path)
+        return True, ""
+    except Exception as e:
+        return False, str(e)

@@ -2,9 +2,9 @@
 """Сервис для создания/редактирования выписок Альфа-Банка.
 
 Блоковая структура:
-  Блок 1 (Операции): транзакции — суммы, телефон, код, описание
-  Блок 2 (Сводка): входящий/исходящий остатки, поступления, расходы
-  Блок 3 (Реквизиты): номер счёта, ФИО клиента, адрес
+  Блок 1 (Информация о счёте): номер счёта, ФИО клиента, адрес
+  Блок 2 (Операции): транзакции — суммы, телефон, код, описание
+  Блок 3 (Баланс счёта): входящий/исходящий остатки, поступления, расходы
 """
 from __future__ import annotations
 
@@ -659,29 +659,13 @@ def _update_xref(data: bytearray, stream_start: int, delta: int) -> None:
 
 # ── Convenience: format blocks for display ────────────────────────────────
 
-def format_block2(vals: dict | None = None) -> str:
-    """Format Block 2 for Telegram display."""
-    v = dict(BLOCK2_DEFAULTS)
-    if vals:
-        v.update(vals)
-    return (
-        f"📊 Блок 2 — Сводка\n"
-        f"├ Входящий остаток: {v['входящий_остаток']} RUR\n"
-        f"├ Поступления: {v['поступления']} RUR\n"
-        f"├ Расходы: {v['расходы']} RUR\n"
-        f"├ Исходящий остаток: {v['исходящий_остаток']} RUR\n"
-        f"├ Платежный лимит: {v['платежный_лимит']} RUR\n"
-        f"└ Текущий баланс: {v['текущий_баланс']} RUR"
-    )
-
-
-def format_block3(vals: dict | None = None) -> str:
-    """Format Block 3 for Telegram display."""
+def format_block1(vals: dict | None = None) -> str:
+    """Format Block 1 — Информация о счёте (Реквизиты)."""
     v = dict(BLOCK3_DEFAULTS)
     if vals:
         v.update(vals)
     return (
-        f"👤 Блок 3 — Реквизиты\n"
+        f"📋 Блок 1 — Информация о счёте\n"
         f"├ Счёт: {v['номер_счета']}\n"
         f"├ Клиент: {v['клиент_имя']}\n"
         f"├ Отчество: {v['клиент_отчество']}\n"
@@ -691,17 +675,33 @@ def format_block3(vals: dict | None = None) -> str:
     )
 
 
-def format_block1(vals: dict | None = None) -> str:
-    """Format Block 1 for Telegram display."""
+def format_block2(vals: dict | None = None) -> str:
+    """Format Block 2 — Операции."""
     v = dict(BLOCK1_DEFAULTS)
     if vals:
         v.update(vals)
     return (
-        f"💳 Блок 1 — Операции\n"
+        f"💳 Блок 2 — Операции\n"
         f"├ Код (расход): {v['код_операции_расход']}\n"
         f"├ Телефон: {v['телефон']}{v['телефон_окончание']}\n"
         f"├ Сумма расхода: -{v['сумма_расход']} RUR\n"
         f"├ Код (приход): {v['код_операции_приход']}\n"
         f"├ Получатель: {v['получатель_сокр']}\n"
-        f"└ Сумма прихода: {v['сумма_приход']} RUR (жирный)"
+        f"└ Сумма прихода: {v['сумма_приход']} RUR"
+    )
+
+
+def format_block3(vals: dict | None = None) -> str:
+    """Format Block 3 — Баланс счёта."""
+    v = dict(BLOCK2_DEFAULTS)
+    if vals:
+        v.update(vals)
+    return (
+        f"📊 Блок 3 — Баланс счёта\n"
+        f"├ Входящий остаток: {v['входящий_остаток']} RUR\n"
+        f"├ Поступления: {v['поступления']} RUR\n"
+        f"├ Расходы: {v['расходы']} RUR\n"
+        f"├ Исходящий остаток: {v['исходящий_остаток']} RUR\n"
+        f"├ Платежный лимит: {v['платежный_лимит']} RUR\n"
+        f"└ Текущий баланс: {v['текущий_баланс']} RUR"
     )
