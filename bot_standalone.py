@@ -1186,6 +1186,12 @@ def _sw_send_step(token: str, chat_id: int, state: dict, tg_req) -> None:
                 new_phone_flat = new_phone.replace("\n", "")
                 if old_phone_flat:
                     auto = auto.replace(old_phone_flat, new_phone_flat)
+                # Re-insert line break: last 2 digits of phone go to next line (PDF layout)
+                if new_phone_flat and len(new_phone_flat) >= 2 and new_phone_flat in auto:
+                    auto = auto.replace(
+                        new_phone_flat,
+                        new_phone_flat[:-2] + "\n" + new_phone_flat[-2:],
+                    )
                 if auto != flat:
                     state["_auto_desc"] = auto
                     kb.insert(0, [{"text": "✅ Подставить автозначение", "callback_data": "sw_auto_desc"}])

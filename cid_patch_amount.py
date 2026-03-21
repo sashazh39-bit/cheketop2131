@@ -31,20 +31,46 @@ def patch_replacements(
         return False
 
     flat_replacements = []
+    # Anchored pairs: (anchor_text, target_old, target_new, parent)
+    # Used when the first line of a multiline pair is unchanged (acts as context anchor).
+    # Only the target (line 1+) is replaced, and only when it follows the anchor in the stream.
+    anchored_pairs = []
     for old_val, new_val in replacements:
         if "\n" in old_val:
             old_lines = old_val.split("\n")
             new_lines = new_val.split("\n")
-            for i, old_line in enumerate(old_lines):
-                new_line = new_lines[i] if i < len(new_lines) else ""
-                if old_line and old_line != new_line:
-                    flat_replacements.append((old_line, new_line, old_val))
+            if old_lines[0] == (new_lines[0] if new_lines else ""):
+                # Line 0 is the unchanged anchor; handle line 1 as anchored, rest as flat
+                if len(old_lines) >= 2:
+                    ol1 = old_lines[1]
+                    nl1 = new_lines[1] if len(new_lines) > 1 else ""
+                    if ol1 and ol1 != nl1:
+                        anchored_pairs.append((old_lines[0], ol1, nl1, old_val))
+                for i in range(2, len(old_lines)):
+                    ol = old_lines[i]
+                    nl = new_lines[i] if i < len(new_lines) else ""
+                    if ol and ol != nl:
+                        flat_replacements.append((ol, nl, old_val))
+            else:
+                # Both lines change — original flat behavior for all lines
+                for i, old_line in enumerate(old_lines):
+                    new_line = new_lines[i] if i < len(new_lines) else ""
+                    if old_line and old_line != new_line:
+                        flat_replacements.append((old_line, new_line, old_val))
         else:
             flat_replacements.append((old_val, new_val, None))
 
     required_chars = set()
     for _old, new_val, _parent in flat_replacements:
         for c in new_val:
+            cp = ord(c)
+            if cp == 0x20:
+                required_chars.add(0x20)
+                required_chars.add(0xA0)
+            elif cp >= 0x20:
+                required_chars.add(cp)
+    for _anchor, _told, tnew, _parent in anchored_pairs:
+        for c in tnew:
             cp = ord(c)
             if cp == 0x20:
                 required_chars.add(0x20)
@@ -66,6 +92,8 @@ def patch_replacements(
         if b"BT" not in dec:
             continue
         streams.append((stream_start, stream_len, m.start(2), dec))
+
+    _ANCHOR_WINDOW = 2048
 
     mods: list[tuple[int, int, int, bytes, bytes]] = []
     total_replaced = 0
@@ -95,6 +123,36 @@ def patch_replacements(
                 short_old = display[:50].replace("\n", "\\n")
                 short_new = new_val[:50].replace("\n", "\\n")
                 print(f"[OK] {short_old} -> {short_new}")
+
+        # Anchored replacements: replace target only when it follows anchor in stream
+        for anchor_text, target_old, target_new, parent in anchored_pairs:
+            a_hex = _find_old_hex(anchor_text, uni_to_cid, new_dec)
+            t_hex = _find_old_hex(target_old, uni_to_cid, new_dec)
+            if not a_hex or not t_hex:
+                continue
+            n_hex = _encode_cid(target_new, uni_to_cid)
+            if not n_hex:
+                continue
+            is_inner = not t_hex.startswith(b"<")
+            if is_inner:
+                n_hex = n_hex[1:-1]
+            is_lower = any(c in b'abcdef' for c in t_hex)
+            if is_lower:
+                n_hex = n_hex.lower()
+            anchor_pos = new_dec.find(a_hex)
+            if anchor_pos < 0:
+                continue
+            search_start = anchor_pos + len(a_hex)
+            search_end = min(search_start + _ANCHOR_WINDOW, len(new_dec))
+            t_pos = new_dec.find(t_hex, search_start, search_end)
+            if t_pos >= 0:
+                new_dec = new_dec[:t_pos] + n_hex + new_dec[t_pos + len(t_hex):]
+                total_replaced += 1
+                display = parent or target_old
+                if display not in logged_parents:
+                    logged_parents.add(display)
+                    print(f"[OK] {display[:50].replace(chr(10), '\\\\n')} (anchored) -> {target_new[:50]}")
+
         if new_dec != dec:
             orig_raw = bytes(data[stream_start : stream_start + stream_len])
             level = _detect_zlib_level(orig_raw)
