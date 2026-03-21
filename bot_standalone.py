@@ -93,39 +93,34 @@ ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен
 
 MAIN_MENU_TEXT = (
     "👋 Главная\n\n"
-    "📄 Загрузить чек — отправьте PDF и измените сумму/ФИО.\n"
-    "✨ Сгенерировать — чек из базы без загрузки.\n"
-    "📋 Создать выписку — редактирование или по чеку.\n"
-    "📂 Проверка базы — просмотр и добавление чеков-доноров.\n"
-    "📋 Заявки — просмотр и смена статусов."
+    "📁 Чек — загрузить PDF или сгенерировать чек из базы.\n"
+    "📋 Создать выписку — редактирование, по чеку или с нуля.\n"
+    "📂 База — просмотр и добавление шаблонов.\n"
+    "📝 Последние изменения — что нового."
 )
 MAIN_MENU_KB = [
-    [{"text": "📄 Загрузить чек", "callback_data": "main_new"}],
-    [{"text": "✨ Сгенерировать", "callback_data": "main_generate"}],
+    [{"text": "📁 Чек", "callback_data": "main_check"}],
     [{"text": "📋 Создать выписку", "callback_data": "main_stmt"}],
-    [{"text": "📂 Проверка базы", "callback_data": "main_db"}],
-    [{"text": "📋 Заявки", "callback_data": "main_zayavki"}],
+    [{"text": "📂 База", "callback_data": "main_db"}],
     [{"text": "📝 Последние изменения", "callback_data": "main_changelog"}],
 ]
 
 CHANGELOG_TEXT = (
     "📝 Последние изменения\n\n"
-    "• 🏦 Выписка Альфа-Банк — блоковое редактирование выписки. "
-    "3 блока: Операции, Сводка (авто-расчёт), Реквизиты. "
-    "Автозаполнение из чека, проверка доступных символов в шрифте. "
-    "Побайтовый CID-патчинг с сохранением структуры и выравнивания.\n\n"
-    "• 🌍 ВТБ Трансгран (UZS) — режим для трансграничных чеков ВТБ. "
-    "Замена суммы, телефона, даты. Зачисление считается автоматически (сумма × курс). "
-    "Сохраняет структуру PDF, правильное выравнивание, меняет Document ID.\n\n"
-    "• 🌐 Альфа Трансгран — режим для трансграничных чеков Альфа-Банка. "
-    "Замена суммы, комиссии, курса, имени, телефона и номера операции. "
-    "Сохраняет структуру, меняет Document ID.\n\n"
-    "• Система заявок — после создания чека можно оформить заявку. "
-    "В разделе «Заявки» — список, нажмите на заявку и выберите статус: В работе или Оплачено.\n\n"
-    "• Полная замена ВТБ — режим «Все поля»: замена суммы, даты, ФИО плательщика/получателя, телефона и банка. "
-    "Замена ФИО и банка пока может работать некорректно.\n\n"
-    "• Автозамена ё→е, ‑→- — при вводе ФИО/телефона/банка символы заменяются автоматически, если structurally всё ок.\n\n"
-    "• Проверка базы — кнопка «Обновить индекс» для пересборки после ручного добавления чеков."
+    "• Масштабный рефакторинг навигации:\n"
+    "  — Кнопки «Загрузить чек» и «Сгенерировать чек» объединены под «Чек».\n"
+    "  — Раздел переименован: «Проверка базы» → «База».\n"
+    "  — Убраны «Заявки» и кнопки «Тест»/«Заявка» после генерации.\n\n"
+    "• Выбор банка — новый UI:\n"
+    "  — Альфа Чек | ВТБ в два столбца, «Авто» снизу.\n"
+    "  — У каждого банка своё суб-меню: только сумма / все поля / трансгран.\n\n"
+    "• Автодетект суммы — режим «только сумма» теперь сам определяет сумму из чека;\n"
+    "  пользователь вводит только новое значение. Комиссия сканируется автоматически.\n\n"
+    "• Авто — любой банк: свободный формат замен (СТАРОЕ = НОВОЕ) без привязки к банку.\n\n"
+    "• Выписки — новое меню Альфа / ВТБ с тремя вариантами каждого:\n"
+    "  Редактирование своей / По чеку / Создание с нуля.\n\n"
+    "• Исправлен баг: после генерации нажатие «Главная» больше не ломает навигацию.\n\n"
+    "• База теперь показывает и шаблоны выписок."
 )
 
 ZAYAVKI_DIR = Path(__file__).parent / "заявки"
@@ -360,6 +355,159 @@ def parse_custom_replacement(text: str) -> tuple[str, str] | None:
         k, _, v = text.partition("=")
         return (k.strip().lower(), v.strip()) if k.strip() and v.strip() else None
     return None
+
+
+def _increment_filename(stem: str) -> str:
+    """Увеличить последнюю цифру в имени файла на 1. check3 → check4, abc → abc2."""
+    m = re.search(r'(\d+)(\D*)$', stem)
+    if m:
+        num = int(m.group(1)) + 1
+        return stem[:m.start(1)] + str(num) + m.group(2)
+    return stem + "2"
+
+
+def extract_commission_from_pdf(pdf_path: str) -> int | None:
+    """Извлечь комиссию из PDF-чека. Вернуть сумму в рублях или None."""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return None
+    patterns = [
+        r'[Кк]омиссия[^\d]*?([\d\s]+)[,\.](\d{2})',
+        r'[Кк]омиссия[^\d]*?([\d\s]+)\s*(?:₽|руб|RUR|RUB)',
+        r'Commission[^\d]*?([\d\s]+)[,\.](\d{2})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            raw = m.group(1).replace(' ', '').replace('\xa0', '')
+            try:
+                val = int(raw)
+                return val
+            except ValueError:
+                pass
+    return None
+
+
+def parse_auto_replacements(text: str) -> list[tuple[str, str]]:
+    """Разобрать пары замен формата (старое = новое) или старое=новое."""
+    pairs = re.findall(r'\(([^)]+?)\s*=\s*([^)]+?)\)', text)
+    if pairs:
+        return [(a.strip(), b.strip()) for a, b in pairs]
+    # Fallback: строки вида ключ=значение
+    result = []
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if '=' in line and not line.startswith('#'):
+            k, _, v = line.partition('=')
+            k, v = k.strip(), v.strip()
+            if k and v:
+                result.append((k, v))
+    return result
+
+
+def _send_main_menu_button(token: str, chat_id: int, tg_req) -> None:
+    """Отправить кнопку «Главное меню» после генерации."""
+    tg_req(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": "✅ Готово! Нажмите для возврата:",
+        "reply_markup": json.dumps({
+            "inline_keyboard": [[{"text": "🏠 Главное меню", "callback_data": "main_back"}]],
+        }),
+    })
+
+
+def _do_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Выполнить патч суммы (и опционально комиссии) и отправить PDF."""
+    inp = state["file_path"]
+    bank = state["bank"]
+    amount_from = state.get("current_amount") or 0
+    amount_to = state["amount_to"]
+    out_stem = _increment_filename(Path(state["file_name"]).stem)
+    out_name = out_stem + ".pdf"
+
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+    try:
+        commission_from = state.get("current_commission") or 0
+        commission_to = state.get("commission_to")
+        data = bytearray(Path(inp).read_bytes())
+
+        if bank == "vtb":
+            try:
+                out_bytes = bytes(patch_amount_only(data, Path(inp), amount_to))
+            except Exception:
+                ok_sum, err_sum, new_data = pdf_patch_amount(data, amount_from, amount_to, bank="vtb")
+                if not ok_sum or new_data is None:
+                    try:
+                        os.unlink(inp)
+                    except OSError:
+                        pass
+                    del USER_STATE[uid]
+                    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Сумма не найдена в чеке. {err_sum or ''}"})
+                    _send_main_menu_button(token, chat_id, tg_req)
+                    return
+                out_bytes = new_data
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                out_path_tmp = tf.name
+            ok, err = patch_pdf_file(inp, out_path_tmp, amount_from, amount_to, bank=bank)
+            if not ok:
+                try:
+                    os.unlink(inp)
+                    os.unlink(out_path_tmp)
+                except OSError:
+                    pass
+                del USER_STATE[uid]
+                tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
+                _send_main_menu_button(token, chat_id, tg_req)
+                return
+            out_bytes = Path(out_path_tmp).read_bytes()
+            try:
+                os.unlink(out_path_tmp)
+            except OSError:
+                pass
+
+        # Комиссия
+        if commission_to is not None and commission_from > 0:
+            try:
+                from cid_patch_amount import patch_replacements
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                    comm_path = tf.name
+                Path(comm_path).write_bytes(out_bytes)
+                old_c = str(commission_from)
+                new_c = str(commission_to)
+                if patch_replacements(Path(comm_path), Path(comm_path), [(old_c, new_c)]):
+                    out_bytes = Path(comm_path).read_bytes()
+                try:
+                    os.unlink(comm_path)
+                except OSError:
+                    pass
+            except Exception:
+                pass
+
+        try:
+            os.unlink(inp)
+        except OSError:
+            pass
+        del USER_STATE[uid]
+        am_from_disp = format_amount_display(amount_from) if amount_from else "?"
+        caption = f"✅ Готово: {am_from_disp} ₽ → {format_amount_display(amount_to)} ₽"
+        if commission_to is not None:
+            caption += f"\nКомиссия: {format_amount_display(commission_from)} → {format_amount_display(commission_to)} ₽"
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+        _send_main_menu_button(token, chat_id, tg_req)
+    except Exception as e:
+        try:
+            os.unlink(inp)
+        except OSError:
+            pass
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново."})
+        _send_main_menu_button(token, chat_id, tg_req)
 
 
 def run_check_caps(payer: str, recipient: str) -> tuple[bool, str]:
@@ -679,24 +827,7 @@ def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req)
         am_from = state.get("vtb_amount_from") or state.get("vtb_amount")
         caption = f"✅ Готово: {format_amount_display(am_from)} ₽ → {format_amount_display(state['vtb_amount'])} ₽"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
-        USER_STATE[uid] = {
-            "awaiting": "report_choice",
-            "amount_from": state.get("vtb_amount_from") or state.get("vtb_amount", 0),
-            "amount_to": state["vtb_amount"],
-            "bank": "vtb",
-            "pdf_name": out_name,
-        }
-        tg_req(token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "📋 Отчёт:",
-            "reply_markup": json.dumps({
-                "inline_keyboard": [
-                    [{"text": "Тест", "callback_data": "report_test"}],
-                    [{"text": "Заявка", "callback_data": "report_zayavka"}],
-                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-                ],
-            }),
-        })
+        _send_main_menu_button(token, chat_id, tg_req)
     except ValueError as e:
         send(f"❌ Ошибка: {e}")
     except Exception as e:
@@ -745,66 +876,6 @@ def _gen_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: str, 
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": prompt})
 
 
-def _do_gen_fio_check_and_continue(token: str, uid: int, chat_id: int, state: dict, send, next_step) -> None:
-    """Проверить ФИО (--check-caps), показать результат, перейти к настройке суммы."""
-    payer = state.get("gen_payer") or ""
-    recipient = state.get("gen_recipient") or ""
-    ok, output = run_check_caps(payer, recipient)
-    txt = "📋 Результат проверки ФИО:\n\n" + (output or "(пусто)")
-    send(txt[:4000])
-    next_step("gen_amount", "📝 Настройка.\n\n1️⃣ Сумма (например 10000):")
-
-
-def _gen_next_after_bank(state: dict, next_step) -> None:
-    """После ввода банка: для СБП — gen_account, для ВТБ на ВТБ — gen_operation_id."""
-    if state.get("gen_vtb_subtype") == "vtb_sbp":
-        next_step("gen_account", "6️⃣ Номер счёта (4 цифры, напр. 9426). Оставить пустым — из шаблона:")
-    else:
-        next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить или ввести:")
-
-
-def _run_sbp_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
-    """Сгенерировать чек СБП через add_glyphs_to_13_03.py."""
-    def send(txt: str):
-        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
-
-    amount = state.get("gen_amount") or 0
-    date_str = state.get("gen_date") or "now"
-    ok, pdf_bytes, err = run_sbp_generate(
-        payer=state.get("gen_payer") or "Иван Иванович И.",
-        recipient=state.get("gen_recipient") or "Иван Иванович И.",
-        amount=amount,
-        date_str=date_str,
-        bank=state.get("gen_bank") or "Т-Банк",
-        account=state.get("gen_account"),
-        operation_id=state.get("gen_operation_id"),
-    )
-    if not ok:
-        send(f"❌ Ошибка генерации: {err}")
-        return
-    out_name = f"чек_{format_amount_display(amount).replace(' ', '_')}.pdf"
-    del USER_STATE[uid]
-    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": f"✅ Сгенерировано: {format_amount_display(amount)} ₽"}, files={"document": (out_name, pdf_bytes)})
-    USER_STATE[uid] = {"awaiting": "report_choice", "amount_from": 0, "amount_to": amount, "bank": "vtb", "pdf_name": out_name}
-    tg_req(token, "sendMessage", {
-        "chat_id": chat_id,
-        "text": "📋 Отчёт:",
-        "reply_markup": json.dumps({
-            "inline_keyboard": [
-                [{"text": "Тест", "callback_data": "report_test"}],
-                [{"text": "Заявка", "callback_data": "report_zayavka"}],
-                [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-            ],
-        }),
-    })
-
-
-def _gen_next_after_bank(state: dict, next_step) -> None:
-    """После gen_bank: для vtb_sbp → gen_account, иначе → gen_operation_id."""
-    if state.get("gen_vtb_subtype") == "vtb_sbp":
-        next_step("gen_account", "6️⃣ Номер счёта (4 цифры, напр. 9426). Или «оставить»:")
-    else:
-        next_step("gen_operation_id", "7️⃣ ID операции (B606...). Оставить из чека или ввести свой:")
 
 
 def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
@@ -831,7 +902,7 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
         if missing:
             missing_sorted = sorted(missing)
             lines.append(f"❌ Не хватает букв ({len(missing)}): «{'» «'.join(missing_sorted)}»")
-        lines.append("Добавьте чеки в «Проверка базы» или замените буквы (ё→е, ‑→-).")
+        lines.append("Добавьте чеки в разделе «База» или замените буквы (ё→е, ‑→-).")
         send("\n".join(lines))
         del USER_STATE[uid]
         return
@@ -879,24 +950,7 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
         op_id = state.get("gen_operation_id") or get_operation_id_from_pdf(out_bytes)
         if op_id:
             tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"📋 ID операции (скопируйте при необходимости):\n{op_id}"})
-        USER_STATE[uid] = {
-            "awaiting": "report_choice",
-            "amount_from": amount_from or 0,
-            "amount_to": amount_to,
-            "bank": "vtb",
-            "pdf_name": out_name,
-        }
-        tg_req(token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "📋 Отчёт:",
-            "reply_markup": json.dumps({
-                "inline_keyboard": [
-                    [{"text": "Тест", "callback_data": "report_test"}],
-                    [{"text": "Заявка", "callback_data": "report_zayavka"}],
-                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-                ],
-            }),
-        })
+        _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
         send(f"❌ Ошибка: {e}")
         if uid in USER_STATE and state.get("gen_bank_type"):
@@ -943,24 +997,7 @@ def _run_sbp_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -
     del USER_STATE[uid]
     caption = f"✅ Сгенерировано: {format_amount_display(state['gen_amount'])} ₽"
     tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
-    USER_STATE[uid] = {
-        "awaiting": "report_choice",
-        "amount_from": 0,
-        "amount_to": state["gen_amount"],
-        "bank": "vtb",
-        "pdf_name": out_name,
-    }
-    tg_req(token, "sendMessage", {
-        "chat_id": chat_id,
-        "text": "📋 Отчёт:",
-        "reply_markup": json.dumps({
-            "inline_keyboard": [
-                [{"text": "Тест", "callback_data": "report_test"}],
-                [{"text": "Заявка", "callback_data": "report_zayavka"}],
-                [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-            ],
-        }),
-    })
+    _send_main_menu_button(token, chat_id, tg_req)
 
 
 def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
@@ -1676,12 +1713,11 @@ def _alfa_tg_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: s
     """Следующий шаг режима «Альфа Трансгран». Поля с кнопкой «Оставить текущим»."""
     KEEP_PROMPTS = {
         "at_amount": ("1️⃣ Сумма перевода (сейчас: {amount}):\nВведите новую сумму, напр. 3 036 RUR", "at_keep_amount"),
-        "at_commission": ("2️⃣ Комиссия (сейчас: {commission}):\nВведите новую, напр. 50 RUR", "at_keep_commission"),
-        "at_rate": ("3️⃣ Курс конвертации (сейчас: {rate}):\nВведите новый, напр. 1 RUR = 0.1130 TJS", "at_keep_rate"),
-        "at_credited": ("4️⃣ Сумма зачисления (сейчас: {credited}):\nВведите новую, напр. 343,06 TJS", "at_keep_credited"),
-        "at_phone": ("5️⃣ Телефон (сейчас: {phone}):", "at_keep_phone"),
-        "at_name": ("6️⃣ Получатель (сейчас: {name}):", "at_keep_name"),
-        "at_operation_id": ("7️⃣ Номер операции (сейчас: {operation_id}):", "at_keep_opid"),
+        "at_commission": ("2️⃣ Комиссия (сейчас: {commission}):\nВведите новую, напр. 50 RUR\n(комиссия не включается в зачисление)", "at_keep_commission"),
+        "at_rate": ("3️⃣ Курс конвертации (сейчас: {rate}):\nВведите новый, напр. 1 RUR = 0.1130 TJS\n✅ Зачисление будет рассчитано автоматически (сумма × курс)", "at_keep_rate"),
+        "at_phone": ("4️⃣ Телефон (сейчас: {phone}):", "at_keep_phone"),
+        "at_name": ("5️⃣ Получатель (сейчас: {name}):", "at_keep_name"),
+        "at_operation_id": ("6️⃣ Номер операции (сейчас: {operation_id}):", "at_keep_opid"),
     }
     state["awaiting"] = aw
     if aw in KEEP_PROMPTS:
@@ -1743,22 +1779,7 @@ def _run_alfa_transgran_patch(token: str, uid: int, chat_id: int, state: dict, t
         changes = [f"• {k}" for k in kwargs]
         caption = f"✅ Трансгран готов\n" + "\n".join(changes)
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, new_data)})
-        USER_STATE[uid] = {
-            "awaiting": "report_choice",
-            "amount_from": 0,
-            "amount_to": 0,
-            "bank": "alfa_transgran",
-            "pdf_name": out_name,
-        }
-        tg_req(token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "📋 Отчёт:",
-            "reply_markup": json.dumps({
-                "inline_keyboard": [
-                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-                ],
-            }),
-        })
+        _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
         send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
 
@@ -1802,14 +1823,32 @@ def _handle_alfa_sbp_input(token: str, uid: int, chat_id: int, text: str, tg_req
             last4 = last4[-4:]
             fields["account_last4"] = last4
         else:
-            fields[field_key] = t
+            # Check for unsupported chars, but continue anyway with warning
+            from vtb_cmap import get_unsupported_chars as _get_bad
+            bad = _get_bad(t)
+            if bad:
+                bad_str = ", ".join(f"«{c}»" for c in sorted(bad))
+                send(f"⚠️ Символы недоступны: {bad_str}. Поле будет пропущено. Продолжаем.")
+                # Don't save the value, continue to next step
+            else:
+                fields[field_key] = t
 
     step += 1
     state["alfa_sbp_step"] = step
 
     if step < len(field_list):
         _, prompt_next = field_list[step]
-        send(f"✅ Принято.\n\nШаг {step + 1}/{len(field_list)}: {prompt_next}\nОтправьте - чтобы пропустить.")
+        curr_key = field_list[step][0]
+        curr_val = state.get("alfa_sbp_current", {}).get(curr_key)
+        keep_hint = f"\n📌 Текущее: {curr_val}" if curr_val else ""
+        kb = [[{"text": f"⏭ Пропустить", "callback_data": f"alfa_sbp_skip_{step}"}]]
+        if curr_val:
+            kb[0].insert(0, {"text": f"📌 Оставить: {str(curr_val)[:20]}", "callback_data": f"alfa_sbp_keep_{step}"})
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"✅ Принято.\n\nШаг {step + 1}/{len(field_list)}: {prompt_next}{keep_hint}",
+            "reply_markup": json.dumps({"inline_keyboard": kb}),
+        })
     else:
         summary_lines = []
         for fk, label in field_list:
@@ -2019,22 +2058,7 @@ def _run_alfa_sbp_full_patch(token: str, uid: int, chat_id: int, state: dict, tg
         except OSError:
             pass
 
-        USER_STATE[uid] = {
-            "awaiting": "report_choice",
-            "amount_from": 0,
-            "amount_to": fields.get("amount", 0),
-            "bank": "alfa_sbp_full",
-            "pdf_name": out_name,
-        }
-        tg_req(token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "📋 Отчёт:",
-            "reply_markup": json.dumps({
-                "inline_keyboard": [
-                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-                ],
-            }),
-        })
+        _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -2060,11 +2084,11 @@ def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, 
 
     skip_words = ("оставить", "текущим", "оставить текущим", "пропустить", "-", "=")
 
+    # Примечание: at_credited рассчитывается автоматически (сумма × курс) — шаг пропускается
     FLOW = [
         ("at_amount",       "at_commission"),
         ("at_commission",   "at_rate"),
-        ("at_rate",         "at_credited"),
-        ("at_credited",     "at_phone"),
+        ("at_rate",         "at_phone"),   # at_credited вычисляется автоматически
         ("at_phone",        "at_name"),
         ("at_name",         "at_operation_id"),
         ("at_operation_id", None),
@@ -2078,6 +2102,20 @@ def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, 
             state[step_aw] = None
         else:
             state[step_aw] = t
+        # После ввода курса — автоматически вычислить зачисление
+        if step_aw == "at_rate" and state.get("at_rate"):
+            fields = state.get("at_fields", {})
+            try:
+                rate_str = state["at_rate"]
+                amount_str = state.get("at_amount") or fields.get("amount", "")
+                rate_val, currency = parse_rate(rate_str)
+                from decimal import Decimal
+                amount_num = Decimal(re.sub(r"[^\d.,]", "", amount_str.replace(",", ".")))
+                credited_val = amount_num * rate_val
+                state["at_credited"] = format_credited(credited_val, currency)
+                send(f"✅ Зачисление авто: {state['at_credited']} (сумма × курс, без комиссии)")
+            except Exception:
+                state["at_credited"] = None
         if next_aw:
             next_step(next_aw)
         else:
@@ -2174,22 +2212,7 @@ def _run_vtb_transgran_patch(token: str, uid: int, chat_id: int, state: dict, tg
 
         caption = "✅ ВТБ Трансгран готов\n" + "\n".join(summary_lines)
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, new_data)})
-        USER_STATE[uid] = {
-            "awaiting": "report_choice",
-            "amount_from": 0,
-            "amount_to": kwargs.get("amount", 0),
-            "bank": "vtb_transgran",
-            "pdf_name": out_name,
-        }
-        tg_req(token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "📋 Отчёт:",
-            "reply_markup": json.dumps({
-                "inline_keyboard": [
-                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-                ],
-            }),
-        })
+        _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
         send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
 
@@ -2342,24 +2365,6 @@ def run_bot(token: str) -> None:
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": txt, "reply_markup": json.dumps(kb)})
                         continue
 
-                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "report_choice":
-                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "📋 Нажмите кнопку «Тест» или «Заявка» выше."})
-                        continue
-                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "zayavka_description":
-                        state = USER_STATE[uid]
-                        description = text or "(без описания)"
-                        username = msg.get("from", {}).get("username", "") or msg.get("from", {}).get("first_name", "")
-                        fp = save_zayavka(
-                            uid, username,
-                            state["amount_from"], state["amount_to"], state["bank"], state["pdf_name"],
-                            description,
-                        )
-                        del USER_STATE[uid]
-                        if fp:
-                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "✅ Заявка сохранена."})
-                        else:
-                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "⚠️ Ошибка сохранения. Заявка не записана."})
-                        continue
 
                     if "document" in msg:
                         doc = msg["document"]
@@ -2490,17 +2495,14 @@ def run_bot(token: str) -> None:
                         USER_STATE[uid] = {"file_path": path, "file_name": fname}
                         tg_request(token, "sendMessage", {
                             "chat_id": msg["chat"]["id"],
-                            "text": "📎 Чек получен. Выберите банк:\n\n• Альфа-Банк / ВТБ / Авто — замена только суммы\n• Альфа СБП (все поля) — сумма, дата, получатель, телефон, банк, счёт",
+                            "text": "📎 Чек получен. Выберите банк:",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [
-                                        {"text": "🏦 Альфа-Банк", "callback_data": "bank_alfa"},
-                                        {"text": "🏛 ВТБ", "callback_data": "bank_vtb"},
+                                        {"text": "🏦 Альфа Чек", "callback_data": "bank_alfa_sub"},
+                                        {"text": "🏛 ВТБ", "callback_data": "bank_vtb_sub"},
                                     ],
-                                    [{"text": "🏦 Альфа СБП (все поля)", "callback_data": "bank_alfa_sbp_full"}],
-                                    [{"text": "🌐 Альфа Трансгран", "callback_data": "bank_alfa_transgran"}],
-                                    [{"text": "🌍 ВТБ Трансгран (UZS)", "callback_data": "bank_vtb_transgran"}],
-                                    [{"text": "🔍 Авто", "callback_data": "bank_auto"}],
+                                    [{"text": "🔍 Авто — любой банк", "callback_data": "bank_auto_free"}],
                                     [{"text": "❌ Отмена", "callback_data": "cancel"}],
                                 ],
                             }),
@@ -2542,123 +2544,89 @@ def run_bot(token: str) -> None:
                         _handle_gen_input(token, uid, chat_id, text, msg, tg_request)
                         continue
 
-                    if uid in USER_STATE and "bank" in USER_STATE[uid]:
-                        parsed = parse_amounts(text)
-                        if not parsed:
-                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Неверный формат. Введите две суммы, например: 10 5000"})
-                            continue
-                        amount_from, amount_to = parsed
-                        if amount_from <= 0 or amount_to <= 0:
-                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Суммы должны быть больше 0."})
-                            continue
-                        chat_id = msg["chat"]["id"]
+                    # Авто-режим: пользователь вводит пары замен (старое = новое)
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "auto_replacements":
                         state = USER_STATE[uid]
-                        inp = state["file_path"]
-                        bank = state["bank"]
-                        out_name = Path(state["file_name"]).stem + f"_{format_amount_display(amount_to).replace(' ', '_')}.pdf"
-
-                        # ВТБ «Только сумма»: patch_amount_only выравнивает по wall.
-                        # pdf_patcher не пересчитывает Tm для kern -11.11111 → сумма смещается вправо.
-                        if bank == "vtb" and state.get("vtb_mode") == "amount":
-                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
-                            try:
-                                print(f"  Патч ВТБ (только сумма) {amount_from}→{amount_to}...", end=" ", flush=True)
-                                data = bytearray(Path(inp).read_bytes())
-                                try:
-                                    out_bytes = bytes(patch_amount_only(data, Path(inp), amount_to))
-                                except Exception:
-                                    ok_sum, err_sum, new_data = pdf_patch_amount(data, amount_from, amount_to, bank="vtb")
-                                    if not ok_sum or new_data is None:
-                                        del USER_STATE[uid]
-                                        try:
-                                            os.unlink(inp)
-                                        except OSError:
-                                            pass
-                                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Сумма не найдена. В чеке должна быть {format_amount_display(amount_from)} ₽. {err_sum or ''}"})
-                                        continue
-                                    out_bytes = new_data
-                                try:
-                                    os.unlink(inp)
-                                except OSError:
-                                    pass
-                                del USER_STATE[uid]
-                                print("отправляю...", end=" ", flush=True)
-                                caption = f"✅ Готово: {format_amount_display(amount_from)} ₽ → {format_amount_display(amount_to)} ₽"
-                                tg_request(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
-                                print("готово")
-                                USER_STATE[uid] = {
-                                    "awaiting": "report_choice",
-                                    "amount_from": amount_from,
-                                    "amount_to": amount_to,
-                                    "bank": bank,
-                                    "pdf_name": out_name,
-                                }
-                                tg_request(token, "sendMessage", {
-                                    "chat_id": chat_id,
-                                    "text": "📋 Отчёт:",
-                                    "reply_markup": json.dumps({
-                                        "inline_keyboard": [
-                                            [{"text": "Тест", "callback_data": "report_test"}],
-                                            [{"text": "Заявка", "callback_data": "report_zayavka"}],
-                                            [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-                                        ],
-                                    }),
-                                })
-                            except Exception as e:
-                                print("ошибка:", e)
-                                tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново."})
+                        pairs = parse_auto_replacements(text)
+                        if not pairs:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Не найдено пар замен.\nФормат: (старое = новое)\nНапример: (10 RUR = 10 000 RUR)"})
                             continue
-
-                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+                        inp = state["file_path"]
+                        out_stem = _increment_filename(Path(state["file_name"]).stem)
+                        out_name = out_stem + ".pdf"
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"⏳ Применяю {len(pairs)} замен(ы)..."})
                         try:
-                            print(f"  Патч {amount_from}→{amount_to} ({bank})...", end=" ", flush=True)
+                            from cid_patch_amount import patch_replacements
                             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
                                 out_path = tf.name
-                            ok, err = patch_pdf_file(inp, out_path, amount_from, amount_to, bank=bank)
+                            ok = patch_replacements(Path(inp), Path(out_path), pairs)
                             try:
                                 os.unlink(inp)
                             except OSError:
                                 pass
                             del USER_STATE[uid]
-                            if not ok:
-                                print("не найден")
-                                tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
+                            if ok:
+                                with open(out_path, "rb") as f:
+                                    pdf_bytes = f.read()
                                 try:
                                     os.unlink(out_path)
                                 except OSError:
                                     pass
-                                continue
-                            with open(out_path, "rb") as f:
-                                pdf_bytes = f.read()
-                            try:
-                                os.unlink(out_path)
-                            except OSError:
-                                pass
-                            print("отправляю...", end=" ", flush=True)
-                            caption = f"✅ Готово: {format_amount_display(amount_from)} ₽ → {format_amount_display(amount_to)} ₽"
-                            tg_request(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
-                            print("готово")
-                            USER_STATE[uid] = {
-                                "awaiting": "report_choice",
-                                "amount_from": amount_from,
-                                "amount_to": amount_to,
-                                "bank": bank,
-                                "pdf_name": out_name,
-                            }
+                                summary = "\n".join(f"  {a} → {b}" for a, b in pairs[:5])
+                                if len(pairs) > 5:
+                                    summary += f"\n  ... и ещё {len(pairs)-5}"
+                                caption = f"✅ Авто-замены:\n{summary}\n\n⚠️ Режим Авто не гарантирует прохождение проверки."
+                                tg_request(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
+                            else:
+                                try:
+                                    os.unlink(out_path)
+                                except OSError:
+                                    pass
+                                tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Не удалось применить замены. Проверьте что значения совпадают с текстом в PDF."})
+                        except Exception as e:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+                        _send_main_menu_button(token, chat_id, tg_request)
+                        continue
+
+                    # Новый ввод суммы: только новое значение (auto-detect текущего)
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "amount_new_only":
+                        state = USER_STATE[uid]
+                        nums = re.findall(r"\d+", text.strip())
+                        if not nums:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите новую сумму числом (например: 5000)"})
+                            continue
+                        amount_to = int("".join(nums))
+                        if amount_to <= 0:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Сумма должна быть больше 0."})
+                            continue
+                        state["amount_to"] = amount_to
+                        commission = state.get("current_commission")
+                        if commission and commission > 0:
+                            state["awaiting"] = "amount_commission"
                             tg_request(token, "sendMessage", {
                                 "chat_id": chat_id,
-                                "text": "📋 Отчёт:",
-                                "reply_markup": json.dumps({
-                                    "inline_keyboard": [
-                                        [{"text": "Тест", "callback_data": "report_test"}],
-                                        [{"text": "Заявка", "callback_data": "report_zayavka"}],
-                                        [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
-                                    ],
-                                }),
+                                "text": f"💳 Обнаружена комиссия: {format_amount_display(commission)} ₽\nВведите новую комиссию или — чтобы пропустить:",
+                                "reply_markup": json.dumps({"inline_keyboard": [[{"text": "— Пропустить", "callback_data": "amount_skip_commission"}]]}),
                             })
-                        except Exception as e:
-                            print("ошибка:", e)
-                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново."})
+                        else:
+                            _do_amount_patch(token, uid, chat_id, state, tg_request)
+                        continue
+
+                    # Ввод новой комиссии
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "amount_commission":
+                        state = USER_STATE[uid]
+                        t = text.strip()
+                        if t in ("-", "—", "пропустить", "skip"):
+                            state["commission_to"] = None
+                        else:
+                            nums = re.findall(r"\d+", t)
+                            state["commission_to"] = int("".join(nums)) if nums else None
+                        _do_amount_patch(token, uid, chat_id, state, tg_request)
+                        continue
+
+                    if uid in USER_STATE and "bank" in USER_STATE[uid]:
+                        # Fallback: legacy "FROM TO" format (shouldn't normally reach here)
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите новую сумму (одно число, например: 5000)."})
                         continue
 
                     if uid in USER_STATE:
@@ -2676,6 +2644,22 @@ def run_bot(token: str) -> None:
                     if _ALLOWED_IDS and uid not in _ALLOWED_IDS:
                         tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
                         continue
+                    if q["data"] == "main_check":
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "📁 Чек\n\nЗагрузите PDF или сгенерируйте из базы:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [
+                                        {"text": "📄 Загрузить чек", "callback_data": "main_new"},
+                                        {"text": "✨ Сгенерировать чек", "callback_data": "main_generate"},
+                                    ],
+                                    [{"text": "⬅️ Назад", "callback_data": "main_back"}],
+                                ],
+                            }),
+                        })
+                        continue
                     if q["data"] == "main_generate":
                         USER_STATE[uid] = {"awaiting": "gen_type", "gen_transfer_type": None, "gen_bank_type": None}
                         tg_request(token, "editMessageText", {
@@ -2691,7 +2675,7 @@ def run_bot(token: str) -> None:
                                     [{"text": "📱 Перевод по СБП", "callback_data": "gen_type_sbp"}],
                                     [{"text": "💳 По номеру карты (скоро)", "callback_data": "gen_type_card"}],
                                     [{"text": "🌐 Трансгран (скоро)", "callback_data": "gen_type_transgran"}],
-                                    [{"text": "⬅️ Назад", "callback_data": "main_back"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "main_check"}],
                                 ],
                             }),
                         })
@@ -2701,18 +2685,40 @@ def run_bot(token: str) -> None:
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": (
-                                "✨ Перевод по СБП\n\n"
-                                "Выберите тип чека:"
-                            ),
+                            "text": "✨ Перевод по СБП\n\nВыберите тип чека:",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
-                                    [{"text": "📱 СБП", "callback_data": "gen_subtype_sbp"}],
+                                    [
+                                        {"text": "🏛 ВТБ СБП", "callback_data": "gen_subtype_sbp"},
+                                        {"text": "🏦 Альфа СБП", "callback_data": "gen_subtype_alfa_sbp"},
+                                    ],
                                     [{"text": "🏛 ВТБ на ВТБ", "callback_data": "gen_subtype_vtb_vtb"}],
                                     [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
                                 ],
                             }),
                         })
+                        continue
+                    if q["data"] == "gen_subtype_alfa_sbp":
+                        # Проверяем базу Альфа
+                        alfa_base = _BOT_DIR / "база_чеков" / "alfa"
+                        alfa_files = list(alfa_base.glob("*.pdf")) if alfa_base.exists() else []
+                        if not alfa_files:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": "⚠️ База Альфа пуста.\n\nДобавьте донорские чеки Альфа-Банк через раздел «База».",
+                                "reply_markup": json.dumps({"inline_keyboard": [
+                                    [{"text": "📂 Открыть Базу", "callback_data": "main_db"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "gen_type_sbp"}],
+                                ]}),
+                            })
+                        else:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": f"🏦 Альфа СБП\n\nВ базе {len(alfa_files)} чек(ов).\n⚠️ Функция генерации Альфа СБП в разработке.",
+                                "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "gen_type_sbp"}]]}),
+                            })
                         continue
                     if q["data"] == "gen_subtype_sbp":
                         USER_STATE[uid] = {"awaiting": "gen_bank", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": "vtb_sbp"}
@@ -2720,14 +2726,14 @@ def run_bot(token: str) -> None:
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
                             "text": (
-                                "✨ СБП\n\n"
+                                "✨ ВТБ СБП\n\n"
                                 f"{VTB_UNSUPPORTED_NOTICE}\n\n"
-                                "Выберите банк (пока только ВТБ):"
+                                "Выберите банк:"
                             ),
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [{"text": "🏛 ВТБ", "callback_data": "gen_bank_vtb"}],
-                                    [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "gen_type_sbp"}],
                                 ],
                             }),
                         })
@@ -2763,12 +2769,20 @@ def run_bot(token: str) -> None:
                     if q["data"] == "main_db":
                         counts = get_bank_counts()
                         n_sbp, n_vtb, n_alfa = counts["vtb_sbp"], counts["vtb_vtb_vtb"], counts["alfa"]
+                        # Подсчёт шаблонов выписок
+                        stmt_base = _BOT_DIR / "база_выписок"
+                        n_alfa_stmt = len(list(stmt_base.glob("*.pdf"))) if stmt_base.exists() else 0
+                        vtb_tpl = stmt_base / "vtb_template.pdf"
+                        n_vtb_stmt = 1 if vtb_tpl.exists() else 0
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
                             "text": (
-                                f"📂 Проверка базы\n\n"
-                                f"СБП: {n_sbp} | ВТБ на ВТБ: {n_vtb} | Альфа: {n_alfa}\n\n"
+                                f"📂 База\n\n"
+                                f"Чеки:\n"
+                                f"  СБП: {n_sbp} | ВТБ→ВТБ: {n_vtb} | Альфа: {n_alfa}\n\n"
+                                f"Шаблоны выписок:\n"
+                                f"  Альфа: {n_alfa_stmt} | ВТБ: {n_vtb_stmt}\n\n"
                                 "Чтобы добавить чек: выберите тип, затем загрузите PDF.\n"
                                 "Если добавили файлы вручную — нажмите «Обновить индекс»."
                             ),
@@ -2919,48 +2933,121 @@ def run_bot(token: str) -> None:
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
                             "text": (
-                                "📄 Новый чек\n\n"
-                                "1. Отправьте PDF-чек\n"
-                                "2. Выберите банк (Альфа-Банк или ВТБ)\n"
-                                "3. Введите сумму: с какой на какую (например: 10 5000)"
+                                "📄 Загрузить чек\n\n"
+                                "Отправьте PDF-чек — бот определит сумму автоматически.\n\n"
+                                "После загрузки выберите банк и режим замены."
                             ),
-                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_check"}]]}),
                         })
                         continue
                     if q["data"] == "main_stmt":
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": "📄 Создание выписки\n\nВыберите вариант:",
+                            "text": "📋 Создать выписку\n\nВыберите банк:",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
-                                    [{"text": "🏦 Выписка Альфа-Банк", "callback_data": "alfa_stmt_start"}],
-                                    [{"text": "✏️ Редактирование своей выписки", "callback_data": "stmt_edit"}],
-                                    [{"text": "📄 Выписка по чеку", "callback_data": "stmt_receipt"}],
+                                    [
+                                        {"text": "🏦 Альфа Банк", "callback_data": "stmt_alfa_menu"},
+                                        {"text": "🏛 ВТБ", "callback_data": "stmt_vtb_menu"},
+                                    ],
                                     [{"text": "⬅️ Назад", "callback_data": "main_back"}],
                                 ],
                             }),
                         })
                         continue
-                    if q["data"].startswith("alfa_stmt"):
-                        _handle_alfa_stmt_callback(token, uid, q, tg_request)
+                    if q["data"] == "stmt_alfa_menu":
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "🏦 Выписка Альфа-Банк\n\nВыберите вариант:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [{"text": "✏️ Редактирование своей выписки", "callback_data": "stmt_alfa_edit"}],
+                                    [{"text": "📄 Выписка по чеку", "callback_data": "stmt_alfa_from_check"}],
+                                    [{"text": "🔧 Создание с нуля", "callback_data": "stmt_alfa_new"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "main_stmt"}],
+                                ],
+                            }),
+                        })
                         continue
-                    if q["data"] == "stmt_edit":
+                    if q["data"] == "stmt_vtb_menu":
+                        vtb_tpl = _BOT_DIR / "база_выписок" / "vtb_template.pdf"
+                        if not vtb_tpl.exists():
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": "🏛 Выписка ВТБ\n\n⚠️ Шаблон выписки ВТБ не найден.\n\nДобавьте файл vtb_template.pdf в папку база_выписок/ и обновите индекс в разделе «База».",
+                                "reply_markup": json.dumps({"inline_keyboard": [
+                                    [{"text": "⬅️ Назад", "callback_data": "main_stmt"}],
+                                ]}),
+                            })
+                        else:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": "🏛 Выписка ВТБ\n\nВыберите вариант:",
+                                "reply_markup": json.dumps({
+                                    "inline_keyboard": [
+                                        [{"text": "✏️ Редактирование своей выписки", "callback_data": "stmt_vtb_edit"}],
+                                        [{"text": "📄 Выписка по чеку", "callback_data": "stmt_vtb_from_check"}],
+                                        [{"text": "🔧 Создание с нуля", "callback_data": "stmt_vtb_new"}],
+                                        [{"text": "⬅️ Назад", "callback_data": "main_stmt"}],
+                                    ],
+                                }),
+                            })
+                        continue
+                    if q["data"] in ("stmt_vtb_edit", "stmt_vtb_from_check", "stmt_vtb_new"):
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "⚠️ Выписка ВТБ пока недоступна.\n\nАдд файл vtb_template.pdf в папку база_выписок/ для активации.",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "stmt_vtb_menu"}]]}),
+                        })
+                        continue
+                    if q["data"] == "stmt_alfa_edit":
                         USER_STATE[uid] = {"mode": "statement_edit", "step": "upload"}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": "✏️ Редактирование своей выписки\n\nОтправьте PDF-файл выписки.",
-                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
+                            "text": "✏️ Редактирование выписки Альфа\n\nОтправьте PDF-файл выписки.\n\nПосле загрузки бот покажет найденные суммы и предложит замены.",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "stmt_alfa_menu"}]]}),
                         })
                         continue
-                    if q["data"] == "stmt_receipt":
+                    if q["data"] == "stmt_alfa_from_check":
                         USER_STATE[uid] = {"mode": "statement_from_receipt", "step": "upload"}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": "📄 Выписка по чеку\n\nОтправьте PDF-файл чека.",
-                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
+                            "text": "📄 Выписка по чеку (Альфа)\n\nОтправьте PDF-файл чека — данные из него будут автоматически перенесены в выписку.",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "stmt_alfa_menu"}]]}),
+                        })
+                        continue
+                    if q["data"] == "stmt_alfa_new":
+                        USER_STATE[uid] = {"mode": "alfa_stmt", "changes": {}}
+                        _alfa_stmt_show_blocks(token, q["message"]["chat"]["id"], USER_STATE[uid], tg_request)
+                        continue
+                    if q["data"].startswith("alfa_stmt"):
+                        _handle_alfa_stmt_callback(token, uid, q, tg_request)
+                        continue
+                    if q["data"] == "stmt_edit":
+                        # redirect to new alfa edit
+                        USER_STATE[uid] = {"mode": "statement_edit", "step": "upload"}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "✏️ Редактирование выписки Альфа\n\nОтправьте PDF-файл выписки.",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "stmt_alfa_menu"}]]}),
+                        })
+                        continue
+                    if q["data"] == "stmt_receipt":
+                        # redirect to new alfa from check
+                        USER_STATE[uid] = {"mode": "statement_from_receipt", "step": "upload"}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "📄 Выписка по чеку (Альфа)\n\nОтправьте PDF-файл чека.",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "stmt_alfa_menu"}]]}),
                         })
                         continue
                     if q["data"] == "stmt_skip" or q["data"] == "stmt_next":
@@ -2990,7 +3077,7 @@ def run_bot(token: str) -> None:
                         tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": "ФИО не заменяется. Введите другие замены или Далее."})
                         continue
                     if q["data"] == "main_back":
-                        if uid in USER_STATE and USER_STATE[uid].get("mode", "").startswith(("statement_", "alfa_stmt")):
+                        if uid in USER_STATE:
                             if "file_path" in USER_STATE[uid]:
                                 try:
                                     os.unlink(USER_STATE[uid]["file_path"])
@@ -3098,37 +3185,27 @@ def run_bot(token: str) -> None:
                             "reply_markup": json.dumps({"inline_keyboard": []}),
                         })
                         continue
-                    if q["data"] == "report_test":
-                        if uid in USER_STATE:
-                            del USER_STATE[uid]
-                        tg_request(token, "editMessageText", {
-                            "chat_id": q["message"]["chat"]["id"],
-                            "message_id": q["message"]["message_id"],
-                            "text": "📋 Отчёт: Тест (ничего не сохранено)",
-                            "reply_markup": json.dumps({"inline_keyboard": []}),
-                        })
-                        continue
-                    if q["data"] == "report_zayavka":
-                        if uid not in USER_STATE:
-                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Сессия истекла. Отправьте чек заново."})
-                            continue
-                        USER_STATE[uid]["awaiting"] = "zayavka_description"
-                        tg_request(token, "editMessageText", {
-                            "chat_id": q["message"]["chat"]["id"],
-                            "message_id": q["message"]["message_id"],
-                            "text": "📝 Опишите заявку:\nссылка на платеж / казино / обменник",
-                            "reply_markup": json.dumps({"inline_keyboard": []}),
-                        })
-                        continue
                     if q["data"] == "vtb_mode_amount":
+                        # redirect to new flow
                         if uid not in USER_STATE:
                             tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
                             continue
+                        USER_STATE[uid]["bank"] = "vtb"
                         USER_STATE[uid]["vtb_mode"] = "amount"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            from receipt_db import get_receipt_amount
+                            current_amt = get_receipt_amount(Path(inp))
+                        except Exception:
+                            current_amt = None
+                        USER_STATE[uid]["current_amount"] = current_amt
+                        USER_STATE[uid]["current_commission"] = extract_commission_from_pdf(inp)
+                        USER_STATE[uid]["awaiting"] = "amount_new_only"
+                        amt_txt = f"Текущая сумма: {format_amount_display(current_amt)} ₽\n\n" if current_amt else ""
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": "💰 Введите сумму: с какой на какую менять\nНапример: 10 5000 или 50 10000",
+                            "text": f"🏛 ВТБ — только сумма\n\n{amt_txt}Введите новую сумму:",
                         })
                         continue
                     if q["data"] == "vtb_mode_full":
@@ -3137,9 +3214,17 @@ def run_bot(token: str) -> None:
                             continue
                         USER_STATE[uid]["vtb_mode"] = "full"
                         USER_STATE[uid]["awaiting"] = "vtb_amount"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            from receipt_db import get_receipt_amount
+                            current_amt = get_receipt_amount(Path(inp))
+                        except Exception:
+                            current_amt = None
+                        amt_hint = f"Текущая сумма: {format_amount_display(current_amt)} ₽\n" if current_amt else ""
                         txt = (
-                            "📋 Режим «Все поля»\n\n"
+                            "🏛 ВТБ — все поля\n\n"
                             f"{VTB_UNSUPPORTED_NOTICE}\n\n"
+                            f"{amt_hint}"
                             "1️⃣ Сумма: с какой на какую менять (например: 10 1000 или 50 50000)"
                         )
                         tg_request(token, "editMessageText", {
@@ -3221,7 +3306,37 @@ def run_bot(token: str) -> None:
                             tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
                             _run_vtb_transgran_patch(token, uid, cid, state, tg_request)
                         continue
-                    # Альфа СБП все поля: callback
+                    # Альфа СБП: пропустить/оставить текущий шаг
+                    if q["data"].startswith("alfa_sbp_skip_") or q["data"].startswith("alfa_sbp_keep_"):
+                        if uid not in USER_STATE or USER_STATE[uid].get("mode") != "alfa_sbp_full":
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Сессия истекла"})
+                            continue
+                        state = USER_STATE[uid]
+                        cid = q["message"]["chat"]["id"]
+                        is_keep = q["data"].startswith("alfa_sbp_keep_")
+                        step_idx = int(q["data"].split("_")[-1])
+                        field_list = state.get("_alfa_sbp_field_list", [])
+                        if step_idx < len(field_list):
+                            field_key = field_list[step_idx][0]
+                            if is_keep:
+                                curr_val = state.get("alfa_sbp_current", {}).get(field_key)
+                                if curr_val:
+                                    fields = state.setdefault("alfa_sbp_fields", {})
+                                    if field_key == "account":
+                                        fields["account_last4"] = str(curr_val)[-4:]
+                                    else:
+                                        fields[field_key] = curr_val
+                        # Advance step
+                        state["alfa_sbp_step"] = step_idx + 1
+                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "✅"})
+                        if step_idx + 1 < len(field_list):
+                            _, prompt_next = field_list[step_idx + 1]
+                            tg_request(token, "sendMessage", {"chat_id": cid, "text": f"Шаг {step_idx+2}/{len(field_list)}: {prompt_next}\nОтправьте - чтобы пропустить."})
+                        else:
+                            tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Генерирую PDF..."})
+                            _run_alfa_sbp_full_patch(token, uid, cid, state, tg_request)
+                        continue
+                    # Альфа СБП все поля: старый callback (для совместимости)
                     if q["data"] == "bank_alfa_sbp_full":
                         if uid not in USER_STATE:
                             tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
@@ -3243,7 +3358,7 @@ def run_bot(token: str) -> None:
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
                             "text": (
-                                "🏦 Альфа-Банк СБП — замена всех полей\n\n"
+                                "🏦 Альфа — все поля\n\n"
                                 "Введите новые значения пошагово.\n"
                                 "Отправьте - чтобы оставить поле без изменений.\n\n"
                                 f"Шаг 1/{len(_ALFA_SBP_FIELDS)}: {prompt}"
@@ -3288,10 +3403,11 @@ def run_bot(token: str) -> None:
                             continue
                         state = USER_STATE[uid]
                         cid = q["message"]["chat"]["id"]
+                        # at_credited теперь вычисляется автоматически — пропускаем этот шаг
                         keep_flow = {
                             "at_keep_amount": ("at_amount", "at_commission"),
                             "at_keep_commission": ("at_commission", "at_rate"),
-                            "at_keep_rate": ("at_rate", "at_credited"),
+                            "at_keep_rate": ("at_rate", "at_phone"),  # пропускаем at_credited
                             "at_keep_credited": ("at_credited", "at_phone"),
                             "at_keep_phone": ("at_phone", "at_name"),
                             "at_keep_name": ("at_name", "at_operation_id"),
@@ -3306,14 +3422,29 @@ def run_bot(token: str) -> None:
                             tg_request(token, "sendMessage", {"chat_id": cid, "text": "⏳ Обрабатываю чек..."})
                             _run_alfa_transgran_patch(token, uid, cid, state, tg_request)
                         continue
-                    if uid not in USER_STATE:
-                        tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                    # Новые обработчики банка
+                    if q["data"] == "bank_alfa_sub":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "🏦 Альфа Чек\n\nВыберите режим:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [{"text": "💰 Только сумма", "callback_data": "bank_alfa_amount"}],
+                                    [{"text": "📋 Все поля", "callback_data": "bank_alfa_full"}],
+                                    [{"text": "🌐 Трансгран", "callback_data": "bank_alfa_transgran"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "cancel"}],
+                                ],
+                            }),
+                        })
                         continue
-                    bank_map = {"bank_alfa": "alfa", "bank_vtb": "vtb", "bank_auto": "auto"}
-                    bank = bank_map.get(q["data"], "auto")
-                    bank_name = {"alfa": "Альфа-Банк", "vtb": "ВТБ", "auto": "Авто"}[bank]
-                    USER_STATE[uid]["bank"] = bank
-                    if bank == "vtb":
+                    if q["data"] == "bank_vtb_sub":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
                         scan_tip = ""
                         try:
                             bad = scan_vtb_unsupported_chars(USER_STATE[uid]["file_path"])
@@ -3325,21 +3456,181 @@ def run_bot(token: str) -> None:
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": f"✅ Банк: {bank_name}{scan_tip}\n\nВыберите режим:",
+                            "text": f"🏛 ВТБ{scan_tip}\n\nВыберите режим:",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
-                                    [{"text": "💰 Только сумма", "callback_data": "vtb_mode_amount"}],
-                                    [{"text": "📋 Все поля (дата, ФИО, телефон, банк)", "callback_data": "vtb_mode_full"}],
+                                    [{"text": "💰 Только сумма", "callback_data": "bank_vtb_amount"}],
+                                    [{"text": "📋 Все поля", "callback_data": "bank_vtb_full"}],
+                                    [{"text": "🌍 Трансгран", "callback_data": "bank_vtb_transgran"}],
                                     [{"text": "⬅️ Назад", "callback_data": "cancel"}],
                                 ],
                             }),
                         })
-                    else:
+                        continue
+                    if q["data"] == "bank_auto_free":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        USER_STATE[uid]["bank"] = "auto"
+                        USER_STATE[uid]["awaiting"] = "auto_replacements"
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": f"✅ Банк: {bank_name}\n\n💰 Введите сумму: с какой на какую менять\nНапример: 10 5000 или 50 10000",
+                            "text": (
+                                "🔍 Авто — любой банк\n\n"
+                                "Введите замены в формате:\n"
+                                "(старое = новое)\n\n"
+                                "Пример:\n(10 RUR = 10 000 RUR)\n(01.01.2025 = 20.03.2026)\n\n"
+                                "⚠️ Авто-режим не гарантирует прохождение проверки."
+                            ),
                         })
+                        continue
+                    if q["data"] == "bank_alfa_amount":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        USER_STATE[uid]["bank"] = "alfa"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            from receipt_db import get_receipt_amount
+                            current_amt = get_receipt_amount(Path(inp))
+                        except Exception:
+                            current_amt = None
+                        current_comm = extract_commission_from_pdf(inp)
+                        USER_STATE[uid]["current_amount"] = current_amt
+                        USER_STATE[uid]["current_commission"] = current_comm
+                        USER_STATE[uid]["awaiting"] = "amount_new_only"
+                        amt_txt = f"Текущая сумма: {format_amount_display(current_amt)} ₽\n\n" if current_amt else ""
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": f"🏦 Альфа — только сумма\n\n{amt_txt}Введите новую сумму:",
+                        })
+                        continue
+                    if q["data"] == "bank_vtb_amount":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        USER_STATE[uid]["bank"] = "vtb"
+                        USER_STATE[uid]["vtb_mode"] = "amount"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            from receipt_db import get_receipt_amount
+                            current_amt = get_receipt_amount(Path(inp))
+                        except Exception:
+                            current_amt = None
+                        current_comm = extract_commission_from_pdf(inp)
+                        USER_STATE[uid]["current_amount"] = current_amt
+                        USER_STATE[uid]["current_commission"] = current_comm
+                        USER_STATE[uid]["awaiting"] = "amount_new_only"
+                        amt_txt = f"Текущая сумма: {format_amount_display(current_amt)} ₽\n\n" if current_amt else ""
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": f"🏛 ВТБ — только сумма\n\n{amt_txt}Введите новую сумму:",
+                        })
+                        continue
+                    if q["data"] == "bank_alfa_full":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        # Same as old bank_alfa_sbp_full
+                        USER_STATE[uid]["mode"] = "alfa_sbp_full"
+                        USER_STATE[uid]["alfa_sbp_step"] = 0
+                        USER_STATE[uid]["alfa_sbp_fields"] = {}
+                        _ALFA_SBP_FIELDS = [
+                            ("amount", "💰 Сумма перевода (число, например: 5000)"),
+                            ("date_time", "📅 Дата и время (например: 20.03.2026 14:30:00 мск)"),
+                            ("recipient", "👤 Получатель (например: Александр Евгеньевич Ж)"),
+                            ("phone", "📱 Телефон получателя (например: +7 (900) 351-70-80)"),
+                            ("bank", "🏦 Банк получателя (например: ВТБ, Сбербанк, Т-Банк)"),
+                            ("account", "💳 Последние 4 цифры счёта (например: 1234)"),
+                        ]
+                        USER_STATE[uid]["_alfa_sbp_field_list"] = _ALFA_SBP_FIELDS
+                        _, prompt = _ALFA_SBP_FIELDS[0]
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": (
+                                "🏦 Альфа — все поля\n\n"
+                                "Введите новые значения пошагово.\n"
+                                "Отправьте - чтобы оставить поле без изменений.\n\n"
+                                f"Шаг 1/{len(_ALFA_SBP_FIELDS)}: {prompt}"
+                            ),
+                        })
+                        continue
+                    if q["data"] == "bank_vtb_full":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        USER_STATE[uid]["bank"] = "vtb"
+                        USER_STATE[uid]["vtb_mode"] = "full"
+                        USER_STATE[uid]["awaiting"] = "vtb_amount"
+                        # Extract current values
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            from receipt_db import get_receipt_amount
+                            current_amt = get_receipt_amount(Path(inp))
+                        except Exception:
+                            current_amt = None
+                        amt_hint = f"Текущая сумма: {format_amount_display(current_amt)} ₽\n" if current_amt else ""
+                        txt = (
+                            "🏛 ВТБ — все поля\n\n"
+                            f"{VTB_UNSUPPORTED_NOTICE}\n\n"
+                            f"{amt_hint}"
+                            "1️⃣ Сумма: с какой на какую (например: 10 1000)"
+                        )
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": txt,
+                        })
+                        continue
+                    if q["data"] == "amount_skip_commission":
+                        if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "amount_commission":
+                            USER_STATE[uid]["commission_to"] = None
+                            _do_amount_patch(token, uid, q["message"]["chat"]["id"], USER_STATE[uid], tg_request)
+                        continue
+
+                    if uid not in USER_STATE:
+                        tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                        continue
+                    # Legacy bank callbacks (for backwards compat)
+                    bank_map = {"bank_alfa": "alfa", "bank_vtb": "vtb", "bank_auto": "auto"}
+                    if q["data"] in bank_map:
+                        bank = bank_map[q["data"]]
+                        USER_STATE[uid]["bank"] = bank
+                        if bank == "vtb":
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": "🏛 ВТБ\n\nВыберите режим:",
+                                "reply_markup": json.dumps({
+                                    "inline_keyboard": [
+                                        [{"text": "💰 Только сумма", "callback_data": "bank_vtb_amount"}],
+                                        [{"text": "📋 Все поля", "callback_data": "bank_vtb_full"}],
+                                        [{"text": "⬅️ Назад", "callback_data": "cancel"}],
+                                    ],
+                                }),
+                            })
+                        else:
+                            # Old alfa/auto: trigger amount_new_only flow
+                            inp = USER_STATE[uid]["file_path"]
+                            try:
+                                from receipt_db import get_receipt_amount
+                                current_amt = get_receipt_amount(Path(inp))
+                            except Exception:
+                                current_amt = None
+                            USER_STATE[uid]["current_amount"] = current_amt
+                            USER_STATE[uid]["current_commission"] = extract_commission_from_pdf(inp)
+                            USER_STATE[uid]["awaiting"] = "amount_new_only"
+                            amt_txt = f"Текущая сумма: {format_amount_display(current_amt)} ₽\n\n" if current_amt else ""
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": f"Введите новую сумму:\n\n{amt_txt}",
+                            })
+                        continue
                     continue
             except Exception as _upd_err:
                 import traceback

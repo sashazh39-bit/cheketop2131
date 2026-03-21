@@ -313,3 +313,75 @@ def patch_statement(
         _restore_pdf_id(out_path, orig_id)
 
     return True, ""
+
+
+# ── Новые функции для 3-блочного редактора ──────────────────────────────────
+
+def scan_alfa_block1(pdf_path: Path) -> dict[str, str]:
+    """Извлечь поля Блока 1 (Информация о счёте) из выписки Альфа-Банк."""
+    result: dict[str, str] = {}
+    if fitz is None:
+        return result
+    try:
+        doc = fitz.open(str(pdf_path))
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return result
+    patterns = {
+        "номер_счета": r"Номер счет[аа]?\s*([\d]+)",
+        "дата_открытия": r"Дата открытия счет[аа]?\s*(\d{2}\.\d{2}\.\d{4})",
+        "валюта": r"Валюта счет[аа]?\s*([A-Z]{3})",
+        "тип_счета": r"Тип счет[аа]?\s*(.+?)(?:\n|Дата)",
+        "дата_формирования": r"Дата формирования\s*(\d{2}\.\d{2}\.\d{4})",
+        "клиент": r"Клиент\s*(.+?)(?:\n|Адрес)",
+        "адрес": r"Адрес регистрации\s*(.+?)(?:\n\n|\Z)",
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, text, re.DOTALL)
+        if m:
+            result[key] = m.group(1).strip()[:200]
+    return result
+
+
+def scan_alfa_block2(pdf_path: Path) -> list[dict[str, str]]:
+    """Извлечь список операций (Блок 2) из выписки Альфа-Банк."""
+    ops: list[dict[str, str]] = []
+    if fitz is None:
+        return ops
+    try:
+        doc = fitz.open(str(pdf_path))
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return ops
+    pat = re.compile(
+        r"(\d{2}\.\d{2}\.\d{4})\s+"
+        r"([A-Z]\d+)\s+"
+        r"(?:Перевод\s+.+?через.+?на\s+)?"
+        r"(\+7[\s\d\(\)\-]+)?\.?\s*"
+        r"[-−]\s*([\d\s]+[,\.]\d{2})\s*RUR",
+        re.DOTALL,
+    )
+    for m in pat.finditer(text):
+        ops.append({
+            "дата": m.group(1),
+            "номер_операции": m.group(2),
+            "телефон": (m.group(3) or "").strip(),
+            "сумма": m.group(4).strip(),
+        })
+    return ops
+
+
+def patch_vtb_statement(
+    in_path: Path,
+    out_path: Path,
+    block1_changes: dict,
+    block2_changes: dict,
+    balance_params: dict,
+) -> tuple[bool, str]:
+    """Заглушка: патч выписки ВТБ. Требует шаблон vtb_template.pdf."""
+    vtb_tpl = Path(__file__).parent / "база_выписок" / "vtb_template.pdf"
+    if not vtb_tpl.exists():
+        return False, "Шаблон выписки ВТБ не найден (база_выписок/vtb_template.pdf)"
+    return False, "Патчинг выписки ВТБ в разработке — добавьте шаблон и повторите."

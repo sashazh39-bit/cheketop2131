@@ -132,3 +132,32 @@ def generate_fio_from_first_letter(first_letter: str, name: str = "", patronymic
     n = name.strip() if name else "Иван"
     p = patronymic.strip() if patronymic else "Иванович"
     return f"{surname} {n} {p}"
+
+
+def extract_commission_from_pdf(pdf_path: str | Path) -> int | None:
+    """Извлечь сумму комиссии из PDF-чека. Возвращает рубли (целое) или None."""
+    path = Path(pdf_path)
+    if not path.exists() or not fitz:
+        return None
+    try:
+        doc = fitz.open(str(path))
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return None
+    patterns = [
+        r"[Кк]омиссия[^\d]*?([\d\s]+)[,\.](\d{2})",
+        r"[Кк]омиссия[^\d\n]*?([\d\s]+)\s*(?:₽|руб|RUR|RUB)",
+        r"Commission[^\d]*?([\d\s]+)[,\.](\d{2})",
+        r"[Кк]омиссия банка[^\d]*?([\d\s]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            raw = m.group(1).replace(" ", "").replace("\xa0", "")
+            try:
+                val = int(raw)
+                return val
+            except ValueError:
+                continue
+    return None
