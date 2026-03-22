@@ -16,21 +16,27 @@ from pathlib import Path
 from typing import Any
 
 BASE_DIR = Path(__file__).parent
-BASE_PDF = BASE_DIR / "AM_1774109927283.pdf"
+# Проходящий эталон (см. task2_statements.py) — НЕ AM_1774109927283 (другая вёрстка/ModDate/потоки).
+_BASE_ALFA_PDF_CANDIDATES = [
+    BASE_DIR / "AM_1774134591446.pdf",
+    Path.home() / "Downloads" / "AM_1774134591446.pdf",
+    BASE_DIR / "AM_1774109927283.pdf",  # запасной шаблон, может не пройти ту же проверку
+]
+BASE_PDF = next((p for p in _BASE_ALFA_PDF_CANDIDATES if p.exists()), _BASE_ALFA_PDF_CANDIDATES[0])
 
-# ── Current template values (from AM_1774109927283.pdf) ──────────────────
+# ── Значения по умолчанию: AM_1774134591446.pdf (эталон) / fallback старый шаблон ──
 
 BLOCK2_DEFAULTS = {
-    "входящий_остаток": "74,82",
+    "входящий_остаток": "1 852,90",
     "поступления": "0,00",
-    "расходы": "10,00",
-    "исходящий_остаток": "64,82",
-    "платежный_лимит": "64,82",
-    "текущий_баланс": "64,82",
+    "расходы": "40,00",
+    "исходящий_остаток": "1 812,90",
+    "платежный_лимит": "1 812,90",
+    "текущий_баланс": "1 812,90",
 }
 
 BLOCK3_DEFAULTS = {
-    "номер_счета": "40817810280480002477",
+    "номер_счета": "40817810980480002476",
     "клиент_имя": "Жеребятьев Александр",
     "клиент_отчество": "Евгеньевич",
     "индекс": "238753",
@@ -40,10 +46,10 @@ BLOCK3_DEFAULTS = {
 }
 
 BLOCK1_DEFAULTS = {
-    "код_операции_расход": "C162103261572702",
+    "код_операции_расход": "C822502260006543",
     "телефон": "+7 (911) 858-45-",
     "телефон_окончание": "52",
-    "сумма_расход": "10,00",
+    "сумма_расход": "30,00",
 }
 
 BLOCK_LABELS = {
@@ -191,6 +197,52 @@ def validate_text(text: str, pdf_path: Path | None = None) -> list[str]:
             missing.append(ch)
             seen.add(ch)
     return missing
+
+
+# Код операции C… из эталона AM_1774134591446 — встречается в нескольких Tj/CMap;
+# глобальная замена в одном проходе с остальными патчами оставляет «хвосты».
+ALFA_TEMPLATE_OP_C = "C822502260006543"
+
+
+def split_alfa_pairs_defer_global_op_c(
+    pairs: list[tuple[str, str]],
+    template_op_c: str | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Первая фаза — все пары, кроме точной замены эталонного C-кода на новый.
+
+    Вторую фазу обрабатывает apply_deferred_op_c_replacements (несколько проходов).
+    """
+    toc = template_op_c or ALFA_TEMPLATE_OP_C
+    first: list[tuple[str, str]] = []
+    deferred: list[tuple[str, str]] = []
+    for old, new in pairs:
+        if old == toc and new != toc:
+            deferred.append((old, new))
+            continue
+        first.append((old, new))
+    return first, deferred
+
+
+def apply_deferred_op_c_replacements(
+    pdf_path: Path,
+    deferred: list[tuple[str, str]],
+    *,
+    max_passes: int = 8,
+) -> None:
+    """Повторяет CID-замену old→new, пока находятся вхождения (разные шрифты/потоки)."""
+    if not deferred:
+        return
+    patch_replacements, _, _, _ = _import_cid()
+    # Один целевой new на old (последний выигрывает при дубликатах)
+    by_old: dict[str, str] = {}
+    for o, n in deferred:
+        by_old[o] = n
+    for old, new in by_old.items():
+        if not old or old == new:
+            continue
+        for _ in range(max_passes):
+            if not patch_replacements(pdf_path, pdf_path, [(old, new)]):
+                break
 
 
 # ── Auto-recalculate balances ─────────────────────────────────────────────
@@ -668,8 +720,15 @@ _TM_RIGHT_EDGES: dict[float, float] = {
     628.397: 566.979,  # расходы
     611.347: 566.979,  # исходящий_остаток
     594.297: 566.979,  # платежный_лимит
-    537.497: 566.979,  # текущий_баланс
-    427.104: 568.028,  # Block 2 op amount
+    537.497: 566.979,  # текущий_баланс (старый шаблон)
+    554.547: 566.979,  # текущий баланс — AM_1774134591446
+    427.104: 568.028,  # Block 2 op amount (старый шаблон)
+    # AM_1774134591446 — строки сумм операций (Tm y из эталона)
+    466.152: 566.979,
+    456.953: 566.979,
+    444.154: 566.979,
+    434.955: 566.979,
+    420.056: 566.979,
 }
 
 # Tolerance for y-coordinate matching (floating point from different PDFs)

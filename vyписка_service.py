@@ -381,9 +381,10 @@ def scan_alfa_block2(pdf_path: Path) -> list[dict[str, str]]:
     if ops_start:
         ops_section = text[ops_start.end():]
 
+    # Код операции: C822502260006543 или OST1_5KSH0001I0M (не только «буква + цифры»)
     pat = re.compile(
         r"(\d{2}\.\d{2}\.\d{4})\s*\n\s*"
-        r"([A-Z]\d{10,})\s*\n"
+        r"([A-Z][A-Z0-9_]{5,22})\s*\n"
         r"(.+?)\n"
         r"(-?[\d\s]+[,.]\d{2})\s*RUR",
         re.DOTALL,

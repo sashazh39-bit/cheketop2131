@@ -1411,21 +1411,37 @@ def _apply_alfa_block3_calc(state, changes, current, out_path,
         patch_replacements(Path(out_path), Path(out_path), bal_pairs)
 
 
-def _mutate_doc_id(pdf_bytes: bytes) -> bytes:
-    """Mutate PDF /ID to MD5 of content, so each output has a unique document ID."""
+def _finalize_statement_pdf_bytes(
+    pdf_bytes: bytes,
+    *,
+    formation_date_ddmmyyyy: str | None = None,
+) -> bytes:
+    """После CID-патча: ModDate + минимальная правка /ID (как task2 / CHECK_VERIFICATION_RULES).
+
+    Полная подмена обоих /ID на MD5 ломала ту же проверку, что и у чеков.
+    """
     import hashlib
-    data = bytearray(pdf_bytes)
-    id_m = re.search(rb'/ID\s*\[\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*\]', bytes(data))
-    if not id_m:
-        return bytes(data)
-    h = hashlib.md5(bytes(data)).hexdigest().upper()
-    new_id = h.encode()
-    old1, old2 = id_m.group(1), id_m.group(2)
-    full_old = id_m.group(0)
-    full_new = full_old.replace(old1, new_id[:len(old1)].ljust(len(old1), b'0'), 1)
-    full_new = full_new.replace(old2, new_id[:len(old2)].ljust(len(old2), b'0'), 1)
-    data[id_m.start():id_m.end()] = full_new
-    return bytes(data)
+    import tempfile
+    from pathlib import Path
+
+    from patch_id import patch_document_id_one_nibble, patch_moddate
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+        tf.write(pdf_bytes)
+        path = Path(tf.name)
+    try:
+        if formation_date_ddmmyyyy and re.match(
+            r"^\d{2}\.\d{2}\.\d{4}$", formation_date_ddmmyyyy.strip()
+        ):
+            patch_moddate(path, formation_date_ddmmyyyy.strip())
+        pos = hashlib.md5(pdf_bytes).digest()[0] % 32
+        patch_document_id_one_nibble(path, which=2, pos_from_end=min(pos, 31))
+        return path.read_bytes()
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
@@ -1454,13 +1470,25 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 return
             in_path = Path(state["file_path"])
             try:
+                from alfa_statement_service import (
+                    apply_deferred_op_c_replacements,
+                    split_alfa_pairs_defer_global_op_c,
+                )
                 from cid_patch_amount import patch_replacements
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
                     out_path = tf.name
-                patch_replacements(in_path, Path(out_path), replacement_pairs)
+                first_pairs, deferred_op_c = split_alfa_pairs_defer_global_op_c(
+                    replacement_pairs
+                )
+                if first_pairs:
+                    patch_replacements(in_path, Path(out_path), first_pairs)
+                else:
+                    import shutil
+                    shutil.copy2(in_path, out_path)
                 _apply_alfa_block3_calc(state, changes, current, out_path,
                                         sum_operations_expense, sum_operations_income_alfa,
                                         calc_alfa_block3, format_amount_rur, patch_replacements)
+                apply_deferred_op_c_replacements(Path(out_path), deferred_op_c)
                 try:
                     from alfa_statement_service import adjust_amount_tm_positions
                     adjust_amount_tm_positions(Path(out_path))
@@ -1487,15 +1515,30 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 from alfa_statement_service import BASE_PDF
                 from cid_patch_amount import patch_replacements
                 if not BASE_PDF.exists():
-                    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Шаблон Альфа не найден"})
+                    tg_req(
+                        token,
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": "❌ Шаблон Альфа не найден. Положите AM_1774134591446.pdf в папку бота или ~/Downloads/",
+                        },
+                    )
                     if uid in USER_STATE:
                         del USER_STATE[uid]
                     return
+                from alfa_statement_service import (
+                    apply_deferred_op_c_replacements,
+                    split_alfa_pairs_defer_global_op_c,
+                )
+
                 replacement_pairs = build_replacement_pairs(state) + raw_extra
+                first_pairs, deferred_op_c = split_alfa_pairs_defer_global_op_c(
+                    replacement_pairs
+                )
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
                     out_path = tf.name
-                if replacement_pairs:
-                    patch_replacements(BASE_PDF, Path(out_path), replacement_pairs)
+                if first_pairs:
+                    patch_replacements(BASE_PDF, Path(out_path), first_pairs)
                 else:
                     import shutil
                     shutil.copy2(BASE_PDF, out_path)
@@ -1503,6 +1546,7 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 _apply_alfa_block3_calc(state, changes, current, out_path,
                                         sum_operations_expense, sum_operations_income_alfa,
                                         calc_alfa_block3, format_amount_rur, patch_replacements)
+                apply_deferred_op_c_replacements(Path(out_path), deferred_op_c)
                 try:
                     from alfa_statement_service import adjust_amount_tm_positions
                     adjust_amount_tm_positions(Path(out_path))
@@ -1612,7 +1656,14 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 return
             out_name = "выписка_втб.pdf"
 
-    pdf_bytes = _mutate_doc_id(pdf_bytes)
+    form_date = None
+    if bank == "alfa":
+        form_date = changes.get("дата_формирования") or current.get(
+            "дата_формирования"
+        )
+    pdf_bytes = _finalize_statement_pdf_bytes(
+        pdf_bytes, formation_date_ddmmyyyy=form_date
+    )
 
     if uid in USER_STATE:
         del USER_STATE[uid]
