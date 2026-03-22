@@ -52,7 +52,7 @@ except Exception:
     pass
 
 from pdf_patcher import patch_pdf_file, patch_amount as pdf_patch_amount, format_amount_display
-from alfa_transgran_patch import patch_transgran, extract_transgran_fields
+from alfa_transgran_patch import patch_transgran, extract_transgran_fields, _mutate_doc_id
 from vtb_transgran_patch import patch_vtb_transgran, extract_fields as extract_vtb_transgran_fields, parse_rate, format_credited, format_amount_rub
 from vtb_patch_from_config import patch_from_values, patch_amount_only
 from vtb_cmap import get_unsupported_chars, format_unsupported_error, suggest_replacement, FALLBACK_TIPS
@@ -916,14 +916,19 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
         _send_main_menu_button(token, chat_id, tg_req)
         return
 
-    pdf_bytes = _mutate_doc_id(pdf_bytes)
-    out_name = f"alfa_karta_{format_amount_display(amount).replace(' ', '_')}.pdf"
-    cap = f"✅ Альфа-карта: {format_amount_display(amount)} ₽"
-    if comm is not None:
-        cap += f", комиссия {comm} ₽"
-    else:
-        cap += " (комиссия как в шаблоне)"
-    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": cap}, files={"document": (out_name, pdf_bytes)})
+    try:
+        _pdf_ba = bytearray(pdf_bytes)
+        _mutate_doc_id(_pdf_ba)
+        pdf_bytes = bytes(_pdf_ba)
+        out_name = f"alfa_karta_{format_amount_display(amount).replace(' ', '_')}.pdf"
+        cap = f"✅ Альфа-карта: {format_amount_display(amount)} ₽"
+        if comm is not None:
+            cap += f", комиссия {comm} ₽"
+        else:
+            cap += " (комиссия как в шаблоне)"
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": cap}, files={"document": (out_name, pdf_bytes)})
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Не удалось отправить PDF: {e}"})
     _send_main_menu_button(token, chat_id, tg_req)
 
 
