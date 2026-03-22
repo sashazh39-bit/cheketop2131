@@ -401,6 +401,107 @@ def extract_transgran_fields(pdf_data: bytes) -> dict[str, str]:
     return fields
 
 
+def _parse_rub_line(s: str) -> int:
+    """«10 RUR», «1 000 RUR» → целые рубли."""
+    s = (s or "").replace("\xa0", " ").strip()
+    m = re.match(r"([\d\s]+)", s)
+    if not m:
+        return 0
+    return int(re.sub(r"\D", "", m.group(1)))
+
+
+def _format_rub_line(rub: int) -> str:
+    """Рубли в том же стиле, что в чеке: «10 000 RUR»."""
+    from pdf_patcher import format_amount_display
+
+    return f"{format_amount_display(int(rub))} RUR"
+
+
+def _parse_uzs_line(s: str) -> float:
+    """«1 316,70 UZS» → float."""
+    s = (s or "").replace("\xa0", " ").replace("UZS", "").strip()
+    if "," in s:
+        left, _, right = s.rpartition(",")
+        left = left.replace(" ", "")
+        frac = right[:2].ljust(2, "0")[:2]
+        try:
+            return int(left) + int(frac) / 100.0
+        except ValueError:
+            return 0.0
+    digits = re.sub(r"\D", "", s)
+    return float(digits) / 100.0 if len(digits) > 2 else float(digits or 0)
+
+
+def _format_uzs_line(val: float) -> str:
+    """Формат как в шаблоне: пробелы по тысячам, запятая — копейки (тут сотые UZS)."""
+    cents = int(round(val * 100))
+    whole = cents // 100
+    frac = cents % 100
+    s = str(whole)
+    parts: list[str] = []
+    while len(s) > 3:
+        parts.insert(0, s[-3:])
+        s = s[:-3]
+    if s:
+        parts.insert(0, s)
+    int_part = " ".join(parts)
+    return f"{int_part},{frac:02d} UZS"
+
+
+def is_alfa_transgran_receipt(pdf_data: bytes) -> bool:
+    """Есть ли в PDF поля трансграна Альфы (сумма в RUR и зачисление в UZS)."""
+    f = extract_transgran_fields(pdf_data)
+    amt = f.get("amount", "")
+    cr = f.get("credited", "")
+    return bool(amt and "RUR" in amt.upper() and cr and "UZS" in cr.upper())
+
+
+def patch_transgran_scale_amount(
+    pdf_data: bytes, new_amount_rub: int
+) -> tuple[bool, str | None, bytes | None]:
+    """Масштабировать сумму перевода: сохраняется курс, пересчитываются комиссия и UZS.
+
+    Комиссия: round(старая_комиссия * new / old). Зачисление: старое_UZS * (new / old).
+    """
+    if new_amount_rub <= 0:
+        return False, "Новая сумма должна быть больше 0", None
+
+    fields = extract_transgran_fields(pdf_data)
+    old_amt_s = fields.get("amount", "")
+    old_comm_s = fields.get("commission", "")
+    old_cred_s = fields.get("credited", "")
+
+    if not old_amt_s or "RUR" not in old_amt_s.upper():
+        return False, None, None  # не трансгран — вызывающий код попробует другой путь
+
+    old_rub = _parse_rub_line(old_amt_s)
+    if old_rub <= 0:
+        return False, "Не удалось прочитать сумму перевода из PDF", None
+
+    ratio = new_amount_rub / float(old_rub)
+
+    new_amt_s = _format_rub_line(new_amount_rub)
+
+    kwargs: dict[str, str | None] = {}
+    kwargs["amount"] = f"{old_amt_s}={new_amt_s}"
+
+    if old_comm_s and "RUR" in old_comm_s.upper():
+        old_comm = _parse_rub_line(old_comm_s)
+        new_comm = int(round(old_comm * ratio))
+        new_comm_s = _format_rub_line(new_comm)
+        if new_comm_s != old_comm_s:
+            kwargs["commission"] = f"{old_comm_s}={new_comm_s}"
+
+    if old_cred_s and "UZS" in old_cred_s.upper():
+        old_uzs = _parse_uzs_line(old_cred_s)
+        new_uzs = old_uzs * ratio
+        new_cred_s = _format_uzs_line(new_uzs)
+        if new_cred_s != old_cred_s:
+            kwargs["credited"] = f"{old_cred_s}={new_cred_s}"
+
+    return patch_transgran(pdf_data, **kwargs)
+
+
 if __name__ == '__main__':
     import sys
     if len(sys.argv) < 2:

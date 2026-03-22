@@ -348,6 +348,13 @@ def _increment_filename(stem: str) -> str:
     return stem + "2"
 
 
+def scale_commission_rub(amount_from: int, amount_to: int, commission_from: int) -> int:
+    """Пропорционально масштабировать комиссию при смене суммы перевода (руб., целые)."""
+    if amount_from <= 0 or commission_from <= 0:
+        return commission_from
+    return max(0, int(round(commission_from * amount_to / amount_from)))
+
+
 def extract_commission_from_pdf(pdf_path: str) -> int | None:
     """Извлечь комиссию из PDF-чека. Вернуть сумму в рублях или None."""
     try:
@@ -415,6 +422,7 @@ def _do_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) ->
     try:
         commission_from = state.get("current_commission") or 0
         commission_to = state.get("commission_to")
+        transgran_scaled = False
         data = bytearray(Path(inp).read_bytes())
 
         if bank == "vtb":
@@ -433,24 +441,39 @@ def _do_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) ->
                     return
                 out_bytes = new_data
         else:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
-                out_path_tmp = tf.name
-            ok, err = patch_pdf_file(inp, out_path_tmp, amount_from, amount_to, bank=bank)
-            if not ok:
+            # Альфа трансгран: сумма + комиссия + UZS зачисления одним CID-патчем
+            out_bytes = None
+            try:
+                from alfa_transgran_patch import is_alfa_transgran_receipt, patch_transgran_scale_amount
+                pdf_blob = Path(inp).read_bytes()
+                if bank in ("alfa", "auto") and is_alfa_transgran_receipt(pdf_blob):
+                    ok_tg, _err_tg, data_tg = patch_transgran_scale_amount(pdf_blob, amount_to)
+                    if ok_tg and data_tg:
+                        out_bytes = data_tg
+                        commission_to = None  # уже в PDF
+                        transgran_scaled = True
+            except Exception:
+                pass
+
+            if out_bytes is None:
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                    out_path_tmp = tf.name
+                ok, err = patch_pdf_file(inp, out_path_tmp, amount_from, amount_to, bank=bank)
+                if not ok:
+                    try:
+                        os.unlink(inp)
+                        os.unlink(out_path_tmp)
+                    except OSError:
+                        pass
+                    del USER_STATE[uid]
+                    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
+                    _send_main_menu_button(token, chat_id, tg_req)
+                    return
+                out_bytes = Path(out_path_tmp).read_bytes()
                 try:
-                    os.unlink(inp)
                     os.unlink(out_path_tmp)
                 except OSError:
                     pass
-                del USER_STATE[uid]
-                tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err}"})
-                _send_main_menu_button(token, chat_id, tg_req)
-                return
-            out_bytes = Path(out_path_tmp).read_bytes()
-            try:
-                os.unlink(out_path_tmp)
-            except OSError:
-                pass
 
         # Комиссия
         if commission_to is not None and commission_from > 0:
@@ -477,8 +500,11 @@ def _do_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) ->
         del USER_STATE[uid]
         am_from_disp = format_amount_display(amount_from) if amount_from else "?"
         caption = f"✅ Готово: {am_from_disp} ₽ → {format_amount_display(amount_to)} ₽"
-        if commission_to is not None:
+        if commission_to is not None and commission_from > 0:
             caption += f"\nКомиссия: {format_amount_display(commission_from)} → {format_amount_display(commission_to)} ₽"
+        elif transgran_scaled and commission_from > 0 and amount_from:
+            c_auto = scale_commission_rub(amount_from, amount_to, commission_from)
+            caption += f"\nКомиссия: {format_amount_display(commission_from)} → {format_amount_display(c_auto)} ₽"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
         _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
@@ -858,6 +884,96 @@ def _gen_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: str, 
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": prompt})
 
 
+def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Сгенерировать квитанцию Альфа «карта на карту» из шаблона шаблоны/alfa_karta.pdf."""
+    from alfa_karta_service import patch_alfa_karta, template_exists
+
+    if not template_exists():
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Шаблон Альфа-карта не найден (шаблоны/alfa_karta.pdf)."})
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        _send_main_menu_button(token, chat_id, tg_req)
+        return
+
+    card = state.get("ak_new_card", "")
+    amount = int(state.get("ak_amount", 0))
+    comm = state.get("ak_commission")
+    if uid in USER_STATE:
+        del USER_STATE[uid]
+
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Генерирую квитанцию..."})
+    try:
+        ok, err, pdf_bytes = patch_alfa_karta(
+            new_recipient_card=card,
+            new_amount_rub=amount,
+            new_commission_rub=comm,
+        )
+    except Exception as e:
+        ok, err, pdf_bytes = False, str(e), None
+
+    if not ok or not pdf_bytes:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {err or 'патч PDF'}"})
+        _send_main_menu_button(token, chat_id, tg_req)
+        return
+
+    pdf_bytes = _mutate_doc_id(pdf_bytes)
+    out_name = f"alfa_karta_{format_amount_display(amount).replace(' ', '_')}.pdf"
+    cap = f"✅ Альфа-карта: {format_amount_display(amount)} ₽"
+    if comm is not None:
+        cap += f", комиссия {comm} ₽"
+    else:
+        cap += " (комиссия как в шаблоне)"
+    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": cap}, files={"document": (out_name, pdf_bytes)})
+    _send_main_menu_button(token, chat_id, tg_req)
+
+
+def _handle_alfa_karta_input(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
+    """Пошаговый ввод: карта получателя → сумма → комиссия."""
+    state = USER_STATE.get(uid)
+    if not state:
+        return
+    aw = state.get("awaiting", "")
+    t = text.strip()
+
+    if aw == "ak_recipient_card":
+        card = re.sub(r"\s+", "", t).replace("\u00a0", "")
+        if len(card) < 12 or "*" not in card:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите маску карты, например: 220220******5047"})
+            return
+        state["ak_new_card"] = card
+        state["awaiting"] = "ak_amount"
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "💰 Сумма перевода (руб., целое число, например 10000):"})
+        return
+
+    if aw == "ak_amount":
+        nums = re.findall(r"\d+", t)
+        if not nums:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите сумму числом."})
+            return
+        amount = int("".join(nums))
+        if amount <= 0:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Сумма должна быть больше 0."})
+            return
+        state["ak_amount"] = amount
+        state["awaiting"] = "ak_commission"
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "💳 Комиссия (руб., можно 62.79 или 150). Отправьте — чтобы оставить как в шаблоне:",
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "— Как в шаблоне", "callback_data": "ak_keep_commission"}]]}),
+        })
+        return
+
+    if aw == "ak_commission":
+        if t in ("-", "—", "пропустить", "skip"):
+            state["ak_commission"] = None
+        else:
+            try:
+                state["ak_commission"] = float(t.replace(",", ".").replace(" ", ""))
+            except ValueError:
+                tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверное число. Пример: 62.79"})
+                return
+        _run_alfa_karta_generate(token, uid, chat_id, state, tg_req)
+        return
 
 
 def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
@@ -2617,7 +2733,12 @@ def run_bot(token: str) -> None:
                                     pass
                                 tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Не удалось добавить (возможно пустой PDF или ошибка)"})
                             continue
-                        if "gen_bank_type" in USER_STATE.get(uid, {}) or "gen_transfer_type" in USER_STATE.get(uid, {}):
+                        _aw_pdf = (USER_STATE.get(uid, {}).get("awaiting") or "")
+                        if (
+                            "gen_bank_type" in USER_STATE.get(uid, {})
+                            or "gen_transfer_type" in USER_STATE.get(uid, {})
+                            or _aw_pdf.startswith("ak_")
+                        ):
                             tg_request(token, "sendMessage", {
                                 "chat_id": msg["chat"]["id"],
                                 "text": "В режиме генерации чек не нужен. Продолжайте ввод выше или нажмите /start.",
@@ -2679,6 +2800,11 @@ def run_bot(token: str) -> None:
                     # ВТБ «Все поля»: пошаговый ввод
                     if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("vtb_"):
                         _handle_vtb_full_input(token, uid, chat_id, text, msg, tg_request)
+                        continue
+
+                    # Альфа-карта: генерация из шаблона (карта / сумма / комиссия)
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("ak_"):
+                        _handle_alfa_karta_input(token, uid, chat_id, text, tg_request)
                         continue
 
                     # Режим «Сгенерировать»: по gen_bank_type (надёжнее, чем только awaiting)
@@ -2743,7 +2869,11 @@ def run_bot(token: str) -> None:
                             continue
                         state["amount_to"] = amount_to
                         commission = state.get("current_commission")
-                        if commission and commission > 0:
+                        amt_from = state.get("current_amount") or 0
+                        if commission and commission > 0 and amt_from > 0:
+                            state["commission_to"] = scale_commission_rub(amt_from, amount_to, commission)
+                            _do_amount_patch(token, uid, chat_id, state, tg_request)
+                        elif commission and commission > 0:
                             state["awaiting"] = "amount_commission"
                             tg_request(token, "sendMessage", {
                                 "chat_id": chat_id,
@@ -2772,7 +2902,8 @@ def run_bot(token: str) -> None:
                         continue
 
                     if uid in USER_STATE:
-                        if "gen_bank_type" in USER_STATE[uid] or "gen_transfer_type" in USER_STATE[uid]:
+                        _aw = USER_STATE[uid].get("awaiting") or ""
+                        if "gen_bank_type" in USER_STATE[uid] or "gen_transfer_type" in USER_STATE[uid] or _aw.startswith("ak_"):
                             tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Продолжайте ввод выше или нажмите кнопки."})
                         else:
                             tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Сначала выберите банк (кнопками выше)."})
@@ -2815,7 +2946,7 @@ def run_bot(token: str) -> None:
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [{"text": "📱 Перевод по СБП", "callback_data": "gen_type_sbp"}],
-                                    [{"text": "💳 По номеру карты (скоро)", "callback_data": "gen_type_card"}],
+                                    [{"text": "💳 Альфа-карта", "callback_data": "gen_type_card"}],
                                     [{"text": "🌐 Трансгран (скоро)", "callback_data": "gen_type_transgran"}],
                                     [{"text": "⬅️ Назад", "callback_data": "main_check"}],
                                 ],
@@ -2898,7 +3029,33 @@ def run_bot(token: str) -> None:
                             }),
                         })
                         continue
-                    if q["data"] in ("gen_type_card", "gen_type_transgran"):
+                    if q["data"] == "gen_type_card":
+                        from alfa_karta_service import template_exists
+                        cid, mid = q["message"]["chat"]["id"], q["message"]["message_id"]
+                        if not template_exists():
+                            tg_request(token, "editMessageText", {
+                                "chat_id": cid,
+                                "message_id": mid,
+                                "text": "❌ Шаблон не найден.\n\nПоложите PDF в папку бота:\n`шаблоны/alfa_karta.pdf`",
+                                "parse_mode": "Markdown",
+                                "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_generate"}]]}),
+                            })
+                            continue
+                        USER_STATE[uid] = {"awaiting": "ak_recipient_card"}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": cid,
+                            "message_id": mid,
+                            "text": (
+                                "💳 Альфа-карта\n\n"
+                                "Квитанция «перевод с карты на карту» (шаблон Альфа-Банка).\n\n"
+                                "1️⃣ Введите номер карты получателя (маска), например:\n"
+                                "`220220******5047`"
+                            ),
+                            "parse_mode": "Markdown",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_generate"}]]}),
+                        })
+                        continue
+                    if q["data"] == "gen_type_transgran":
                         if uid in USER_STATE and "gen_bank_type" in USER_STATE[uid]:
                             del USER_STATE[uid]
                         tg_request(token, "editMessageText", {
@@ -2907,6 +3064,14 @@ def run_bot(token: str) -> None:
                             "text": "Пока доступен только перевод по СБП.",
                             "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
                         })
+                        continue
+                    if q["data"] == "ak_keep_commission":
+                        if uid not in USER_STATE or USER_STATE[uid].get("awaiting") != "ak_commission":
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Не тот шаг"})
+                            continue
+                        st = USER_STATE[uid]
+                        st["ak_commission"] = None
+                        _run_alfa_karta_generate(token, uid, q["message"]["chat"]["id"], st, tg_request)
                         continue
                     if q["data"] == "main_db":
                         counts = get_bank_counts()
