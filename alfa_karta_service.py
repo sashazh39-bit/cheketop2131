@@ -63,6 +63,14 @@ def extract_alfa_karta_fields(pdf_path: str | Path | bytes) -> dict[str, str]:
             raw = _next_val(i)
             if raw:
                 fields["card_recipient"] = raw
+        elif nl == "Сформирована" or nl.startswith("Сформирована "):
+            raw = _next_val(i)
+            if raw:
+                fields["formed_at_raw"] = raw
+        elif "Дата" in nl and "время" in nl and "перевода" in nl:
+            raw = _next_val(i)
+            if raw:
+                fields["transfer_dt_raw"] = raw
     return fields
 
 
@@ -72,12 +80,48 @@ def _normalize_card(s: str) -> str:
 
 
 def _commission_to_template_str(rub: float, nbsp: bool = True) -> str:
-    """62.79 -> «62,79\xa0RUR\xa0» как в шаблоне Альфа."""
+    """Целые рубли без «,00»; с копейками — «62,79» как в Альфа."""
     cents = int(round(rub * 100))
     whole = cents // 100
     frac = cents % 100
     sp = "\xa0" if nbsp else " "
+    if frac == 0:
+        return f"{whole}{sp}RUR{sp}"
     return f"{whole},{frac:02d}{sp}RUR{sp}"
+
+
+_SKIP_TIME = frozenset(("-", "—", "пропустить", "skip", ""))
+
+_FORMED_LINE_RE = re.compile(
+    r"^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2})\s*$"
+)
+_TRANSFER_LINE_RE = re.compile(
+    r"^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})\s*$"
+)
+
+
+def parse_alfa_karta_formed_input(text: str) -> str | None:
+    """None — оставить шаблон. Иначе строка для PDF: «ДД.ММ.ГГГГ\\xa0ЧЧ:ММ\\xa0мск»."""
+    t = (text or "").strip().replace("\xa0", " ")
+    if t in _SKIP_TIME:
+        return None
+    m = _FORMED_LINE_RE.match(t)
+    if not m:
+        raise ValueError("Ожидается ДД.ММ.ГГГГ ЧЧ:ММ (например 22.03.2026 06:34)")
+    dd, mm, yyyy, hh, mi = m.groups()
+    return f"{dd}.{mm}.{yyyy}\xa0{int(hh):02d}:{mi}\xa0мск"
+
+
+def parse_alfa_karta_transfer_input(text: str) -> str | None:
+    """None — оставить шаблон. Иначе «ДД.ММ.ГГГГ\\xa0ЧЧ:ММ:СС\\xa0мск»."""
+    t = (text or "").strip().replace("\xa0", " ")
+    if t in _SKIP_TIME:
+        return None
+    m = _TRANSFER_LINE_RE.match(t)
+    if not m:
+        raise ValueError("Ожидается ДД.ММ.ГГГГ ЧЧ:ММ:СС (например 22.03.2026 06:34:23)")
+    dd, mm, yyyy, hh, mi, ss = m.groups()
+    return f"{dd}.{mm}.{yyyy}\xa0{int(hh):02d}:{mi}:{ss}\xa0мск"
 
 
 def _extend_bfrange_for_unicode(data: bytearray, unicode_cp: int) -> bytearray:
@@ -164,9 +208,11 @@ def patch_alfa_karta(
     new_recipient_card: str,
     new_amount_rub: int,
     new_commission_rub: float | None,
+    new_formed_at: str | None = None,
+    new_transfer_at: str | None = None,
     template_path: Path | None = None,
 ) -> tuple[bool, str | None, bytes | None]:
-    """Патч шаблона: карта получателя, сумма, опционально комиссия."""
+    """Патч шаблона: карта, сумма, комиссия; опционально «Сформирована» и дата/время перевода."""
     from cid_patch_amount import patch_replacements
 
     tpl = template_path or ALFA_KARTA_TEMPLATE
@@ -204,6 +250,16 @@ def patch_alfa_karta(
         new_c = _commission_to_template_str(float(new_commission_rub))
         if old_c != new_c:
             pairs.append((old_c, new_c))
+
+    if new_formed_at is not None and fields.get("formed_at_raw"):
+        old_f = fields["formed_at_raw"]
+        if old_f != new_formed_at:
+            pairs.append((old_f, new_formed_at))
+
+    if new_transfer_at is not None and fields.get("transfer_dt_raw"):
+        old_t = fields["transfer_dt_raw"]
+        if old_t != new_transfer_at:
+            pairs.append((old_t, new_transfer_at))
 
     for _old, _new in pairs:
         raw = _ensure_pdf_chars(raw, _new)

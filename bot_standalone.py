@@ -971,6 +971,8 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
     card = state.get("ak_new_card", "")
     amount = int(state.get("ak_amount", 0))
     comm = state.get("ak_commission")
+    ak_formed_line = state.get("ak_formed_line")
+    ak_transfer_line = state.get("ak_transfer_line")
     if uid in USER_STATE:
         del USER_STATE[uid]
 
@@ -980,6 +982,8 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
             new_recipient_card=card,
             new_amount_rub=amount,
             new_commission_rub=comm,
+            new_formed_at=ak_formed_line,
+            new_transfer_at=ak_transfer_line,
         )
     except Exception as e:
         ok, err, pdf_bytes = False, str(e), None
@@ -996,7 +1000,9 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
         out_name = f"alfa_karta_{format_amount_display(amount).replace(' ', '_')}.pdf"
         cap = f"✅ Альфа-карта: {format_amount_display(amount)} ₽"
         if comm is not None:
-            cap += f", комиссия {comm} ₽"
+            _c = int(round(float(comm) * 100))
+            _w, _f = _c // 100, _c % 100
+            cap += f", комиссия {_w},{_f:02d} ₽" if _f else f", комиссия {_w} ₽"
         else:
             cap += " (комиссия как в шаблоне)"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": cap}, files={"document": (out_name, pdf_bytes)})
@@ -1007,7 +1013,9 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
 
 
 def _handle_alfa_karta_input(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
-    """Пошаговый ввод: карта получателя → сумма → комиссия."""
+    """Пошаговый ввод: карта → сумма → комиссия → время «Сформирована» → время перевода."""
+    from alfa_karta_service import parse_alfa_karta_formed_input, parse_alfa_karta_transfer_input
+
     state = USER_STATE.get(uid)
     if not state:
         return
@@ -1037,7 +1045,7 @@ def _handle_alfa_karta_input(token: str, uid: int, chat_id: int, text: str, tg_r
         state["awaiting"] = "ak_commission"
         tg_req(token, "sendMessage", {
             "chat_id": chat_id,
-            "text": "💳 Комиссия (руб., можно 62.79 или 150). Отправьте — чтобы оставить как в шаблоне:",
+            "text": "💳 Комиссия (руб., можно 62.79 или 150; целые без ,00 в PDF). Отправьте — чтобы оставить как в шаблоне:",
             "reply_markup": json.dumps({"inline_keyboard": [[{"text": "— Как в шаблоне", "callback_data": "ak_keep_commission"}]]}),
         })
         return
@@ -1051,6 +1059,42 @@ def _handle_alfa_karta_input(token: str, uid: int, chat_id: int, text: str, tg_r
             except ValueError:
                 tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверное число. Пример: 62.79"})
                 return
+        state["awaiting"] = "ak_formed"
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                "🕐 Строка «Сформирована» (без секунд).\n"
+                "Формат: `ДД.ММ.ГГГГ ЧЧ:ММ` — мск подставится само.\n"
+                "Отправьте «—» чтобы оставить как в шаблоне."
+            ),
+            "parse_mode": "Markdown",
+        })
+        return
+
+    if aw == "ak_formed":
+        try:
+            state["ak_formed_line"] = parse_alfa_karta_formed_input(t)
+        except ValueError as e:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ {e}"})
+            return
+        state["awaiting"] = "ak_transfer"
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                "🕑 Дата и время перевода (со секундами).\n"
+                "Формат: `ДД.ММ.ГГГГ ЧЧ:ММ:СС`\n"
+                "«—» — оставить как в шаблоне."
+            ),
+            "parse_mode": "Markdown",
+        })
+        return
+
+    if aw == "ak_transfer":
+        try:
+            state["ak_transfer_line"] = parse_alfa_karta_transfer_input(t)
+        except ValueError as e:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ {e}"})
+            return
         _run_alfa_karta_generate(token, uid, chat_id, state, tg_req)
         return
 
@@ -3190,7 +3234,16 @@ def run_bot(token: str) -> None:
                             continue
                         st = USER_STATE[uid]
                         st["ak_commission"] = None
-                        _run_alfa_karta_generate(token, uid, q["message"]["chat"]["id"], st, tg_request)
+                        st["awaiting"] = "ak_formed"
+                        tg_request(token, "sendMessage", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "text": (
+                                "🕐 Строка «Сформирована» (без секунд).\n"
+                                "Формат: `ДД.ММ.ГГГГ ЧЧ:ММ` — мск подставится само.\n"
+                                "Отправьте «—» чтобы оставить как в шаблоне."
+                            ),
+                            "parse_mode": "Markdown",
+                        })
                         continue
                     if q["data"] == "main_db":
                         counts = get_bank_counts()
