@@ -79,13 +79,23 @@ def _normalize_card(s: str) -> str:
     return s
 
 
-def _commission_to_template_str(rub: float, nbsp: bool = True) -> str:
-    """Целые рубли без «,00»; с копейками — «62,79» как в Альфа."""
+def commission_user_typed_zero_kopeks(text: str) -> bool:
+    """True, если в вводе явно указаны нулевые копейки (…,00 или ….00)."""
+    s = (text or "").strip().replace(" ", "").replace("\xa0", "")
+    return bool(re.search(r"[.,]00$", s))
+
+
+def _commission_to_template_str(
+    rub: float, nbsp: bool = True, *, show_zero_kopeks: bool = False
+) -> str:
+    """Целые без «,00», если пользователь не просил ,00; иначе «244,00»; копейки — «62,79»."""
     cents = int(round(rub * 100))
     whole = cents // 100
     frac = cents % 100
     sp = "\xa0" if nbsp else " "
     if frac == 0:
+        if show_zero_kopeks:
+            return f"{whole},00{sp}RUR{sp}"
         return f"{whole}{sp}RUR{sp}"
     return f"{whole},{frac:02d}{sp}RUR{sp}"
 
@@ -208,6 +218,7 @@ def patch_alfa_karta(
     new_recipient_card: str,
     new_amount_rub: int,
     new_commission_rub: float | None,
+    commission_show_zero_kopeks: bool = False,
     new_formed_at: str | None = None,
     new_transfer_at: str | None = None,
     template_path: Path | None = None,
@@ -247,7 +258,9 @@ def patch_alfa_karta(
 
     if new_commission_rub is not None and fields.get("commission_raw"):
         old_c = fields["commission_raw"]
-        new_c = _commission_to_template_str(float(new_commission_rub))
+        new_c = _commission_to_template_str(
+            float(new_commission_rub), show_zero_kopeks=commission_show_zero_kopeks
+        )
         if old_c != new_c:
             pairs.append((old_c, new_c))
 

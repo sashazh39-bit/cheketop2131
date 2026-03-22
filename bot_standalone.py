@@ -1020,6 +1020,7 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
     card = state.get("ak_new_card", "")
     amount = int(state.get("ak_amount", 0))
     comm = state.get("ak_commission")
+    comm_show_00 = bool(state.get("ak_commission_show_00"))
     ak_formed_line = state.get("ak_formed_line")
     ak_transfer_line = state.get("ak_transfer_line")
     if uid in USER_STATE:
@@ -1031,6 +1032,7 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
             new_recipient_card=card,
             new_amount_rub=amount,
             new_commission_rub=comm,
+            commission_show_zero_kopeks=comm_show_00,
             new_formed_at=ak_formed_line,
             new_transfer_at=ak_transfer_line,
         )
@@ -1051,7 +1053,12 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
         if comm is not None:
             _c = int(round(float(comm) * 100))
             _w, _f = _c // 100, _c % 100
-            cap += f", комиссия {_w},{_f:02d} ₽" if _f else f", комиссия {_w} ₽"
+            if _f:
+                cap += f", комиссия {_w},{_f:02d} ₽"
+            elif comm_show_00:
+                cap += f", комиссия {_w},00 ₽"
+            else:
+                cap += f", комиссия {_w} ₽"
         else:
             cap += " (комиссия как в шаблоне)"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": cap}, files={"document": (out_name, pdf_bytes)})
@@ -1063,7 +1070,11 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
 
 def _handle_alfa_karta_input(token: str, uid: int, chat_id: int, text: str, tg_req) -> None:
     """Пошаговый ввод: карта → сумма → комиссия → время «Сформирована» → время перевода."""
-    from alfa_karta_service import parse_alfa_karta_formed_input, parse_alfa_karta_transfer_input
+    from alfa_karta_service import (
+        commission_user_typed_zero_kopeks,
+        parse_alfa_karta_formed_input,
+        parse_alfa_karta_transfer_input,
+    )
 
     state = USER_STATE.get(uid)
     if not state:
@@ -1094,7 +1105,7 @@ def _handle_alfa_karta_input(token: str, uid: int, chat_id: int, text: str, tg_r
         state["awaiting"] = "ak_commission"
         tg_req(token, "sendMessage", {
             "chat_id": chat_id,
-            "text": "💳 Комиссия (руб., можно 62.79 или 150; целые без ,00 в PDF). Отправьте — чтобы оставить как в шаблоне:",
+            "text": "💳 Комиссия (руб.: 62.79, 150 или 244,00 — если указали ,00, в PDF будет ,00). Отправьте — чтобы оставить как в шаблоне:",
             "reply_markup": json.dumps({"inline_keyboard": [[{"text": "— Как в шаблоне", "callback_data": "ak_keep_commission"}]]}),
         })
         return
@@ -1102,12 +1113,14 @@ def _handle_alfa_karta_input(token: str, uid: int, chat_id: int, text: str, tg_r
     if aw == "ak_commission":
         if t in ("-", "—", "пропустить", "skip"):
             state["ak_commission"] = None
+            state.pop("ak_commission_show_00", None)
         else:
             try:
                 state["ak_commission"] = float(t.replace(",", ".").replace(" ", ""))
             except ValueError:
                 tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверное число. Пример: 62.79"})
                 return
+            state["ak_commission_show_00"] = commission_user_typed_zero_kopeks(t)
         state["awaiting"] = "ak_formed"
         tg_req(token, "sendMessage", {
             "chat_id": chat_id,
@@ -3283,6 +3296,7 @@ def run_bot(token: str) -> None:
                             continue
                         st = USER_STATE[uid]
                         st["ak_commission"] = None
+                        st.pop("ak_commission_show_00", None)
                         st["awaiting"] = "ak_formed"
                         tg_request(token, "sendMessage", {
                             "chat_id": q["message"]["chat"]["id"],
