@@ -10,6 +10,71 @@ import sys
 from pathlib import Path
 
 
+def patch_document_id_one_nibble(
+    pdf_path: Path,
+    *,
+    which: int = 2,
+    pos_from_end: int = 0,
+) -> bool:
+    """
+    Изменить ровно один hex-символ в одной из строк /ID (без полной замены).
+
+    Нужно для проверок, которые по CHECK_VERIFICATION_RULES.md флагают **полную**
+    подмену /ID как подделку; для чеков разрешён только один символ.
+
+    which: 1 = первый hex (ID[0]), 2 = второй (ID[1]) — по умолчанию второй,
+           как «instance id» при неизменном «документном» ID[0].
+    pos_from_end: 0 = последний символ, 1 = предпоследний, …
+    """
+    if which not in (1, 2):
+        raise ValueError("which must be 1 or 2")
+
+    data = bytearray(pdf_path.read_bytes())
+    m = re.search(rb"/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]", bytes(data))
+    if not m:
+        return False
+
+    h1 = m.group(1).decode()
+    h2 = m.group(2).decode()
+    if len(h1) != len(h2):
+        return False
+
+    if which == 1:
+        s, other = h1, h2
+        start, end = m.start(1), m.end(1)
+    else:
+        s, other = h2, h1
+        start, end = m.start(2), m.end(2)
+
+    idx = len(s) - 1 - pos_from_end
+    if idx < 0 or idx >= len(s):
+        return False
+
+    def flip_at(s: str, i: int, delta: int) -> str:
+        c = s[i]
+        lo = c.lower()
+        if lo not in "0123456789abcdef":
+            lo = "0"
+        j = int(lo, 16)
+        nl = f"{(j + delta) % 16:x}"
+        nc = nl.upper() if c.isupper() else nl
+        return s[:i] + nc + s[i + 1 :]
+
+    new_s = None
+    for delta in range(1, 17):
+        cand = flip_at(s, idx, delta)
+        if cand != other:
+            new_s = cand
+            break
+
+    if new_s is None:
+        return False
+
+    data[start:end] = new_s.encode("ascii")
+    pdf_path.write_bytes(bytes(data))
+    return True
+
+
 def patch_document_id(pdf_path: Path, new_id_hex: str | None = None) -> bool:
     """
     Заменить /ID [ <hex1> <hex2> ] на два РАЗНЫХ новых ID той же длины.
@@ -79,7 +144,8 @@ def patch_moddate(pdf_path: Path, date_str: str) -> bool:
     old_val = m.group(1)
     new_val = new_moddate.encode("ascii")
     old_full = m.group(0)
-    new_full = b"/ModDate (" + new_val + b")"
+    # No space after /ModDate — matches iText / Oracle BI Publisher output (strict validators compare raw bytes)
+    new_full = b"/ModDate(" + new_val + b")"
 
     if old_full == new_full:
         return True  # already correct

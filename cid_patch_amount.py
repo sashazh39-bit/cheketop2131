@@ -25,10 +25,11 @@ def patch_replacements(
     if not replacements:
         return False
     data = bytearray(in_path.read_bytes())
-    uni_to_cid = _parse_tounicode(data)
-    if not uni_to_cid:
+    all_cmaps = _parse_tounicode_all(bytes(data))
+    if not all_cmaps:
         print("[ERROR] ToUnicode CMap не найден", file=sys.stderr)
         return False
+    uni_to_cid_primary = dict(all_cmaps[0])
 
     flat_replacements = []
     # Anchored pairs: (anchor_text, target_old, target_new, parent)
@@ -77,7 +78,11 @@ def patch_replacements(
                 required_chars.add(0xA0)
             elif cp >= 0x20:
                 required_chars.add(cp)
-    data, uni_to_cid = _extend_tounicode_identity(data, required_chars, uni_to_cid)
+    data, uni_to_cid = _extend_tounicode_identity(data, required_chars, uni_to_cid_primary)
+    # Дополнительные ToUnicode (другие subset) — не сливаем в один словарь (ломает кириллицу),
+    # а перебираем при поиске hex в потоке (например OST1_… в Arial vs основной шрифт).
+    extra_cmaps = [dict(m) for m in all_cmaps[1:]]
+    candidate_maps: list[dict] = [uni_to_cid] + extra_cmaps
 
     streams: list[tuple[int, int, int, bytes]] = []
     for m in re.finditer(rb"<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n", data, re.DOTALL):
@@ -101,12 +106,10 @@ def patch_replacements(
     for stream_start, stream_len, len_num_start, dec in streams:
         new_dec = dec
         for old_val, new_val, parent in flat_replacements:
-            old_hex = _find_old_hex(old_val, uni_to_cid, new_dec)
-            if not old_hex:
+            pair = _find_hex_pair_for_maps(old_val, new_val, candidate_maps, new_dec)
+            if not pair:
                 continue
-            new_hex = _encode_cid(new_val, uni_to_cid)
-            if not new_hex:
-                continue
+            old_hex, new_hex = pair
             is_inner = not old_hex.startswith(b"<")
             if is_inner:
                 new_hex = new_hex[1:-1]
@@ -126,13 +129,12 @@ def patch_replacements(
 
         # Anchored replacements: replace target only when it follows anchor in stream
         for anchor_text, target_old, target_new, parent in anchored_pairs:
-            a_hex = _find_old_hex(anchor_text, uni_to_cid, new_dec)
-            t_hex = _find_old_hex(target_old, uni_to_cid, new_dec)
-            if not a_hex or not t_hex:
+            anchored = _find_anchored_hex_pair(
+                anchor_text, target_old, target_new, candidate_maps, new_dec
+            )
+            if not anchored:
                 continue
-            n_hex = _encode_cid(target_new, uni_to_cid)
-            if not n_hex:
-                continue
+            a_hex, t_hex, n_hex = anchored
             is_inner = not t_hex.startswith(b"<")
             if is_inner:
                 n_hex = n_hex[1:-1]
@@ -205,6 +207,47 @@ def _detect_zlib_level(raw: bytes) -> int:
         if raw[1] == 0x5E: return 4
         if raw[1] == 0x01: return 1
     return 6
+
+
+def _find_hex_pair_for_maps(
+    old_val: str,
+    new_val: str,
+    candidate_maps: list[dict],
+    dec: bytes,
+) -> tuple[bytes, bytes] | None:
+    """Для одной пары old→new: подобрать CMap, в котором строка реально закодирована в потоке."""
+    for umap in candidate_maps:
+        old_hex = _find_old_hex(old_val, umap, dec)
+        if not old_hex:
+            continue
+        new_hex = _encode_cid(new_val, umap)
+        if not new_hex:
+            continue
+        return (old_hex, new_hex)
+    return None
+
+
+def _find_anchored_hex_pair(
+    anchor_text: str,
+    target_old: str,
+    target_new: str,
+    candidate_maps: list[dict],
+    dec: bytes,
+) -> tuple[bytes, bytes, bytes] | None:
+    """Якорь и цель могут быть в разных subset — перебираем пары карт."""
+    for umap_a in candidate_maps:
+        a_hex = _find_old_hex(anchor_text, umap_a, dec)
+        if not a_hex:
+            continue
+        for umap_t in candidate_maps:
+            t_hex = _find_old_hex(target_old, umap_t, dec)
+            if not t_hex:
+                continue
+            n_hex = _encode_cid(target_new, umap_t)
+            if not n_hex:
+                continue
+            return (a_hex, t_hex, n_hex)
+    return None
 
 
 def _find_old_hex(old_val: str, uni_to_cid: dict, dec: bytes) -> bytes | None:
@@ -351,32 +394,45 @@ def patch_amount(in_path: Path, out_path: Path, old_amount: str, new_amount: str
     return False
 
 
-def _parse_tounicode(data: bytes) -> dict:
-    """Парсит ToUnicode из beginbfchar или beginbfrange."""
-    uni_to_cid = {}
+def _parse_one_cmap_from_dec(dec: bytes) -> dict:
+    """Один ToUnicode stream: beginbfchar или beginbfrange."""
+    uni_to_cid: dict = {}
+    if b"beginbfchar" in dec:
+        for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
+            cid = mm.group(1).decode().upper().zfill(4)
+            uni = int(mm.group(2).decode().upper(), 16)
+            uni_to_cid[uni] = cid
+        return uni_to_cid
+    if b"beginbfrange" in dec:
+        for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
+            src_start = int(mm.group(1).decode().upper(), 16)
+            src_end = int(mm.group(2).decode().upper(), 16)
+            dest = int(mm.group(3).decode().upper(), 16)
+            for i in range(src_end - src_start + 1):
+                uni_to_cid[dest + i] = f"{src_start + i:04X}"
+        return uni_to_cid
+    return {}
+
+
+def _parse_tounicode_all(data: bytes) -> list[dict]:
+    """Все ToUnicode CMap в порядке появления в файле (каждый отдельным dict)."""
+    maps: list[dict] = []
     for m in re.finditer(rb"<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n", data, re.DOTALL):
         raw = data[m.end() : m.end() + int(m.group(2))]
         try:
             dec = zlib.decompress(raw)
         except zlib.error:
             continue
-        # beginbfchar: <cid> <unicode>
-        if b"beginbfchar" in dec:
-            for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
-                cid = mm.group(1).decode().upper().zfill(4)
-                uni = int(mm.group(2).decode().upper(), 16)
-                uni_to_cid[uni] = cid
-            return uni_to_cid
-        # beginbfrange: <srcStart> <srcEnd> <destStart> — линейный маппинг
-        if b"beginbfrange" in dec:
-            for mm in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", dec):
-                src_start = int(mm.group(1).decode().upper(), 16)
-                src_end = int(mm.group(2).decode().upper(), 16)
-                dest = int(mm.group(3).decode().upper(), 16)
-                for i in range(src_end - src_start + 1):
-                    uni_to_cid[dest + i] = f"{src_start + i:04X}"
-            return uni_to_cid
-    return {}
+        cmap = _parse_one_cmap_from_dec(dec)
+        if cmap:
+            maps.append(cmap)
+    return maps
+
+
+def _parse_tounicode(data: bytes) -> dict:
+    """Первый ToUnicode (как раньше) — для patch_amount и одиночных сценариев."""
+    maps = _parse_tounicode_all(data)
+    return dict(maps[0]) if maps else {}
 
 
 def _extend_tounicode_identity(
