@@ -470,7 +470,7 @@ def _parse_uzs_line(s: str) -> float:
 
 
 def _format_transgran_fx_credited(value: Decimal, currency: str) -> str:
-    """Строка зачисления как в квитанции Альфа: всегда две цифры после запятой («2,20 TJS», «1 316,70 UZS»)."""
+    """Строка зачисления как в квитанции Альфа: дробь только если нужна («11 TJS», «2,20 TJS», «1 316,70 UZS»)."""
     q = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if q < 0:
         raise ValueError("negative credited")
@@ -485,11 +485,13 @@ def _format_transgran_fx_credited(value: Decimal, currency: str) -> str:
     if s:
         parts.insert(0, s)
     int_part = " ".join(parts)
+    if frac == 0:
+        return f"{int_part} {currency}"
     return f"{int_part},{frac:02d} {currency}"
 
 
 def format_alfa_transgran_credited(value: Decimal | float | str, currency: str) -> str:
-    """Публичная обёртка для бота: зачисление в валюте с двумя десятичными знаками."""
+    """Для бота: зачисление в валюте; целые суммы без «,00», иначе две цифры после запятой."""
     v = value if isinstance(value, Decimal) else Decimal(str(value))
     return _format_transgran_fx_credited(v, currency.upper())
 
