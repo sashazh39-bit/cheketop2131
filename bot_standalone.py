@@ -96,34 +96,29 @@ if _raw:
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
 
+# Статистика PDF: учитываются только эти user_id; 8178442784 полностью игнорируется.
+STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
+    (1445265832, "диролЧ"),
+    (7076663447, "ДмитрийЧ"),
+)
+STATS_IGNORE_USER_IDS: frozenset[int] = frozenset({8178442784})
+
 STATS_PATH = _BOT_DIR / "bot_pdf_stats.json"
 
 
 def _stats_load() -> dict:
-    default: dict = {"user_order": [], "users": {}, "days": {}}
     if not STATS_PATH.exists():
-        return default
+        return {"days": {}}
     try:
         raw = json.loads(STATS_PATH.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
-            return default
-        if not isinstance(raw.get("user_order"), list):
-            raw["user_order"] = []
-        if not isinstance(raw.get("users"), dict):
-            raw["users"] = {}
-        if not isinstance(raw.get("days"), dict):
-            raw["days"] = {}
-        order = raw.get("user_order") or []
-        cleaned: list[int] = []
-        for x in order:
-            try:
-                cleaned.append(int(x))
-            except (TypeError, ValueError):
-                continue
-        raw["user_order"] = cleaned
-        return raw
+            return {"days": {}}
+        days = raw.get("days")
+        if not isinstance(days, dict):
+            days = {}
+        return {"days": dict(days)}
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return default
+        return {"days": {}}
 
 
 def _stats_save(data: dict) -> None:
@@ -133,31 +128,16 @@ def _stats_save(data: dict) -> None:
         pass
 
 
-def stats_touch_user(uid: int, username: str | None) -> None:
-    """Порядок «добавленных»: первый /start; username обновляем при наличии."""
-    d = _stats_load()
-    uid_s = str(uid)
-    uinfo = d["users"].setdefault(uid_s, {})
-    if "added_at" not in uinfo:
-        uinfo["added_at"] = datetime.now().isoformat(timespec="seconds")
-    if username:
-        uinfo["username"] = username
-    if uid not in d["user_order"]:
-        d["user_order"].append(uid)
-    _stats_save(d)
-
-
 def stats_record_pdf(uid: int, kind: str) -> None:
     """Учесть успешно выданный PDF: kind — receipt | statement."""
     if kind not in ("receipt", "statement"):
         return
+    if uid in STATS_IGNORE_USER_IDS:
+        return
+    if uid not in {u for u, _ in STATS_TRACKED_USERS}:
+        return
     d = _stats_load()
     uid_s = str(uid)
-    uinfo = d["users"].setdefault(uid_s, {})
-    if "added_at" not in uinfo:
-        uinfo["added_at"] = datetime.now().isoformat(timespec="seconds")
-    if uid not in d["user_order"]:
-        d["user_order"].append(uid)
     day = datetime.now().strftime("%Y-%m-%d")
     d["days"].setdefault(day, {})
     d["days"][day].setdefault(uid_s, {"receipts": 0, "statements": 0})
@@ -167,34 +147,18 @@ def stats_record_pdf(uid: int, kind: str) -> None:
 
 
 def stats_format_today() -> str:
-    """Текст сводки за сегодня; последний в порядке добавления не показывается."""
+    """Сводка за сегодня: два фиксированных участника и счётчики чеков/выписок."""
     day = datetime.now().strftime("%Y-%m-%d")
-    d = _stats_load()
-    order = list(d.get("user_order") or [])
-    today = (d.get("days") or {}).get(day) or {}
+    today = (_stats_load().get("days") or {}).get(day) or {}
     lines = [f"📊 Статистика за {day}", ""]
-    if len(order) <= 1:
-        lines.append(
-            "В списке меньше двух пользователей — сводка появится, когда добавится ещё один. "
-            "Последний добавленный пользователь в этой статистике никогда не показывается."
-        )
-        return "\n".join(lines)
-    excluded = order[-1]
-    users_meta = d.get("users") or {}
-    for uid in order[:-1]:
+    for uid, name in STATS_TRACKED_USERS:
         uid_s = str(uid)
         u = today.get(uid_s) or {}
         r = int(u.get("receipts", 0))
         s = int(u.get("statements", 0))
-        meta = users_meta.get(uid_s) or {}
-        un = (meta.get("username") or "").strip()
-        label = f"@{un}" if un else f"id:{uid}"
-        lines.append(f"• {label}\n  чеков: {r}, выписок: {s}")
+        lines.append(f"• {name}\n  id {uid}\n  чеков: {r}, выписок: {s}")
     lines.append("")
-    ex_meta = users_meta.get(str(excluded)) or {}
-    ex_un = (ex_meta.get("username") or "").strip()
-    ex_label = f"@{ex_un}" if ex_un else f"id:{excluded}"
-    lines.append(f"(Не в списке — последний добавленный: {ex_label})")
+    lines.append("(8178442784 в статистике не учитывается.)")
     return "\n".join(lines)
 
 
@@ -2777,7 +2741,6 @@ def run_bot(token: str) -> None:
                                 except OSError:
                                     pass
                             del USER_STATE[uid]
-                        stats_touch_user(uid, msg.get("from", {}).get("username"))
                         tg_request(token, "sendMessage", {
                             "chat_id": msg["chat"]["id"],
                             "text": MAIN_MENU_TEXT,
