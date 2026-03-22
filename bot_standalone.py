@@ -96,17 +96,121 @@ if _raw:
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
 
+STATS_PATH = _BOT_DIR / "bot_pdf_stats.json"
+
+
+def _stats_load() -> dict:
+    default: dict = {"user_order": [], "users": {}, "days": {}}
+    if not STATS_PATH.exists():
+        return default
+    try:
+        raw = json.loads(STATS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return default
+        if not isinstance(raw.get("user_order"), list):
+            raw["user_order"] = []
+        if not isinstance(raw.get("users"), dict):
+            raw["users"] = {}
+        if not isinstance(raw.get("days"), dict):
+            raw["days"] = {}
+        order = raw.get("user_order") or []
+        cleaned: list[int] = []
+        for x in order:
+            try:
+                cleaned.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        raw["user_order"] = cleaned
+        return raw
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return default
+
+
+def _stats_save(data: dict) -> None:
+    try:
+        STATS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def stats_touch_user(uid: int, username: str | None) -> None:
+    """Порядок «добавленных»: первый /start; username обновляем при наличии."""
+    d = _stats_load()
+    uid_s = str(uid)
+    uinfo = d["users"].setdefault(uid_s, {})
+    if "added_at" not in uinfo:
+        uinfo["added_at"] = datetime.now().isoformat(timespec="seconds")
+    if username:
+        uinfo["username"] = username
+    if uid not in d["user_order"]:
+        d["user_order"].append(uid)
+    _stats_save(d)
+
+
+def stats_record_pdf(uid: int, kind: str) -> None:
+    """Учесть успешно выданный PDF: kind — receipt | statement."""
+    if kind not in ("receipt", "statement"):
+        return
+    d = _stats_load()
+    uid_s = str(uid)
+    uinfo = d["users"].setdefault(uid_s, {})
+    if "added_at" not in uinfo:
+        uinfo["added_at"] = datetime.now().isoformat(timespec="seconds")
+    if uid not in d["user_order"]:
+        d["user_order"].append(uid)
+    day = datetime.now().strftime("%Y-%m-%d")
+    d["days"].setdefault(day, {})
+    d["days"][day].setdefault(uid_s, {"receipts": 0, "statements": 0})
+    key = "receipts" if kind == "receipt" else "statements"
+    d["days"][day][uid_s][key] += 1
+    _stats_save(d)
+
+
+def stats_format_today() -> str:
+    """Текст сводки за сегодня; последний в порядке добавления не показывается."""
+    day = datetime.now().strftime("%Y-%m-%d")
+    d = _stats_load()
+    order = list(d.get("user_order") or [])
+    today = (d.get("days") or {}).get(day) or {}
+    lines = [f"📊 Статистика за {day}", ""]
+    if len(order) <= 1:
+        lines.append(
+            "В списке меньше двух пользователей — сводка появится, когда добавится ещё один. "
+            "Последний добавленный пользователь в этой статистике никогда не показывается."
+        )
+        return "\n".join(lines)
+    excluded = order[-1]
+    users_meta = d.get("users") or {}
+    for uid in order[:-1]:
+        uid_s = str(uid)
+        u = today.get(uid_s) or {}
+        r = int(u.get("receipts", 0))
+        s = int(u.get("statements", 0))
+        meta = users_meta.get(uid_s) or {}
+        un = (meta.get("username") or "").strip()
+        label = f"@{un}" if un else f"id:{uid}"
+        lines.append(f"• {label}\n  чеков: {r}, выписок: {s}")
+    lines.append("")
+    ex_meta = users_meta.get(str(excluded)) or {}
+    ex_un = (ex_meta.get("username") or "").strip()
+    ex_label = f"@{ex_un}" if ex_un else f"id:{excluded}"
+    lines.append(f"(Не в списке — последний добавленный: {ex_label})")
+    return "\n".join(lines)
+
+
 MAIN_MENU_TEXT = (
     "👋 Главная\n\n"
     "📁 Чек — загрузить PDF или сгенерировать чек из базы.\n"
     "📋 Создать выписку — редактирование, по чеку или с нуля.\n"
     "📂 База — просмотр и добавление шаблонов.\n"
+    "📊 Статистика — чеки и выписки за сегодня (/statistika).\n"
     "📝 Последние изменения — что нового."
 )
 MAIN_MENU_KB = [
     [{"text": "📁 Чек", "callback_data": "main_check"}],
     [{"text": "📋 Создать выписку", "callback_data": "main_stmt"}],
     [{"text": "📂 База", "callback_data": "main_db"}],
+    [{"text": "📊 Статистика", "callback_data": "main_stats"}],
     [{"text": "📝 Последние изменения", "callback_data": "main_changelog"}],
 ]
 
@@ -511,6 +615,7 @@ def _do_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) ->
             c_auto = scale_commission_rub(amount_from, amount_to, commission_from)
             caption += f"\nКомиссия: {format_amount_display(commission_from)} → {format_amount_display(c_auto)} ₽"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+        stats_record_pdf(uid, "receipt")
         _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
         try:
@@ -840,6 +945,7 @@ def _run_vtb_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req)
         am_from = state.get("vtb_amount_from") or state.get("vtb_amount")
         caption = f"✅ Готово: {format_amount_display(am_from)} ₽ → {format_amount_display(state['vtb_amount'])} ₽"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+        stats_record_pdf(uid, "receipt")
         _send_main_menu_button(token, chat_id, tg_req)
     except ValueError as e:
         send(f"❌ Ошибка: {e}")
@@ -932,6 +1038,7 @@ def _run_alfa_karta_generate(token: str, uid: int, chat_id: int, state: dict, tg
         else:
             cap += " (комиссия как в шаблоне)"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": cap}, files={"document": (out_name, pdf_bytes)})
+        stats_record_pdf(uid, "receipt")
     except Exception as e:
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Не удалось отправить PDF: {e}"})
     _send_main_menu_button(token, chat_id, tg_req)
@@ -1055,6 +1162,7 @@ def _run_gen_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> N
         del USER_STATE[uid]
         caption = f"✅ Сгенерировано: {format_amount_display(amount_to)} ₽"
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+        stats_record_pdf(uid, "receipt")
         op_id = state.get("gen_operation_id") or get_operation_id_from_pdf(out_bytes)
         if op_id:
             tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"📋 ID операции (скопируйте при необходимости):\n{op_id}"})
@@ -1105,6 +1213,7 @@ def _run_sbp_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -
     del USER_STATE[uid]
     caption = f"✅ Сгенерировано: {format_amount_display(state['gen_amount'])} ₽"
     tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
+    stats_record_pdf(uid, "receipt")
     _send_main_menu_button(token, chat_id, tg_req)
 
 
@@ -1799,6 +1908,7 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
         caption += f" ({n_changes} изм.)"
     tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption},
            files={"document": (out_name, pdf_bytes)})
+    stats_record_pdf(uid, "statement")
     _send_main_menu_button(token, chat_id, tg_req)
 
 
@@ -2114,6 +2224,7 @@ def _run_alfa_transgran_patch(token: str, uid: int, chat_id: int, state: dict, t
         changes = [f"• {k}" for k in kwargs]
         caption = f"✅ Трансгран готов\n" + "\n".join(changes)
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, new_data)})
+        stats_record_pdf(uid, "receipt")
         _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
         send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
@@ -2387,6 +2498,7 @@ def _run_alfa_sbp_full_patch(token: str, uid: int, chat_id: int, state: dict, tg
         caption = "✅ Готово! " + ", ".join(caption_parts) if caption_parts else "✅ Готово!"
 
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, out_bytes)})
+        stats_record_pdf(uid, "receipt")
 
         try:
             os.unlink(out_path)
@@ -2570,6 +2682,7 @@ def _run_vtb_transgran_patch(token: str, uid: int, chat_id: int, state: dict, tg
 
         caption = "✅ ВТБ Трансгран готов\n" + "\n".join(summary_lines)
         tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, new_data)})
+        stats_record_pdf(uid, "receipt")
         _send_main_menu_button(token, chat_id, tg_req)
     except Exception as e:
         send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
@@ -2664,10 +2777,21 @@ def run_bot(token: str) -> None:
                                 except OSError:
                                     pass
                             del USER_STATE[uid]
+                        stats_touch_user(uid, msg.get("from", {}).get("username"))
                         tg_request(token, "sendMessage", {
                             "chat_id": msg["chat"]["id"],
                             "text": MAIN_MENU_TEXT,
                             "reply_markup": json.dumps({"inline_keyboard": MAIN_MENU_KB}),
+                        })
+                        continue
+
+                    _parts = text.split()
+                    cmd0 = _parts[0].split("@", 1)[0] if _parts else ""
+                    if cmd0 in ("/statistika", "/stats"):
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": stats_format_today(),
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Главное меню", "callback_data": "main_back"}]]}),
                         })
                         continue
 
@@ -2878,6 +3002,7 @@ def run_bot(token: str) -> None:
                                     summary += f"\n  ... и ещё {len(pairs)-5}"
                                 caption = f"✅ Авто-замены:\n{summary}\n\n⚠️ Режим Авто не гарантирует прохождение проверки."
                                 tg_request(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
+                                stats_record_pdf(uid, "receipt")
                             else:
                                 try:
                                     os.unlink(out_path)
@@ -3411,6 +3536,14 @@ def run_bot(token: str) -> None:
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
                             "text": CHANGELOG_TEXT,
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
+                        })
+                        continue
+                    if q["data"] == "main_stats":
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": stats_format_today(),
                             "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
                         })
                         continue
