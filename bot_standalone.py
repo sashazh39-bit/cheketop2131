@@ -52,7 +52,12 @@ except Exception:
     pass
 
 from pdf_patcher import patch_pdf_file, patch_amount as pdf_patch_amount, format_amount_display
-from alfa_transgran_patch import patch_transgran, extract_transgran_fields, _mutate_doc_id
+from alfa_transgran_patch import (
+    patch_transgran,
+    extract_transgran_fields,
+    _mutate_doc_id,
+    format_alfa_transgran_credited,
+)
 from vtb_transgran_patch import patch_vtb_transgran, extract_fields as extract_vtb_transgran_fields, parse_rate, format_credited, format_amount_rub
 from vtb_patch_from_config import patch_from_values, patch_amount_only
 from vtb_cmap import get_unsupported_chars, format_unsupported_error, suggest_replacement, FALLBACK_TIPS
@@ -2044,7 +2049,7 @@ def _alfa_tg_send_next(state: dict, aw: str, prompt: str, chat_id: int, token: s
     KEEP_PROMPTS = {
         "at_amount": ("1️⃣ Сумма перевода (сейчас: {amount}):\nВведите новую сумму, напр. 3 036 RUR", "at_keep_amount"),
         "at_commission": ("2️⃣ Комиссия (сейчас: {commission}):\nВведите новую, напр. 50 RUR\n(комиссия не включается в зачисление)", "at_keep_commission"),
-        "at_rate": ("3️⃣ Курс конвертации (сейчас: {rate}):\nВведите новый, напр. 1 RUR = 0.1130 TJS\n✅ Зачисление будет рассчитано автоматически (сумма × курс)", "at_keep_rate"),
+        "at_rate": ("3️⃣ Курс конвертации (сейчас: {rate}):\nВведите новый, напр. 1 RUR = 0.1130 TJS\n✅ Зачисление в валюте (TJS/UZS/…) считается автоматически: сумма × курс", "at_keep_rate"),
         "at_phone": ("4️⃣ Телефон (сейчас: {phone}):", "at_keep_phone"),
         "at_name": ("5️⃣ Получатель (сейчас: {name}):", "at_keep_name"),
         "at_operation_id": ("6️⃣ Номер операции (сейчас: {operation_id}):", "at_keep_opid"),
@@ -2432,17 +2437,40 @@ def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, 
             state[step_aw] = None
         else:
             state[step_aw] = t
+        fields = state.get("at_fields", {})
+        # После новой суммы — зачисление в валюте (TJS, UZS, …) по курсу из чека
+        if step_aw == "at_amount" and state.get("at_amount"):
+            try:
+                rate_str = state.get("at_rate") or fields.get("rate", "")
+                amount_str = state["at_amount"]
+                if rate_str and amount_str:
+                    pr = parse_rate(rate_str)
+                    if pr:
+                        rate_val, currency = pr
+                        from decimal import Decimal
+
+                        amount_num = Decimal(
+                            re.sub(r"[^\d.,]", "", amount_str.replace(",", ".").replace("\xa0", ""))
+                        )
+                        credited_val = amount_num * rate_val
+                        state["at_credited"] = format_alfa_transgran_credited(credited_val, currency)
+                        send(
+                            f"✅ Зачисление: {state['at_credited']} "
+                            f"(сумма × курс; в PDF при патче подставится эта строка)"
+                        )
+            except Exception:
+                pass
         # После ввода курса — автоматически вычислить зачисление
         if step_aw == "at_rate" and state.get("at_rate"):
-            fields = state.get("at_fields", {})
             try:
                 rate_str = state["at_rate"]
                 amount_str = state.get("at_amount") or fields.get("amount", "")
                 rate_val, currency = parse_rate(rate_str)
                 from decimal import Decimal
-                amount_num = Decimal(re.sub(r"[^\d.,]", "", amount_str.replace(",", ".")))
+
+                amount_num = Decimal(re.sub(r"[^\d.,]", "", amount_str.replace(",", ".").replace("\xa0", "")))
                 credited_val = amount_num * rate_val
-                state["at_credited"] = format_credited(credited_val, currency)
+                state["at_credited"] = format_alfa_transgran_credited(credited_val, currency)
                 send(f"✅ Зачисление авто: {state['at_credited']} (сумма × курс, без комиссии)")
             except Exception:
                 state["at_credited"] = None

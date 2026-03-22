@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import re
 import zlib
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 
@@ -417,24 +418,63 @@ def _format_rub_line(rub: int) -> str:
     return f"{format_amount_display(int(rub))} RUR"
 
 
+def _parse_foreign_credited_line(s: str) -> tuple[Decimal, str] | None:
+    """«2,20 TJS», «1 316,70 UZS» → (Decimal, код валюты). RUR — не трансгран-зачисление."""
+    s = (s or "").replace("\xa0", " ").strip()
+    m = re.search(r"^(.+?)\s+([A-Za-z]{3})\s*$", s)
+    if not m:
+        return None
+    body, ccy = m.group(1).strip(), m.group(2).upper()
+    if ccy in ("RUR", "RUB"):
+        return None
+    compact = body.replace(" ", "").replace("\u00a0", "")
+    if not compact:
+        return None
+    if "," in compact:
+        left, _, right = compact.rpartition(",")
+        whole_digits = re.sub(r"\D", "", left)
+        frac_digits = (re.sub(r"\D", "", right) + "00")[:2]
+        try:
+            val = Decimal(int(whole_digits or 0)) + Decimal(int(frac_digits)) / Decimal(100)
+        except (ValueError, ArithmeticError):
+            return None
+    elif "." in compact:
+        try:
+            val = Decimal(compact.replace(",", "."))
+        except ArithmeticError:
+            return None
+    else:
+        digits = re.sub(r"\D", "", compact)
+        if not digits:
+            return None
+        val = Decimal(digits)
+    return val, ccy
+
+
 def _parse_uzs_line(s: str) -> float:
-    """«1 316,70 UZS» → float."""
-    s = (s or "").replace("\xa0", " ").replace("UZS", "").strip()
-    if "," in s:
-        left, _, right = s.rpartition(",")
+    """«1 316,70 UZS» → float (совместимость)."""
+    p = _parse_foreign_credited_line(s)
+    if p is not None:
+        return float(p[0])
+    s2 = (s or "").replace("\xa0", " ").replace("UZS", "").strip()
+    if "," in s2:
+        left, _, right = s2.rpartition(",")
         left = left.replace(" ", "")
         frac = right[:2].ljust(2, "0")[:2]
         try:
             return int(left) + int(frac) / 100.0
         except ValueError:
             return 0.0
-    digits = re.sub(r"\D", "", s)
+    digits = re.sub(r"\D", "", s2)
     return float(digits) / 100.0 if len(digits) > 2 else float(digits or 0)
 
 
-def _format_uzs_line(val: float) -> str:
-    """Формат как в шаблоне: пробелы по тысячам, запятая — копейки (тут сотые UZS)."""
-    cents = int(round(val * 100))
+def _format_transgran_fx_credited(value: Decimal, currency: str) -> str:
+    """Строка зачисления как в квитанции Альфа: всегда две цифры после запятой («2,20 TJS», «1 316,70 UZS»)."""
+    q = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if q < 0:
+        raise ValueError("negative credited")
+    cents = int((q * Decimal(100)).to_integral_value(rounding=ROUND_HALF_UP))
     whole = cents // 100
     frac = cents % 100
     s = str(whole)
@@ -445,23 +485,36 @@ def _format_uzs_line(val: float) -> str:
     if s:
         parts.insert(0, s)
     int_part = " ".join(parts)
-    return f"{int_part},{frac:02d} UZS"
+    return f"{int_part},{frac:02d} {currency}"
+
+
+def format_alfa_transgran_credited(value: Decimal | float | str, currency: str) -> str:
+    """Публичная обёртка для бота: зачисление в валюте с двумя десятичными знаками."""
+    v = value if isinstance(value, Decimal) else Decimal(str(value))
+    return _format_transgran_fx_credited(v, currency.upper())
+
+
+def _format_uzs_line(val: float) -> str:
+    """Формат как в шаблоне UZS."""
+    return _format_transgran_fx_credited(Decimal(str(val)), "UZS")
 
 
 def is_alfa_transgran_receipt(pdf_data: bytes) -> bool:
-    """Есть ли в PDF поля трансграна Альфы (сумма в RUR и зачисление в UZS)."""
+    """Трансгран Альфы: сумма в RUR и зачисление в инвалюте (TJS, UZS, …)."""
     f = extract_transgran_fields(pdf_data)
     amt = f.get("amount", "")
     cr = f.get("credited", "")
-    return bool(amt and "RUR" in amt.upper() and cr and "UZS" in cr.upper())
+    if not amt or "RUR" not in amt.upper():
+        return False
+    return _parse_foreign_credited_line(cr) is not None
 
 
 def patch_transgran_scale_amount(
     pdf_data: bytes, new_amount_rub: int
 ) -> tuple[bool, str | None, bytes | None]:
-    """Масштабировать сумму перевода: сохраняется курс, пересчитываются комиссия и UZS.
+    """Масштабировать сумму перевода: курс в PDF не трогаем; комиссия и зачисление ∝ сумме.
 
-    Комиссия: round(старая_комиссия * new / old). Зачисление: старое_UZS * (new / old).
+    Зачисление пересчитывается для любой валюты (TJS, UZS, …), не только UZS.
     """
     if new_amount_rub <= 0:
         return False, "Новая сумма должна быть больше 0", None
@@ -478,7 +531,7 @@ def patch_transgran_scale_amount(
     if old_rub <= 0:
         return False, "Не удалось прочитать сумму перевода из PDF", None
 
-    ratio = new_amount_rub / float(old_rub)
+    ratio_dec = Decimal(new_amount_rub) / Decimal(old_rub)
 
     new_amt_s = _format_rub_line(new_amount_rub)
 
@@ -487,15 +540,16 @@ def patch_transgran_scale_amount(
 
     if old_comm_s and "RUR" in old_comm_s.upper():
         old_comm = _parse_rub_line(old_comm_s)
-        new_comm = int(round(old_comm * ratio))
+        new_comm = int((Decimal(old_comm) * ratio_dec).quantize(Decimal(1), rounding=ROUND_HALF_UP))
         new_comm_s = _format_rub_line(new_comm)
         if new_comm_s != old_comm_s:
             kwargs["commission"] = f"{old_comm_s}={new_comm_s}"
 
-    if old_cred_s and "UZS" in old_cred_s.upper():
-        old_uzs = _parse_uzs_line(old_cred_s)
-        new_uzs = old_uzs * ratio
-        new_cred_s = _format_uzs_line(new_uzs)
+    parsed_cred = _parse_foreign_credited_line(old_cred_s) if old_cred_s else None
+    if parsed_cred:
+        old_fx, ccy = parsed_cred
+        new_fx = (old_fx * ratio_dec).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        new_cred_s = _format_transgran_fx_credited(new_fx, ccy)
         if new_cred_s != old_cred_s:
             kwargs["credited"] = f"{old_cred_s}={new_cred_s}"
 
