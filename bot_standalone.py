@@ -96,7 +96,7 @@ if _raw:
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
 
-# Статистика PDF: учитываются только эти user_id; 8178442784 полностью игнорируется.
+# Статистика PDF: счётчики только для этих пар (telegram user_id → подпись в отчёте).
 STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
     (1445265832, "диролЧ"),
     (7076663447, "ДмитрийЧ"),
@@ -147,7 +147,7 @@ def stats_record_pdf(uid: int, kind: str) -> None:
 
 
 def stats_format_today() -> str:
-    """Сводка за сегодня: два фиксированных участника и счётчики чеков/выписок."""
+    """Сводка за сегодня: подписи и счётчики чеков/выписок (без id в тексте)."""
     day = datetime.now().strftime("%Y-%m-%d")
     today = (_stats_load().get("days") or {}).get(day) or {}
     lines = [f"📊 Статистика за {day}", ""]
@@ -156,9 +156,7 @@ def stats_format_today() -> str:
         u = today.get(uid_s) or {}
         r = int(u.get("receipts", 0))
         s = int(u.get("statements", 0))
-        lines.append(f"• {name}\n  id {uid}\n  чеков: {r}, выписок: {s}")
-    lines.append("")
-    lines.append("(8178442784 в статистике не учитывается.)")
+        lines.append(f"• {name}\n  чеков: {r}, выписок: {s}")
     return "\n".join(lines)
 
 
