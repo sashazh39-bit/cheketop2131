@@ -1520,7 +1520,7 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                         "sendMessage",
                         {
                             "chat_id": chat_id,
-                            "text": "❌ Шаблон Альфа не найден. Положите AM_1774134591446.pdf в папку бота или ~/Downloads/",
+                            "text": "❌ Шаблон Альфа не найден: выписка_жуков_177414_СБП_одна_операция.pdf (в папке бота или ~/Downloads/). Пересборка: python3 build_statement_zhukov_177414.py",
                         },
                     )
                     if uid in USER_STATE:

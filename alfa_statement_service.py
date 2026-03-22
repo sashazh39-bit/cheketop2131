@@ -16,20 +16,20 @@ from pathlib import Path
 from typing import Any
 
 BASE_DIR = Path(__file__).parent
-# Проходящий эталон (см. task2_statements.py) — НЕ AM_1774109927283 (другая вёрстка/ModDate/потоки).
+# Основной шаблон бота — готовая выписка 177414 (одна СБП, +7 в шрифте). Пересобрать: build_statement_zhukov_177414.py
+_STATEMENT_TEMPLATE = "выписка_жуков_177414_СБП_одна_операция.pdf"
 _BASE_ALFA_PDF_CANDIDATES = [
-    BASE_DIR / "AM_1774134591446.pdf",
-    Path.home() / "Downloads" / "AM_1774134591446.pdf",
-    BASE_DIR / "AM_1774109927283.pdf",  # запасной шаблон, может не пройти ту же проверку
+    BASE_DIR / _STATEMENT_TEMPLATE,
+    Path.home() / "Downloads" / _STATEMENT_TEMPLATE,
 ]
 BASE_PDF = next((p for p in _BASE_ALFA_PDF_CANDIDATES if p.exists()), _BASE_ALFA_PDF_CANDIDATES[0])
 
-# ── Значения по умолчанию: AM_1774134591446.pdf (эталон) / fallback старый шаблон ──
+# ── Значения по умолчанию: выписка_жуков_177414_СБП_одна_операция.pdf ──
 
 BLOCK2_DEFAULTS = {
-    "входящий_остаток": "1 852,90",
+    "входящий_остаток": "56 812,93",
     "поступления": "0,00",
-    "расходы": "40,00",
+    "расходы": "55 000,03",
     "исходящий_остаток": "1 812,90",
     "платежный_лимит": "1 812,90",
     "текущий_баланс": "1 812,90",
@@ -37,19 +37,30 @@ BLOCK2_DEFAULTS = {
 
 BLOCK3_DEFAULTS = {
     "номер_счета": "40817810980480002476",
-    "клиент_имя": "Жеребятьев Александр",
-    "клиент_отчество": "Евгеньевич",
-    "индекс": "238753",
-    "город": "Советск",
-    "дом_кв": "8В, кв. 78",
-    "адрес_полный": "238753, РОССИЯ, \nКалининградская область, \nОБЛАСТЬ Калининградская, \nСоветск, УЛИЦА Каштановая, д. \n8В, кв. 78",
+    "клиент_имя": "Жуков Алексей",
+    "клиент_отчество": "Ефимович",
+    "индекс": "238340",
+    "город": "Светлый",
+    "дом_кв": "2А, кв. 34",
+    # Суффикс после названия города в потоке (у Каштановой / Калининградской разная вёрстка)
+    "_city_street_suffix": ", УЛИЦА Калининградская, \nд. ",
+    "адрес_полный": (
+        "238340, РОССИЯ, \n"
+        "Калининградская область, \n"
+        "ОБЛАСТЬ Калининградская, \n"
+        "Светлый, УЛИЦА Калининградская, \n"
+        "д. 2А, кв. 34"
+    ),
 }
 
 BLOCK1_DEFAULTS = {
     "код_операции_расход": "C822502260006543",
     "телефон": "+7 (911) 858-45-",
     "телефон_окончание": "52",
-    "сумма_расход": "30,00",
+    "сумма_расход": "55 000,03",
+    "код_операции_приход": "—",
+    "получатель_сокр": "—",
+    "сумма_приход": "—",
 }
 
 BLOCK_LABELS = {
@@ -199,9 +210,26 @@ def validate_text(text: str, pdf_path: Path | None = None) -> list[str]:
     return missing
 
 
-# Код операции C… из эталона AM_1774134591446 — встречается в нескольких Tj/CMap;
-# глобальная замена в одном проходе с остальными патчами оставляет «хвосты».
-ALFA_TEMPLATE_OP_C = "C822502260006543"
+def get_alfa_template_op_c() -> str:
+    """Код операции C… из текущего BASE_PDF (первая операция scan_alfa_block2).
+
+    Для AM_1774109927283 — C162103261572702; для AM_1774134591446 — C822502260006543.
+    """
+    if not BASE_PDF.exists():
+        return "C162103261572702"
+    try:
+        from vyписка_service import scan_alfa_block2
+
+        for op in scan_alfa_block2(BASE_PDF):
+            nid = (op.get("номер_операции") or "").strip()
+            if nid.startswith("C") and len(nid) >= 10:
+                return nid
+    except Exception:
+        pass
+    return "C162103261572702"
+
+
+# Код C… встречается в нескольких Tj/CMap — глобальную замену выносим во 2-ю фазу (несколько проходов).
 
 
 def split_alfa_pairs_defer_global_op_c(
@@ -212,7 +240,7 @@ def split_alfa_pairs_defer_global_op_c(
 
     Вторую фазу обрабатывает apply_deferred_op_c_replacements (несколько проходов).
     """
-    toc = template_op_c or ALFA_TEMPLATE_OP_C
+    toc = template_op_c if template_op_c is not None else get_alfa_template_op_c()
     first: list[tuple[str, str]] = []
     deferred: list[tuple[str, str]] = []
     for old, new in pairs:
@@ -405,8 +433,9 @@ def patch_alfa_statement(
                 new_full = f"{new_val}, РОССИЯ,"
                 phase1_replacements.append((old_full, new_full))
             elif key == "город":
-                old_full = f"{current['город']}, УЛИЦА Каштановая, д."
-                new_full = f"{new_val}, УЛИЦА Каштановая, д."
+                suf = current.get("_city_street_suffix", ", УЛИЦА Каштановая, д.")
+                old_full = f"{current['город']}{suf}"
+                new_full = f"{new_val}{suf}"
                 phase1_replacements.append((old_full, new_full))
             else:
                 phase1_replacements.append((current[key], new_val))
@@ -720,10 +749,10 @@ _TM_RIGHT_EDGES: dict[float, float] = {
     628.397: 566.979,  # расходы
     611.347: 566.979,  # исходящий_остаток
     594.297: 566.979,  # платежный_лимит
-    537.497: 566.979,  # текущий_баланс (старый шаблон)
-    554.547: 566.979,  # текущий баланс — AM_1774134591446
-    427.104: 568.028,  # Block 2 op amount (старый шаблон)
-    # AM_1774134591446 — строки сумм операций (Tm y из эталона)
+    537.497: 566.979,  # текущий_баланс
+    427.104: 568.028,  # Block 2 op amount (AM_1774109927283)
+    # Доп. y для AM_1774134591446 (если подставлен как запасной шаблон)
+    554.547: 566.979,
     466.152: 566.979,
     456.953: 566.979,
     444.154: 566.979,
