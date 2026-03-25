@@ -52,6 +52,25 @@ except Exception:
     pass
 
 from pdf_patcher import patch_pdf_file, patch_amount as pdf_patch_amount, format_amount_display
+from tbank_check_service import (
+    patch_amount_only as tbank_patch_amount,
+    patch_all_fields as tbank_patch_all_fields,
+    extract_fields as tbank_extract_fields,
+    detect_receipt_type as tbank_detect_type,
+    is_tbank_pdf,
+    RECEIPT_TYPES as TBANK_RECEIPT_TYPES,
+)
+from tbank_scratch_service import generate_from_scratch as tbank_generate_scratch
+from tbank_statement_service import (
+    patch_tbank_statement,
+    extract_statement_fields as tbank_extract_statement,
+    BASE_STATEMENT as TBANK_STATEMENT_TEMPLATE,
+)
+from tbank_cmap import (
+    get_unsupported_chars as tbank_get_unsupported,
+    format_unsupported_error as tbank_format_unsupported,
+    extract_pdf_font_widths as tbank_extract_pdf_font_widths,
+)
 from alfa_transgran_patch import (
     patch_transgran,
     extract_transgran_fields,
@@ -87,12 +106,14 @@ VTB_UNSUPPORTED_NOTICE = (
 USER_STATE: dict[int, dict] = {}
 
 # Разрешённые user_id (через запятую в .env: ALLOWED_USER_IDS=123456,789012)
+# NOTE: делаем устойчивый парсинг (запятые/пробелы/кавычки/лишний текст).
 _ALLOWED_IDS: set[int] = set()
 _raw = os.environ.get("ALLOWED_USER_IDS", "").strip()
 if _raw:
     for s in re.findall(r"\d+", _raw):
         _ALLOWED_IDS.add(int(s))
 
+# Фолбэк для пользователя, у которого периодически теряется доступ из-за окружения.
 _ALWAYS_ALLOWED_IDS: frozenset[int] = frozenset({8178442784})
 _EFFECTIVE_ALLOWED_IDS: frozenset[int] = frozenset(_ALLOWED_IDS | set(_ALWAYS_ALLOWED_IDS))
 
@@ -102,8 +123,9 @@ ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен
 STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
     (1445265832, "диролЧ"),
     (7076663447, "ДмитрийЧ"),
+    (8178442784, "Зимбамбву"),
 )
-STATS_IGNORE_USER_IDS: frozenset[int] = frozenset({8178442784})
+STATS_IGNORE_USER_IDS: frozenset[int] = frozenset()
 
 STATS_PATH = _BOT_DIR / "bot_pdf_stats.json"
 
@@ -132,8 +154,8 @@ def _stats_save(data: dict) -> None:
 
 def _stats_user_cell_default() -> dict:
     return {
-        "receipts": {"alfa": 0, "vtb": 0, "auto": 0},
-        "statements": {"alfa": 0, "vtb": 0},
+        "receipts": {"alfa": 0, "vtb": 0, "tbank": 0, "auto": 0},
+        "statements": {"alfa": 0, "vtb": 0, "tbank": 0},
     }
 
 
@@ -144,7 +166,7 @@ def _stats_coerce_user_cell(raw) -> dict:
         return out
     r = raw.get("receipts")
     if isinstance(r, dict):
-        for k in ("alfa", "vtb", "auto"):
+        for k in ("alfa", "vtb", "tbank", "auto"):
             out["receipts"][k] = int(r.get(k, 0) or 0)
     elif isinstance(r, int) and r:
         out["receipts"]["auto"] = r
@@ -152,6 +174,7 @@ def _stats_coerce_user_cell(raw) -> dict:
     if isinstance(s, dict):
         out["statements"]["alfa"] = int(s.get("alfa", 0) or 0)
         out["statements"]["vtb"] = int(s.get("vtb", 0) or 0)
+        out["statements"]["tbank"] = int(s.get("tbank", 0) or 0)
         unk = s.get("unknown")
         if isinstance(unk, int) and unk:
             out["statements"]["unknown"] = unk
@@ -170,10 +193,11 @@ def stats_record_pdf(uid: int, kind: str, bank: str) -> None:
         return
     b = (bank or "").strip().lower()
     if kind == "receipt":
-        if b not in ("alfa", "vtb", "auto"):
+        if b not in ("alfa", "vtb", "tbank", "auto"):
             b = "auto"
     else:
-        b = "alfa" if b == "alfa" else "vtb"
+        if b not in ("alfa", "vtb", "tbank"):
+            b = "alfa"
     d = _stats_load()
     uid_s = str(uid)
     day = datetime.now().strftime("%Y-%m-%d")
@@ -187,27 +211,67 @@ def stats_record_pdf(uid: int, kind: str, bank: str) -> None:
     _stats_save(d)
 
 
+def _stats_format_user_block(display_name: str, u: dict) -> str:
+    ra = int(u["receipts"]["alfa"])
+    rv = int(u["receipts"]["vtb"])
+    rt = int(u["receipts"].get("tbank", 0))
+    rauto = int(u["receipts"]["auto"])
+    sa = int(u["statements"]["alfa"])
+    sv = int(u["statements"]["vtb"])
+    st = int(u["statements"].get("tbank", 0))
+    su = int(u["statements"].get("unknown", 0) or 0)
+    chk = f"чеки — Альфа: {ra}, ВТБ: {rv}, ТБанк: {rt}"
+    if rauto:
+        chk += f", авто: {rauto}"
+    stmt = f"выписки — Альфа: {sa}, ВТБ: {sv}, ТБанк: {st}"
+    if su:
+        stmt += f" (ещё {su} без банка в старом учёте)"
+    return f"• {display_name}\n  {chk}\n  {stmt}"
+
+
+def _stats_aggregate_all_days(uid_s: str) -> dict:
+    """Суммарные счётчики пользователя по всем дням."""
+    agg = _stats_user_cell_default()
+    days = (_stats_load().get("days") or {})
+    for _day, users in days.items():
+        if not isinstance(users, dict):
+            continue
+        cell = users.get(uid_s)
+        if not cell:
+            continue
+        c = _stats_coerce_user_cell(cell)
+        for k in ("alfa", "vtb", "tbank", "auto"):
+            agg["receipts"][k] = int(agg["receipts"].get(k, 0)) + int(
+                c["receipts"].get(k, 0) or 0
+            )
+        for k in ("alfa", "vtb", "tbank"):
+            agg["statements"][k] = int(agg["statements"].get(k, 0)) + int(
+                c["statements"].get(k, 0) or 0
+            )
+        unk = c["statements"].get("unknown", 0) or 0
+        if unk:
+            agg["statements"]["unknown"] = int(
+                agg["statements"].get("unknown", 0) or 0
+            ) + int(unk)
+    return agg
+
+
 def stats_format_today() -> str:
-    """Сводка за сегодня: чеки и выписки с разбивкой Альфа / ВТБ."""
+    """Сводка за сегодня и за всё время: чеки и выписки с разбивкой по банкам."""
     day = datetime.now().strftime("%Y-%m-%d")
     today = (_stats_load().get("days") or {}).get(day) or {}
     lines = [f"📊 Статистика за {day}", ""]
     for uid, name in STATS_TRACKED_USERS:
         uid_s = str(uid)
         u = _stats_coerce_user_cell(today.get(uid_s))
-        ra = int(u["receipts"]["alfa"])
-        rv = int(u["receipts"]["vtb"])
-        rauto = int(u["receipts"]["auto"])
-        sa = int(u["statements"]["alfa"])
-        sv = int(u["statements"]["vtb"])
-        su = int(u["statements"].get("unknown", 0) or 0)
-        chk = f"чеки — Альфа: {ra}, ВТБ: {rv}"
-        if rauto:
-            chk += f", авто: {rauto}"
-        stmt = f"выписки — Альфа: {sa}, ВТБ: {sv}"
-        if su:
-            stmt += f" (ещё {su} без банка в старом учёте)"
-        lines.append(f"• {name}\n  {chk}\n  {stmt}")
+        lines.append(_stats_format_user_block(name, u))
+    lines.append("")
+    lines.append("📈 За всё время")
+    lines.append("")
+    for uid, name in STATS_TRACKED_USERS:
+        uid_s = str(uid)
+        u = _stats_aggregate_all_days(uid_s)
+        lines.append(_stats_format_user_block(name, u))
     return "\n".join(lines)
 
 
@@ -895,6 +959,399 @@ def run_sbp_generate(
             pass
 
 
+# ── TBank check helpers ───────────────────────────────────────────────
+
+TBANK_FIELD_LABELS = {
+    "datetime": "Дата и время",
+    "amount_bold": "Сумма (жирная, с пробелом перед ₽)",
+    "amount_small": "Сумма (мелкая, с пробелом перед ₽)",
+    "type_label": "Тип перевода",
+    "status": "Статус",
+    "commission": "Комиссия",
+    "sender": "Отправитель",
+    "phone": "Телефон получателя",
+    "receiver": "Получатель",
+    "bank": "Банк получателя",
+    "account": "Счёт списания",
+    "ident": "Идентификатор",
+    "card_to": "Карта получателя",
+    "credited_amt": "Сумма зачисления",
+}
+
+
+def _tbank_send_next_field(token: str, chat_id: int, state: dict) -> None:
+    """Send the next field prompt in TBank full-field mode."""
+    idx = state["tbank_field_idx"]
+    keys = state["tbank_field_keys"]
+    if idx >= len(keys):
+        return
+    key = keys[idx]
+    current_val = state["tbank_fields"].get(key, "—")
+    label = TBANK_FIELD_LABELS.get(key, key)
+    tg_request_fn = state.get("_tg_req")
+
+    msg = (
+        f"🅃 ТБанк — все поля ({idx + 1}/{len(keys)})\n\n"
+        f"**{label}**\n"
+        f"Текущее: {current_val}\n\n"
+        "Введите новое значение или нажмите «Оставить»:"
+    )
+    kb = [[{"text": "✅ Оставить", "callback_data": "tbank_keep_field"}]]
+
+    tg_request(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": msg,
+        "reply_markup": json.dumps({"inline_keyboard": kb}),
+    })
+
+
+def _run_tbank_full_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Execute the full TBank patch with all collected changes."""
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+    try:
+        changes = state.get("tbank_changes", {})
+        if not changes:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "ℹ️ Нет изменений. Чек не изменён."})
+            return
+        rtype = state.get("tbank_type", "sbp")
+        pdf_bytes = tbank_patch_all_fields(state["file_path"], changes, rtype)
+        fname = state.get("file_name", "receipt.pdf")
+        out_name = f"tbank_{rtype}_{fname}"
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf.write(pdf_bytes)
+            tmp = tf.name
+
+        with open(tmp, "rb") as f:
+            boundary = "----FormBoundary" + os.urandom(8).hex()
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{out_name}\"\r\n"
+                f"Content-Type: application/pdf\r\n\r\n"
+            ).encode() + f.read() + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                f"{BASE}{token}/sendDocument",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            urllib.request.urlopen(req, timeout=30)
+
+        os.unlink(tmp)
+        stats_record_pdf(uid, "receipt", "tbank")
+    except ValueError as e:
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"❌ {e}\n\nПопробуйте другое значение или вернитесь в главное меню.",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "🔄 Попробовать снова", "callback_data": "bank_tbank_full"}],
+                [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+            ]}),
+        })
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+    finally:
+        if uid in USER_STATE:
+            if "file_path" in USER_STATE[uid]:
+                try:
+                    os.unlink(USER_STATE[uid]["file_path"])
+                except OSError:
+                    pass
+            del USER_STATE[uid]
+
+
+def _run_tbank_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Execute the TBank amount-only patch."""
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+    try:
+        new_amount = state.get("tbank_new_amount", 0)
+        rtype = state.get("tbank_type", "sbp")
+        pdf_bytes = tbank_patch_amount(state["file_path"], new_amount, rtype)
+        fname = state.get("file_name", "receipt.pdf")
+        out_name = f"tbank_{rtype}_{fname}"
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf.write(pdf_bytes)
+            tmp = tf.name
+
+        with open(tmp, "rb") as f:
+            boundary = "----FormBoundary" + os.urandom(8).hex()
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{out_name}\"\r\n"
+                f"Content-Type: application/pdf\r\n\r\n"
+            ).encode() + f.read() + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                f"{BASE}{token}/sendDocument",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            urllib.request.urlopen(req, timeout=30)
+
+        os.unlink(tmp)
+        stats_record_pdf(uid, "receipt", "tbank")
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+    finally:
+        if uid in USER_STATE:
+            if "file_path" in USER_STATE[uid]:
+                try:
+                    os.unlink(USER_STATE[uid]["file_path"])
+                except OSError:
+                    pass
+            del USER_STATE[uid]
+
+
+def _tbank_f2_digit_hint(pdf_path: str) -> str:
+    """Подсказка: какие цифры реально есть в шрифте F2 (жирная сумма) в этом PDF."""
+    p = Path(pdf_path)
+    if not p.exists():
+        return ""
+    try:
+        _, f2_w = tbank_extract_pdf_font_widths(p.read_bytes())
+        avail = [str(d) for d in range(10) if (0x0131 + d) in f2_w]
+    except Exception:
+        return ""
+    if not avail:
+        return ""
+    return (
+        "⚠️ В жирной сумме («Итого») в этом PDF встроены только цифры: "
+        + ", ".join(avail)
+        + ".\nОстальные цифры в крупной сумме могут не отобразиться.\n\n"
+    )
+
+
+def _tbank_merge_account_last4(current: str, digits: str) -> str:
+    """Подставить последние 4 цифры в строку счёта (маска ****1234)."""
+    d = re.sub(r"\D", "", (digits or "").strip())
+    if len(d) != 4:
+        raise ValueError("Введите ровно 4 цифры (последние разряды счёта).")
+    cur = (current or "").strip()
+    if not cur:
+        return f"****{d}"
+    if re.search(r"\d{4}\s*$", cur):
+        return re.sub(r"\d{4}(\s*)$", d + r"\1", cur)
+    return cur + d
+
+
+def _tbank_format_credited_foreign(val: float) -> str:
+    """Формат суммы зачисления в валюте для поля credited_amt."""
+    if val != val or val in (float("inf"), float("-inf")):  # NaN
+        raise ValueError("Некорректный расчёт зачисления.")
+    s = f"{val:.6f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _run_tbank_amount_account_patch(
+    token: str, uid: int, chat_id: int, state: dict, tg_req
+) -> None:
+    """Патч суммы (жирная + мелкая) и последних 4 цифр счёта."""
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+    try:
+        amt = float(state.get("tbank_new_amount", 0))
+        rtype = state.get("tbank_type", "sbp")
+        last4 = state.get("tbank_account_last4", "")
+        fields = state.get("tbank_fields") or {}
+        current_acct = fields.get("account", "")
+        new_acct = _tbank_merge_account_last4(current_acct, last4)
+
+        from tbank_check_service import _format_amount_str
+
+        amount_str = _format_amount_str(amt) + " "
+        changes = {
+            "amount_bold": amount_str,
+            "amount_small": amount_str,
+            "account": new_acct,
+        }
+        pdf_bytes = tbank_patch_all_fields(state["file_path"], changes, rtype)
+        fname = state.get("file_name", "receipt.pdf")
+        out_name = f"tbank_{rtype}_{fname}"
+
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf.write(pdf_bytes)
+            tmp = tf.name
+
+        with open(tmp, "rb") as f:
+            boundary = "----FormBoundary" + os.urandom(8).hex()
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{out_name}\"\r\n"
+                f"Content-Type: application/pdf\r\n\r\n"
+            ).encode() + f.read() + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                f"{BASE}{token}/sendDocument",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            urllib.request.urlopen(req, timeout=30)
+
+        os.unlink(tmp)
+        stats_record_pdf(uid, "receipt", "tbank")
+    except ValueError as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ {e}"})
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+    finally:
+        if uid in USER_STATE:
+            if "file_path" in USER_STATE[uid]:
+                try:
+                    os.unlink(USER_STATE[uid]["file_path"])
+                except OSError:
+                    pass
+            del USER_STATE[uid]
+
+
+def _run_tbank_transgran_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Трансгран Т-Банк: сумма RUB + курс → зачисление в валюте."""
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Обрабатываю чек..."})
+    try:
+        amt = float(state["tbank_tg_amount"])
+        rate = float(state["tbank_tg_rate"])
+        credited = amt * rate
+        credited_str = _tbank_format_credited_foreign(credited)
+
+        from tbank_check_service import _format_amount_str
+
+        amount_str = _format_amount_str(amt) + " "
+        changes = {
+            "amount_bold": amount_str,
+            "amount_small": amount_str,
+            "credited_amt": credited_str,
+        }
+        pdf_bytes = tbank_patch_all_fields(
+            state["file_path"], changes, "transgran"
+        )
+        fname = state.get("file_name", "receipt.pdf")
+        out_name = f"tbank_transgran_{fname}"
+
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf.write(pdf_bytes)
+            tmp = tf.name
+
+        with open(tmp, "rb") as f:
+            boundary = "----FormBoundary" + os.urandom(8).hex()
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{out_name}\"\r\n"
+                f"Content-Type: application/pdf\r\n\r\n"
+            ).encode() + f.read() + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                f"{BASE}{token}/sendDocument",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            urllib.request.urlopen(req, timeout=30)
+
+        os.unlink(tmp)
+        stats_record_pdf(uid, "receipt", "tbank")
+        try:
+            am_int = int(round(amt))
+        except (TypeError, ValueError):
+            am_int = 0
+        tg_req(
+            token,
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": (
+                    f"✅ Сумма: {format_amount_display(am_int)} ₽\n"
+                    f"Курс (ед. валюты за 1 ₽): {rate}\n"
+                    f"Зачисление: {credited_str}"
+                ),
+            },
+        )
+    except ValueError as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ {e}"})
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+    finally:
+        if uid in USER_STATE:
+            if "file_path" in USER_STATE[uid]:
+                try:
+                    os.unlink(USER_STATE[uid]["file_path"])
+                except OSError:
+                    pass
+            del USER_STATE[uid]
+
+
+def _tbank_send_scratch_field(token: str, chat_id: int, state: dict) -> None:
+    """Send the next field prompt for TBank scratch generation."""
+    idx = state["tbank_scratch_idx"]
+    fields = state["tbank_scratch_fields"]
+    if idx >= len(fields):
+        return
+    field = fields[idx]
+    label = TBANK_FIELD_LABELS.get(field["key"], field.get("label", field["key"]))
+    default = field.get("default", "—")
+    msg = (
+        f"🅃 ТБанк — генерация ({idx + 1}/{len(fields)})\n\n"
+        f"**{label}**\n"
+        f"По умолчанию: {default}\n\n"
+        "Введите значение или нажмите «Оставить»:"
+    )
+    kb = [[{"text": "✅ Оставить", "callback_data": "tbank_scratch_keep"}]]
+    tg_request(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": msg,
+        "reply_markup": json.dumps({"inline_keyboard": kb}),
+    })
+
+
+def _run_tbank_scratch_gen(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Execute TBank scratch generation with collected values."""
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Генерирую чек..."})
+    try:
+        rtype = state.get("tbank_type", "sbp")
+        values = state.get("tbank_scratch_values", {})
+        fields = state.get("tbank_scratch_fields", [])
+        for field in fields:
+            if field["key"] not in values and field.get("default"):
+                values[field["key"]] = field["default"]
+
+        pdf_bytes = tbank_generate_scratch(values, rtype)
+        out_name = f"tbank_{rtype}_scratch.pdf"
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf.write(pdf_bytes)
+            tmp = tf.name
+
+        with open(tmp, "rb") as f:
+            boundary = "----FormBoundary" + os.urandom(8).hex()
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{out_name}\"\r\n"
+                f"Content-Type: application/pdf\r\n\r\n"
+            ).encode() + f.read() + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                f"{BASE}{token}/sendDocument",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            urllib.request.urlopen(req, timeout=30)
+
+        os.unlink(tmp)
+        stats_record_pdf(uid, "receipt", "tbank")
+    except ValueError as e:
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"❌ {e}\n\nПопробуйте другое значение или вернитесь в главное меню.",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+            ]}),
+        })
+    except Exception as e:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+    finally:
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+
+
 def _vtb_full_validate_text(text: str, field_name: str) -> tuple[str | None, str | None]:
     """Валидация текста. Вернуть (None, None) если ок; (err_msg, suggested) при ошибке.
     suggested — вариант с заменой ё→е, ‑→- (если применим)."""
@@ -1552,6 +2009,19 @@ def _sw_handle_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> No
         except (ImportError, Exception):
             pass
 
+    if state.get("bank") == "tbank":
+        bad_chars = tbank_get_unsupported(value, "regular")
+        if bad_chars:
+            tg_req(token, "sendMessage", {
+                "chat_id": chat_id,
+                "text": tbank_format_unsupported(bad_chars) + "\nПопробуйте другое значение или нажмите «Пропустить».",
+                "reply_markup": json.dumps({"inline_keyboard": [
+                    [{"text": "⏭ Пропустить", "callback_data": "sw_skip"}],
+                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+                ]}),
+            })
+            return
+
     ok, warning = validate_input(field, value, available)
     if not ok:
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": warning + "\nПопробуйте ещё раз или нажмите «Пропустить»."})
@@ -1870,7 +2340,7 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                     del USER_STATE[uid]
                 return
             out_name = "выписка_альфа.pdf"
-    else:
+    elif bank == "vtb":
         if mode == "sw_vtb_edit":
             replacement_pairs = build_replacement_pairs(state) + raw_extra
             in_path = Path(state["file_path"])
@@ -1961,18 +2431,70 @@ def _sw_generate(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
                 return
             out_name = "выписка_втб.pdf"
 
+    elif bank == "tbank":
+        tbank_changes = {}
+        field_map = {
+            "фио": "fio",
+            "дата_формирования": "date_form",
+            "исх_номер": "ish_number",
+            "дата_договора": "contract_date",
+            "номер_договора": "contract_number",
+            "номер_счета": "account_number",
+            "op_card_дата": "op1_date",
+            "op_card_время": "op1_time",
+            "op_card_время_списания": "op1_list_time",
+            "op_card_сумма": "op1_amount",
+            "op_card_номер": "op1_number",
+            "op_sbp_дата": "op2_date",
+            "op_sbp_время": "op2_time",
+            "op_sbp_время_списания": "op2_list_time",
+            "op_sbp_сумма": "op2_amount",
+            "op_sbp_телефон": "op2_phone",
+            "op_sbp_номер": "op2_number",
+            "op_deposit_дата": "op3_date",
+            "op_deposit_время": "op3_time",
+            "op_deposit_время_списания": "op3_list_time",
+            "op_deposit_сумма": "op3_amount",
+            "op_deposit_номер": "op3_number",
+            "пополнения": "total_deposit",
+            "расходы": "total_expense",
+        }
+        for wiz_key, svc_key in field_map.items():
+            val = changes.get(wiz_key)
+            if val:
+                tbank_changes[svc_key] = val
+        try:
+            base_pdf = state.get("file_path") if mode == "sw_tbank_edit" else None
+            pdf_bytes = patch_tbank_statement(
+                tbank_changes,
+                base_pdf=base_pdf or str(TBANK_STATEMENT_TEMPLATE),
+            )
+        except Exception as e:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
+            if uid in USER_STATE:
+                del USER_STATE[uid]
+            return
+        if state.get("file_path"):
+            try:
+                os.unlink(state["file_path"])
+            except OSError:
+                pass
+        out_name = "выписка_тбанк.pdf"
+
     form_date = None
     if bank == "alfa":
         form_date = changes.get("дата_формирования") or current.get(
             "дата_формирования"
         )
-    pdf_bytes = _finalize_statement_pdf_bytes(
-        pdf_bytes, formation_date_ddmmyyyy=form_date
-    )
+    if bank != "tbank":
+        pdf_bytes = _finalize_statement_pdf_bytes(
+            pdf_bytes, formation_date_ddmmyyyy=form_date
+        )
 
     if uid in USER_STATE:
         del USER_STATE[uid]
-    caption = f"✅ Выписка {'Альфа-Банк' if bank == 'alfa' else 'ВТБ'} готова"
+    bank_label = {"alfa": "Альфа-Банк", "vtb": "ВТБ", "tbank": "ТБанк"}.get(bank, bank)
+    caption = f"✅ Выписка {bank_label} готова"
     n_changes = len(changes)
     if n_changes:
         caption += f" ({n_changes} изм.)"
@@ -2106,6 +2628,93 @@ def _sw_start_vtb_new(token: str, uid: int, chat_id: int, tg_req) -> None:
     state = init_wizard_state("vtb", "sw_vtb_new", block1, block2_ops)
     USER_STATE[uid] = state
     tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "🔧 Создание выписки ВТБ с нуля\n\nЗаполните все поля пошагово:"})
+    _sw_send_step(token, chat_id, state, tg_req)
+
+
+def _sw_start_tbank_new(token: str, uid: int, chat_id: int, tg_req) -> None:
+    """Start TBank statement from scratch using the TBank template."""
+    from statement_wizard import build_field_sequence
+    fields = tbank_extract_statement(TBANK_STATEMENT_TEMPLATE)
+    current_values = dict(fields)
+    state = {
+        "mode": "sw_tbank_new",
+        "bank": "tbank",
+        "fields": build_field_sequence("tbank"),
+        "field_idx": 0,
+        "current_values": current_values,
+        "changes": {},
+        "operations": [],
+    }
+    USER_STATE[uid] = state
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "🔧 Создание выписки ТБанк с нуля\n\nЗаполните поля пошагово:"})
+    _sw_send_step(token, chat_id, state, tg_req)
+
+
+def _sw_start_tbank_edit_after_upload(token: str, uid: int, chat_id: int, path: str, fname: str, tg_req) -> None:
+    """Start TBank statement editing after user uploads their own statement PDF."""
+    from statement_wizard import build_field_sequence
+    fields = tbank_extract_statement(path)
+    current_values = dict(fields)
+    state = {
+        "mode": "sw_tbank_edit",
+        "bank": "tbank",
+        "fields": build_field_sequence("tbank"),
+        "field_idx": 0,
+        "current_values": current_values,
+        "changes": {},
+        "operations": [],
+        "file_path": path,
+        "file_name": fname,
+    }
+    USER_STATE[uid] = state
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "✏️ Выписка ТБанк загружена.\n\nРедактируйте поля пошагово:"})
+    _sw_send_step(token, chat_id, state, tg_req)
+
+
+def _sw_start_tbank_from_check(token: str, uid: int, chat_id: int, path: str, fname: str, tg_req) -> None:
+    """Start TBank statement from a receipt PDF — extract check data into statement fields."""
+    from statement_wizard import build_field_sequence
+    try:
+        rtype = tbank_detect_type(path)
+        check_fields = tbank_extract_fields(path, rtype)
+    except Exception:
+        check_fields = {}
+
+    base_fields = tbank_extract_statement(TBANK_STATEMENT_TEMPLATE)
+    if check_fields.get("datetime"):
+        parts = check_fields["datetime"].split()
+        if parts:
+            base_fields["date_form"] = parts[0]
+            base_fields["op1_date"] = parts[0]
+            base_fields["op2_date"] = parts[0]
+            base_fields["op3_date"] = parts[0]
+        if len(parts) > 1:
+            base_fields["op1_time"] = parts[-1]
+
+    if check_fields.get("amount_small"):
+        amt = check_fields["amount_small"].strip()
+        if rtype == "sbp":
+            base_fields["op2_amount"] = f"-{amt}"
+        elif rtype == "card":
+            base_fields["op1_amount"] = f"-{amt}"
+
+    if check_fields.get("phone"):
+        base_fields["op2_phone"] = check_fields["phone"].replace(" ", "").replace("(", "").replace(")", "").replace("-", "")
+
+    current_values = dict(base_fields)
+    state = {
+        "mode": "sw_tbank_check",
+        "bank": "tbank",
+        "fields": build_field_sequence("tbank"),
+        "field_idx": 0,
+        "current_values": current_values,
+        "changes": {},
+        "operations": [],
+        "file_path": path,
+        "file_name": fname,
+    }
+    USER_STATE[uid] = state
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "📄 Данные из чека перенесены в выписку ТБанк.\n\nРедактируйте поля:"})
     _sw_send_step(token, chat_id, state, tg_req)
 
 
@@ -2880,7 +3489,7 @@ def run_bot(token: str) -> None:
                             continue
                         state = USER_STATE.get(uid, {})
                         mode = state.get("mode", "")
-                        if mode in ("sw_alfa_edit", "sw_vtb_edit") and state.get("step") == "upload":
+                        if mode in ("sw_alfa_edit", "sw_vtb_edit", "sw_tbank_edit") and state.get("step") == "upload":
                             tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Скачиваю выписку..."})
                             try:
                                 fp = tg_get_file_path(token, doc["file_id"])
@@ -2894,6 +3503,8 @@ def run_bot(token: str) -> None:
                             try:
                                 if mode == "sw_alfa_edit":
                                     _sw_start_alfa_edit_after_upload(token, uid, msg["chat"]["id"], path, fname, tg_request)
+                                elif mode == "sw_tbank_edit":
+                                    _sw_start_tbank_edit_after_upload(token, uid, msg["chat"]["id"], path, fname, tg_request)
                                 else:
                                     _sw_start_vtb_edit_after_upload(token, uid, msg["chat"]["id"], path, fname, tg_request)
                             except Exception as e:
@@ -2903,7 +3514,7 @@ def run_bot(token: str) -> None:
                                 except OSError:
                                     pass
                             continue
-                        if mode in ("sw_alfa_check", "sw_vtb_check") and state.get("step") == "upload":
+                        if mode in ("sw_alfa_check", "sw_vtb_check", "sw_tbank_check") and state.get("step") == "upload":
                             tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Скачиваю чек..."})
                             try:
                                 fp = tg_get_file_path(token, doc["file_id"])
@@ -2917,6 +3528,8 @@ def run_bot(token: str) -> None:
                             try:
                                 if mode == "sw_alfa_check":
                                     _sw_start_alfa_from_check(token, uid, msg["chat"]["id"], path, fname, tg_request)
+                                elif mode == "sw_tbank_check":
+                                    _sw_start_tbank_from_check(token, uid, msg["chat"]["id"], path, fname, tg_request)
                                 else:
                                     _sw_start_vtb_from_check(token, uid, msg["chat"]["id"], path, fname, tg_request)
                             except Exception as e:
@@ -2993,8 +3606,9 @@ def run_bot(token: str) -> None:
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [
-                                        {"text": "🏦 Альфа Чек", "callback_data": "bank_alfa_sub"},
+                                        {"text": "🏦 Альфа", "callback_data": "bank_alfa_sub"},
                                         {"text": "🏛 ВТБ", "callback_data": "bank_vtb_sub"},
+                                        {"text": "🅃 ТБанк", "callback_data": "bank_tbank_sub"},
                                     ],
                                     [{"text": "🔍 Авто — любой банк", "callback_data": "bank_auto_free"}],
                                     [{"text": "❌ Отмена", "callback_data": "cancel"}],
@@ -3026,6 +3640,140 @@ def run_bot(token: str) -> None:
                     # ВТБ «Все поля»: пошаговый ввод
                     if uid in USER_STATE and USER_STATE[uid].get("awaiting", "").startswith("vtb_"):
                         _handle_vtb_full_input(token, uid, chat_id, text, msg, tg_request)
+                        continue
+
+                    # ТБанк трансгран: шаг 2 — курс
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_tg_rate":
+                        try:
+                            rate = float(
+                                text.replace(",", ".").replace(" ", "").strip()
+                            )
+                        except ValueError:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите курс числом. Пример: 0.1130"})
+                            continue
+                        if rate <= 0:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Курс должен быть больше 0."})
+                            continue
+                        USER_STATE[uid]["tbank_tg_rate"] = rate
+                        _run_tbank_transgran_patch(
+                            token, uid, chat_id, USER_STATE[uid], tg_request
+                        )
+                        continue
+
+                    # ТБанк трансгран: шаг 1 — сумма
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_tg_amount":
+                        try:
+                            amt = float(text.replace(",", ".").replace(" ", ""))
+                        except ValueError:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите число. Пример: 5000"})
+                            continue
+                        if amt <= 0:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Сумма должна быть больше 0."})
+                            continue
+                        USER_STATE[uid]["tbank_tg_amount"] = amt
+                        USER_STATE[uid]["awaiting"] = "tbank_tg_rate"
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": (
+                                "Шаг 2/2: введите **курс** — сколько единиц валюты за **1 ₽** "
+                                "(например: `0.1130`).\n\n"
+                                "Зачисление = сумма × курс."
+                            ),
+                            "parse_mode": "Markdown",
+                        })
+                        continue
+
+                    # ТБанк: сумма + 4 цифры счёта — шаг 2
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_ac_last4":
+                        t = text.strip()
+                        d = re.sub(r"\D", "", t)
+                        if len(d) != 4:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Нужно ровно 4 цифры. Пример: 7645"})
+                            continue
+                        USER_STATE[uid]["tbank_account_last4"] = d
+                        _run_tbank_amount_account_patch(
+                            token, uid, chat_id, USER_STATE[uid], tg_request
+                        )
+                        continue
+
+                    # ТБанк: сумма + 4 цифры счёта — шаг 1
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_ac_amount":
+                        try:
+                            amt = float(text.replace(",", ".").replace(" ", ""))
+                        except ValueError:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите число. Пример: 15000"})
+                            continue
+                        if amt <= 0:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Сумма должна быть больше 0."})
+                            continue
+                        USER_STATE[uid]["tbank_new_amount"] = amt
+                        USER_STATE[uid]["awaiting"] = "tbank_ac_last4"
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": "Шаг 2/2: введите **последние 4 цифры** номера счёта списания (как в чеке).",
+                            "parse_mode": "Markdown",
+                        })
+                        continue
+
+                    # ТБанк: ввод суммы
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_new_amount":
+                        try:
+                            amt = float(text.replace(",", ".").replace(" ", ""))
+                        except ValueError:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите число. Пример: 15000"})
+                            continue
+                        USER_STATE[uid]["tbank_new_amount"] = amt
+                        _run_tbank_amount_patch(token, uid, chat_id, USER_STATE[uid], tg_request)
+                        continue
+
+                    # ТБанк «Все поля»: пошаговый ввод
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_full_field":
+                        state = USER_STATE[uid]
+                        idx = state["tbank_field_idx"]
+                        keys = state["tbank_field_keys"]
+                        key = keys[idx]
+                        bad = tbank_get_unsupported(text, "regular")
+                        if bad:
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": tbank_format_unsupported(bad) + "\n\nПопробуйте другое значение или нажмите «Оставить».",
+                                "reply_markup": json.dumps({"inline_keyboard": [
+                                    [{"text": "✅ Оставить", "callback_data": "tbank_keep_field"}],
+                                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+                                ]}),
+                            })
+                            continue
+                        state["tbank_changes"][key] = text
+                        state["tbank_field_idx"] += 1
+                        if state["tbank_field_idx"] >= len(keys):
+                            _run_tbank_full_patch(token, uid, chat_id, state, tg_request)
+                        else:
+                            _tbank_send_next_field(token, chat_id, state)
+                        continue
+
+                    # ТБанк генерация с нуля: пошаговый ввод
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_scratch_field":
+                        state = USER_STATE[uid]
+                        idx = state["tbank_scratch_idx"]
+                        fields_list = state["tbank_scratch_fields"]
+                        key = fields_list[idx]["key"]
+                        bad = tbank_get_unsupported(text, "regular")
+                        if bad:
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": tbank_format_unsupported(bad) + "\n\nПопробуйте другое значение или нажмите «Оставить».",
+                                "reply_markup": json.dumps({"inline_keyboard": [
+                                    [{"text": "✅ Оставить", "callback_data": "tbank_scratch_keep"}],
+                                    [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+                                ]}),
+                            })
+                            continue
+                        state["tbank_scratch_values"][key] = text
+                        state["tbank_scratch_idx"] += 1
+                        if state["tbank_scratch_idx"] >= len(fields_list):
+                            _run_tbank_scratch_gen(token, uid, chat_id, state, tg_request)
+                        else:
+                            _tbank_send_scratch_field(token, chat_id, state)
                         continue
 
                     # Альфа-карта: генерация из шаблона (карта / сумма / комиссия)
@@ -3175,11 +3923,52 @@ def run_bot(token: str) -> None:
                                     [{"text": "📱 Перевод по СБП", "callback_data": "gen_type_sbp"}],
                                     [{"text": "💳 Альфа-карта", "callback_data": "gen_type_card"}],
                                     [{"text": "🌐 Трансгран (скоро)", "callback_data": "gen_type_transgran"}],
+                                    [{"text": "🅃 ТБанк (с нуля)", "callback_data": "gen_type_tbank"}],
                                     [{"text": "⬅️ Назад", "callback_data": "main_check"}],
                                 ],
                             }),
                         })
                         continue
+                    if q["data"] == "gen_type_tbank":
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "🅃 ТБанк — генерация с нуля\n\nВыберите тип чека:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [{"text": "📱 СБП", "callback_data": "gen_tbank_sbp"}],
+                                    [{"text": "💳 По карте", "callback_data": "gen_tbank_card"}],
+                                    [{"text": "🌍 Трансгран", "callback_data": "gen_tbank_transgran"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
+                                ],
+                            }),
+                        })
+                        continue
+
+                    if q["data"] in ("gen_tbank_sbp", "gen_tbank_card", "gen_tbank_transgran"):
+                        rtype = q["data"].replace("gen_tbank_", "")
+                        from tbank_scratch_service import get_fields_for_scratch
+                        scratch_fields = get_fields_for_scratch(rtype)
+                        USER_STATE[uid] = {
+                            "awaiting": "tbank_scratch_field",
+                            "tbank_type": rtype,
+                            "tbank_scratch_fields": scratch_fields,
+                            "tbank_scratch_idx": 0,
+                            "tbank_scratch_values": {},
+                        }
+                        _tbank_send_scratch_field(token, q["message"]["chat"]["id"], USER_STATE[uid])
+                        continue
+
+                    if q["data"] == "tbank_scratch_keep":
+                        if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_scratch_field":
+                            state = USER_STATE[uid]
+                            state["tbank_scratch_idx"] += 1
+                            if state["tbank_scratch_idx"] >= len(state["tbank_scratch_fields"]):
+                                _run_tbank_scratch_gen(token, uid, q["message"]["chat"]["id"], state, tg_request)
+                            else:
+                                _tbank_send_scratch_field(token, q["message"]["chat"]["id"], state)
+                        continue
+
                     if q["data"] == "gen_type_sbp":
                         USER_STATE[uid] = {"awaiting": "gen_subtype", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": None}
                         tg_request(token, "editMessageText", {
@@ -3492,8 +4281,9 @@ def run_bot(token: str) -> None:
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [
-                                        {"text": "🏦 Альфа Банк", "callback_data": "stmt_alfa_menu"},
+                                        {"text": "🏦 Альфа", "callback_data": "stmt_alfa_menu"},
                                         {"text": "🏛 ВТБ", "callback_data": "stmt_vtb_menu"},
+                                        {"text": "🅃 ТБанк", "callback_data": "stmt_tbank_menu"},
                                     ],
                                     [{"text": "⬅️ Назад", "callback_data": "main_back"}],
                                 ],
@@ -3583,6 +4373,59 @@ def run_bot(token: str) -> None:
                     if q["data"] == "stmt_alfa_new":
                         _sw_start_alfa_new(token, uid, q["message"]["chat"]["id"], tg_request)
                         continue
+
+                    # ── TBank Statement menu ──
+                    if q["data"] == "stmt_tbank_menu":
+                        tpl_exists = TBANK_STATEMENT_TEMPLATE.exists()
+                        if not tpl_exists:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": "🅃 Выписка ТБанк\n\n⚠️ Шаблон выписки ТБанк не найден.\n\nДобавьте файл «Справка о движении средств.pdf» в папку проекта или ~/Downloads/.",
+                                "reply_markup": json.dumps({"inline_keyboard": [
+                                    [{"text": "⬅️ Назад", "callback_data": "main_stmt"}],
+                                ]}),
+                            })
+                        else:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": "🅃 Выписка ТБанк\n\nВыберите вариант:",
+                                "reply_markup": json.dumps({
+                                    "inline_keyboard": [
+                                        [{"text": "✏️ Редактирование своей выписки", "callback_data": "stmt_tbank_edit"}],
+                                        [{"text": "📄 Выписка по чеку", "callback_data": "stmt_tbank_from_check"}],
+                                        [{"text": "🔧 Создание с нуля", "callback_data": "stmt_tbank_new"}],
+                                        [{"text": "⬅️ Назад", "callback_data": "main_stmt"}],
+                                    ],
+                                }),
+                            })
+                        continue
+
+                    if q["data"] == "stmt_tbank_edit":
+                        USER_STATE[uid] = {"mode": "sw_tbank_edit", "step": "upload"}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "✏️ Редактирование выписки ТБанк\n\nОтправьте PDF-файл вашей выписки ТБанк.\n\nБот отсканирует все поля и предложит пошаговое редактирование.",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "stmt_tbank_menu"}]]}),
+                        })
+                        continue
+
+                    if q["data"] == "stmt_tbank_from_check":
+                        USER_STATE[uid] = {"mode": "sw_tbank_check", "step": "upload"}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "📄 Выписка ТБанк по чеку\n\nОтправьте PDF-файл чека — данные будут перенесены в выписку ТБанк.",
+                            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "stmt_tbank_menu"}]]}),
+                        })
+                        continue
+
+                    if q["data"] == "stmt_tbank_new":
+                        _sw_start_tbank_new(token, uid, q["message"]["chat"]["id"], tg_request)
+                        continue
+
                     if q["data"] in ("stmt_edit", "stmt_receipt"):
                         USER_STATE[uid] = {"mode": "sw_alfa_edit" if q["data"] == "stmt_edit" else "sw_alfa_check", "step": "upload"}
                         tg_request(token, "editMessageText", {
@@ -3994,6 +4837,193 @@ def run_bot(token: str) -> None:
                             }),
                         })
                         continue
+                    # ── ТБанк sub-menu ──
+                    if q["data"] == "bank_tbank_sub":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "🅃 ТБанк\n\nВыберите режим:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [{"text": "💰 Только сумма", "callback_data": "bank_tbank_amount"}],
+                                    [{"text": "💰 Сумма + 4 цифры счёта", "callback_data": "bank_tbank_amount_account"}],
+                                    [{"text": "📋 Все поля", "callback_data": "bank_tbank_full"}],
+                                    [{"text": "🌍 Трансгран", "callback_data": "bank_tbank_transgran"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "cancel"}],
+                                ],
+                            }),
+                        })
+                        continue
+
+                    if q["data"] == "bank_tbank_amount":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден."})
+                            continue
+                        USER_STATE[uid]["bank"] = "tbank"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            rtype = tbank_detect_type(inp)
+                            fields = tbank_extract_fields(inp, rtype)
+                            old_amt = fields.get("amount_small", "?").strip()
+                            USER_STATE[uid]["tbank_type"] = rtype
+                            USER_STATE[uid]["awaiting"] = "tbank_new_amount"
+                            hint = _tbank_f2_digit_hint(inp)
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": (
+                                    f"🅃 ТБанк — только сумма\n"
+                                    f"Тип чека: {rtype.upper()}\n"
+                                    f"Текущая сумма: {old_amt}\n\n"
+                                    f"{hint}"
+                                    "Введите новую сумму (число):"
+                                ),
+                            })
+                        except Exception as e:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": f"❌ Ошибка чтения чека: {e}",
+                            })
+                        continue
+
+                    if q["data"] == "bank_tbank_amount_account":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден."})
+                            continue
+                        USER_STATE[uid]["bank"] = "tbank"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            rtype = tbank_detect_type(inp)
+                            if rtype != "sbp":
+                                tg_request(token, "editMessageText", {
+                                    "chat_id": q["message"]["chat"]["id"],
+                                    "message_id": q["message"]["message_id"],
+                                    "text": (
+                                        "❌ Режим «сумма + 4 цифры счёта» только для чека СБП "
+                                        "(есть поле «Счёт списания»).\n\n"
+                                        "Выберите другой режим или отправьте чек СБП."
+                                    ),
+                                    "reply_markup": json.dumps({"inline_keyboard": [
+                                        [{"text": "⬅️ Назад к ТБанк", "callback_data": "bank_tbank_sub"}],
+                                    ]}),
+                                })
+                                continue
+                            fields = tbank_extract_fields(inp, rtype)
+                            old_amt = fields.get("amount_small", "?").strip()
+                            old_acct = fields.get("account", "—")
+                            USER_STATE[uid]["tbank_type"] = rtype
+                            USER_STATE[uid]["tbank_fields"] = fields
+                            USER_STATE[uid]["awaiting"] = "tbank_ac_amount"
+                            hint = _tbank_f2_digit_hint(inp)
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": (
+                                    "🅃 ТБанк — сумма и последние 4 цифры счёта\n\n"
+                                    f"{hint}"
+                                    f"Текущая сумма: {old_amt}\n"
+                                    f"Текущий счёт: {old_acct}\n\n"
+                                    "Шаг 1/2: введите новую сумму (число):"
+                                ),
+                            })
+                        except Exception as e:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": f"❌ Ошибка чтения чека: {e}",
+                            })
+                        continue
+
+                    if q["data"] == "bank_tbank_transgran":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден."})
+                            continue
+                        USER_STATE[uid]["bank"] = "tbank"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            rtype = tbank_detect_type(inp)
+                            if rtype != "transgran":
+                                tg_request(token, "editMessageText", {
+                                    "chat_id": q["message"]["chat"]["id"],
+                                    "message_id": q["message"]["message_id"],
+                                    "text": (
+                                        "❌ Трансгран доступен только для чека типа «Трансгран» "
+                                        "(по высоте страницы).\n\n"
+                                        "Отправьте соответствующий PDF или выберите другой режим."
+                                    ),
+                                    "reply_markup": json.dumps({"inline_keyboard": [
+                                        [{"text": "⬅️ Назад к ТБанк", "callback_data": "bank_tbank_sub"}],
+                                    ]}),
+                                })
+                                continue
+                            fields = tbank_extract_fields(inp, rtype)
+                            old_amt = fields.get("amount_small", "?").strip()
+                            old_cred = fields.get("credited_amt", "—")
+                            USER_STATE[uid]["tbank_type"] = "transgran"
+                            USER_STATE[uid]["tbank_fields"] = fields
+                            USER_STATE[uid]["awaiting"] = "tbank_tg_amount"
+                            hint = _tbank_f2_digit_hint(inp)
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": (
+                                    "🅃 ТБанк — трансгран\n\n"
+                                    "Зачисление в валюте считается: **сумма в ₽ × курс** "
+                                    "(курс — сколько единиц валюты за 1 ₽, напр. 0.1130).\n\n"
+                                    f"{hint}"
+                                    f"Текущая сумма: {old_amt}\n"
+                                    f"Текущее зачисление: {old_cred}\n\n"
+                                    "Шаг 1/2: введите новую сумму в ₽ (число):"
+                                ),
+                                "parse_mode": "Markdown",
+                            })
+                        except Exception as e:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": f"❌ Ошибка: {e}",
+                            })
+                        continue
+
+                    if q["data"] == "bank_tbank_full":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден."})
+                            continue
+                        USER_STATE[uid]["bank"] = "tbank"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            rtype = tbank_detect_type(inp)
+                            fields = tbank_extract_fields(inp, rtype)
+                            USER_STATE[uid]["tbank_type"] = rtype
+                            USER_STATE[uid]["tbank_fields"] = fields
+                            USER_STATE[uid]["tbank_changes"] = {}
+                            field_keys = list(fields.keys())
+                            USER_STATE[uid]["tbank_field_keys"] = field_keys
+                            USER_STATE[uid]["tbank_field_idx"] = 0
+                            USER_STATE[uid]["awaiting"] = "tbank_full_field"
+                            _tbank_send_next_field(token, q["message"]["chat"]["id"], USER_STATE[uid])
+                        except Exception as e:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": f"❌ Ошибка: {e}",
+                            })
+                        continue
+
+                    if q["data"] == "tbank_keep_field":
+                        if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "tbank_full_field":
+                            state = USER_STATE[uid]
+                            state["tbank_field_idx"] += 1
+                            if state["tbank_field_idx"] >= len(state["tbank_field_keys"]):
+                                _run_tbank_full_patch(token, uid, q["message"]["chat"]["id"], state, tg_request)
+                            else:
+                                _tbank_send_next_field(token, q["message"]["chat"]["id"], state)
+                        continue
+
                     if q["data"] == "bank_auto_free":
                         if uid not in USER_STATE:
                             tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})

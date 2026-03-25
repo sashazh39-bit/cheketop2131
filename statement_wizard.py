@@ -185,8 +185,12 @@ ALFA_BLOCK1_FIELDS = [
     {"key": "валюта", "label": "💱 Валюта счёта", "block": 1},
     {"key": "тип_счета", "label": "📝 Тип счёта", "block": 1},
     {"key": "дата_формирования", "label": "📅 Дата формирования выписки", "block": 1, "unique_replace": True},
-    {"key": "клиент", "label": "👤 ФИО клиента", "block": 1, "suggest_fio": True},
+    {"key": "клиент", "label": "👤 ФИО клиента (Фамилия Имя Отчество)", "block": 1, "suggest_fio": True},
     {"key": "адрес", "label": "🏠 Адрес регистрации", "block": 1, "suggest_address": True},
+    {"key": "индекс", "label": "📮 Индекс", "block": 1},
+    {"key": "город", "label": "🏙️ Город", "block": 1},
+    {"key": "улица", "label": "🛤️ Улица", "block": 1},
+    {"key": "дом_кв", "label": "🏠 Дом, квартира", "block": 1},
 ]
 
 ALFA_OP_FIELDS = [
@@ -225,6 +229,50 @@ VTB_BLOCK3_FIELDS = [
     {"key": "баланс_начало", "label": "💰 Баланс на начало периода", "block": 3},
 ]
 
+# ── TBank field definitions ──────────────────────────────────────────────
+
+TBANK_BLOCK1_FIELDS = [
+    {"key": "фио", "label": "👤 ФИО клиента", "block": 1, "suggest_fio": True},
+    {"key": "дата_формирования", "label": "📅 Дата формирования", "block": 1},
+    {"key": "исх_номер", "label": "🔢 Исх. №", "block": 1},
+]
+
+TBANK_BLOCK2_FIELDS = [
+    {"key": "дата_договора", "label": "📅 Дата заключения договора", "block": 2},
+    {"key": "номер_договора", "label": "🔢 Номер договора", "block": 2},
+    {"key": "номер_счета", "label": "📋 Номер лицевого счёта", "block": 2, "validate": "account"},
+]
+
+TBANK_OP_CARD_FIELDS = [
+    {"key": "дата", "label": "📅 Дата операции (ЛИНИЯ ПЕРЕВОД ПО КАРТЕ)", "block": 3},
+    {"key": "время", "label": "🕐 Время операции", "block": 3},
+    {"key": "время_списания", "label": "🕐 Время списания", "block": 3},
+    {"key": "сумма", "label": "💰 Сумма (напр. -10.00 )", "block": 3},
+    {"key": "номер", "label": "🔢 Номер", "block": 3},
+]
+
+TBANK_OP_SBP_FIELDS = [
+    {"key": "дата", "label": "📅 Дата операции (ЛИНИЯ ПЕРЕВОД СБП)", "block": 3},
+    {"key": "время", "label": "🕐 Время операции", "block": 3},
+    {"key": "время_списания", "label": "🕐 Время списания", "block": 3},
+    {"key": "сумма", "label": "💰 Сумма (напр. -10.00 )", "block": 3},
+    {"key": "телефон", "label": "📱 Телефон (напр. +79118584552)", "block": 3},
+    {"key": "номер", "label": "🔢 Номер", "block": 3},
+]
+
+TBANK_OP_DEPOSIT_FIELDS = [
+    {"key": "дата", "label": "📅 Дата операции (ПОПОЛНЕНИЕ)", "block": 3},
+    {"key": "время", "label": "🕐 Время операции", "block": 3},
+    {"key": "время_списания", "label": "🕐 Время списания", "block": 3},
+    {"key": "сумма", "label": "💰 Сумма (напр. +130.00 )", "block": 3},
+    {"key": "номер", "label": "🔢 Номер", "block": 3},
+]
+
+TBANK_BLOCK4_FIELDS = [
+    {"key": "пополнения", "label": "💰 Пополнения (авто из операций, можно изменить)", "block": 4},
+    {"key": "расходы", "label": "💸 Расходы (авто из операций, можно изменить)", "block": 4},
+]
+
 
 # ── Wizard state helpers ─────────────────────────────────────────────────
 
@@ -242,6 +290,24 @@ def build_field_sequence(bank: str, operations: list[dict] | None = None) -> lis
                     "op_field": f["key"],
                 })
         fields.extend(ALFA_BLOCK3_FIELDS)
+    elif bank == "tbank":
+        fields = list(TBANK_BLOCK1_FIELDS)
+        fields.extend(TBANK_BLOCK2_FIELDS)
+        # Three fixed operation types
+        op_field_sets = [
+            ("op_card", TBANK_OP_CARD_FIELDS, "Перевод по карте"),
+            ("op_sbp", TBANK_OP_SBP_FIELDS, "Перевод СБП"),
+            ("op_deposit", TBANK_OP_DEPOSIT_FIELDS, "Пополнение"),
+        ]
+        for prefix, op_fields, op_name in op_field_sets:
+            for f in op_fields:
+                fields.append({
+                    **f,
+                    "key": f"{prefix}_{f['key']}",
+                    "label": f"{f['label']}",
+                    "op_name": op_name,
+                })
+        fields.extend(TBANK_BLOCK4_FIELDS)
     else:
         fields = list(VTB_BLOCK1_FIELDS)
         for i, op in enumerate(operations or []):
