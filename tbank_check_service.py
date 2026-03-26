@@ -486,11 +486,6 @@ def patch_amount(
     pdf_bytes = _recompress_and_fix(
         pdf_bytes, len_num_start, stream_start, stream_len, new_stream
     )
-    now = datetime.now()
-    pdf_bytes = _update_keywords(pdf_bytes, now)
-    pdf_bytes = _update_dates(pdf_bytes, now)
-    pdf_bytes = _update_doc_id(pdf_bytes)
-
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
     return pdf_bytes
@@ -530,11 +525,6 @@ def patch_all_fields(
     pdf_bytes = _recompress_and_fix(
         pdf_bytes, len_num_start, stream_start, stream_len, new_stream
     )
-    now = datetime.now()
-    pdf_bytes = _update_keywords(pdf_bytes, now)
-    pdf_bytes = _update_dates(pdf_bytes, now)
-    pdf_bytes = _update_doc_id(pdf_bytes)
-
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
     return pdf_bytes
