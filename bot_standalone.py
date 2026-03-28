@@ -120,7 +120,7 @@ _EFFECTIVE_ALLOWED_IDS: frozenset[int] = frozenset(_ALLOWED_IDS | set(_ALWAYS_AL
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
 
 # Пользователи, для которых бот молча игнорирует все сообщения (искусственное "зависание").
-_FROZEN_IDS: frozenset[int] = frozenset({7076663447, 1445265832})
+_FROZEN_IDS: frozenset[int] = frozenset()
 
 # Статистика PDF: счётчики только для этих пар (telegram user_id → подпись в отчёте).
 STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
