@@ -61,6 +61,7 @@ from tbank_check_service import (
     RECEIPT_TYPES as TBANK_RECEIPT_TYPES,
 )
 from tbank_scratch_service import generate_from_scratch as tbank_generate_scratch
+from alfa_scratch_service import generate_alfa_scratch, get_fields_for_scratch as alfa_get_fields_for_scratch
 from tbank_statement_service import (
     patch_tbank_statement,
     extract_statement_fields as tbank_extract_statement,
@@ -114,13 +115,10 @@ if _raw:
         _ALLOWED_IDS.add(int(s))
 
 # Фолбэк для пользователя, у которого периодически теряется доступ из-за окружения.
-_ALWAYS_ALLOWED_IDS: frozenset[int] = frozenset({8178442784})
+_ALWAYS_ALLOWED_IDS: frozenset[int] = frozenset({8178442784, 1176744294})
 _EFFECTIVE_ALLOWED_IDS: frozenset[int] = frozenset(_ALLOWED_IDS | set(_ALWAYS_ALLOWED_IDS))
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
-
-# Пользователи, для которых бот молча игнорирует все сообщения (искусственное "зависание").
-_FROZEN_IDS: frozenset[int] = frozenset()
 
 # Статистика PDF: счётчики только для этих пар (telegram user_id → подпись в отчёте).
 STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
@@ -1355,47 +1353,46 @@ def _run_tbank_scratch_gen(token: str, uid: int, chat_id: int, state: dict, tg_r
             del USER_STATE[uid]
 
 
-def _alfa_scratch_send_next_field(token: str, chat_id: int, state: dict) -> None:
+def _alfa_send_scratch_field(token: str, chat_id: int, state: dict) -> None:
     """Send the next field prompt for Alfa scratch generation."""
     idx = state["alfa_scratch_idx"]
     fields = state["alfa_scratch_fields"]
     if idx >= len(fields):
         return
     field = fields[idx]
-    label = field.get("label") or field["key"]
-    prompt = field.get("prompt") or f"Введите {label}:"
+    label = field.get("label", field["key"])
+    default = field.get("default", "—") or "—"
+    prompt = field.get("prompt", label)
+    msg = (
+        f"🏦 Альфа — генерация ({idx + 1}/{len(fields)})\n\n"
+        f"**{prompt}**\n"
+        f"По умолчанию: {default}\n\n"
+        "Введите значение или нажмите «Оставить»:"
+    )
+    kb = [
+        [{"text": "✅ Оставить", "callback_data": "alfa_scratch_keep"}],
+        [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+    ]
     tg_request(token, "sendMessage", {
         "chat_id": chat_id,
-        "text": (
-            f"🧱 Альфа — генерация с нуля ({state.get('alfa_scratch_type')})\n"
-            f"Шаг {idx + 1}/{len(fields)}: {prompt}"
-        ),
+        "text": msg,
+        "reply_markup": json.dumps({"inline_keyboard": kb}),
     })
 
 
 def _run_alfa_scratch_gen(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
     """Execute Alfa scratch generation with collected values."""
-    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Генерирую PDF..."})
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Генерирую чек Альфа..."})
     try:
-        from alfa_scratch_service import generate_alfa_scratch
+        rtype = state.get("alfa_scratch_type", "sbp")
+        values = state.get("alfa_scratch_values", {})
+        fields = state.get("alfa_scratch_fields", [])
+        for field in fields:
+            if field["key"] not in values and field.get("default"):
+                values[field["key"]] = field["default"]
 
-        receipt_type = state.get("alfa_scratch_type", "alfa-alfa")
-        fields = dict(state.get("alfa_scratch_values", {}))
-
-        # Basic normalization for numeric fields our generator expects as int-cast.
-        if receipt_type in ("sbp", "card", "transgran", "mobile", "alfa-alfa") and "amount" in fields:
-            fields["amount"] = str(int(float(str(fields["amount"]).replace(",", "."))))
-        if receipt_type in ("sbp", "card", "transgran", "mobile", "alfa-alfa") and "commission" in fields:
-            # commission defaults to "0" in our wizard
-            fields["commission"] = str(int(float(str(fields["commission"]).replace(",", "."))))
-
-        # Normalize SBP account as last4 digits (user prompt requests it).
-        if receipt_type == "sbp" and "account" in fields:
-            digits = re.sub(r"\D", "", str(fields["account"]))
-            fields["account"] = digits[-4:] if len(digits) >= 4 else digits
-
-        pdf_bytes = generate_alfa_scratch(receipt_type, fields)
-        out_name = f"alfa_scratch_{receipt_type}.pdf"
+        pdf_bytes = generate_alfa_scratch(rtype, values)
+        out_name = f"alfa_{rtype}_scratch.pdf"
 
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
@@ -1409,7 +1406,6 @@ def _run_alfa_scratch_gen(token: str, uid: int, chat_id: int, state: dict, tg_re
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{out_name}\"\r\n"
                 f"Content-Type: application/pdf\r\n\r\n"
             ).encode() + f.read() + f"\r\n--{boundary}--\r\n".encode()
-
             req = urllib.request.Request(
                 f"{BASE}{token}/sendDocument",
                 data=body,
@@ -1419,8 +1415,16 @@ def _run_alfa_scratch_gen(token: str, uid: int, chat_id: int, state: dict, tg_re
 
         os.unlink(tmp)
         stats_record_pdf(uid, "receipt", "alfa_scratch")
+    except ValueError as e:
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"❌ {e}\n\nПопробуйте другое значение или вернитесь в главное меню.",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "🏠 Главное меню", "callback_data": "main_back"}],
+            ]}),
+        })
     except Exception as e:
-        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка генерации: {e}"})
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
     finally:
         if uid in USER_STATE:
             del USER_STATE[uid]
@@ -3517,8 +3521,6 @@ def run_bot(token: str) -> None:
                     msg = upd["message"]
                     uid = msg["from"]["id"]
                     chat_id = msg["chat"]["id"]
-                    if uid in _FROZEN_IDS:
-                        continue
                     if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": ACCESS_DENIED_MSG})
                         continue
@@ -3857,38 +3859,13 @@ def run_bot(token: str) -> None:
                         state = USER_STATE[uid]
                         idx = state["alfa_scratch_idx"]
                         fields_list = state["alfa_scratch_fields"]
-                        if idx >= len(fields_list):
-                            continue
                         key = fields_list[idx]["key"]
-
-                        # Basic validation for numeric fields we later cast with int().
-                        t = text.strip()
-                        if key in ("amount", "commission"):
-                            try:
-                                num = int(float(t.replace(",", ".")))
-                                if num < 0:
-                                    raise ValueError("negative")
-                                t = str(num)
-                            except Exception:
-                                tg_request(token, "sendMessage", {
-                                    "chat_id": chat_id,
-                                    "text": "❌ Нужно число (целое). Пример: 5000",
-                                })
-                                continue
-
-                        if key == "account":
-                            # For sbp in our generator we keep last4 digits.
-                            digits = re.sub(r"\D", "", t)
-                            if state.get("alfa_scratch_type") == "sbp":
-                                t = digits[-4:] if len(digits) >= 4 else digits
-
-                        state["alfa_scratch_values"][key] = t
+                        state["alfa_scratch_values"][key] = text
                         state["alfa_scratch_idx"] += 1
-
                         if state["alfa_scratch_idx"] >= len(fields_list):
                             _run_alfa_scratch_gen(token, uid, chat_id, state, tg_request)
                         else:
-                            _alfa_scratch_send_next_field(token, chat_id, state)
+                            _alfa_send_scratch_field(token, chat_id, state)
                         continue
 
                     # Альфа-карта: генерация из шаблона (карта / сумма / комиссия)
@@ -4003,9 +3980,6 @@ def run_bot(token: str) -> None:
                 elif "callback_query" in upd:
                     q = upd["callback_query"]
                     uid = q["from"]["id"]
-                    if uid in _FROZEN_IDS:
-                        tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"]})
-                        continue
                     tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"]})
                     if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
                         tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
@@ -4041,13 +4015,54 @@ def run_bot(token: str) -> None:
                                     [{"text": "📱 Перевод по СБП", "callback_data": "gen_type_sbp"}],
                                     [{"text": "💳 Альфа-карта", "callback_data": "gen_type_card"}],
                                     [{"text": "🌐 Трансгран (скоро)", "callback_data": "gen_type_transgran"}],
-                                    [{"text": "🏦 Альфа (с нуля)", "callback_data": "gen_alfa_scratch_menu"}],
+                                    [{"text": "🏦 Альфа (с нуля)", "callback_data": "gen_type_alfa_scratch"}],
                                     [{"text": "🅃 ТБанк (с нуля)", "callback_data": "gen_type_tbank"}],
                                     [{"text": "⬅️ Назад", "callback_data": "main_check"}],
                                 ],
                             }),
                         })
                         continue
+                    if q["data"] == "gen_type_alfa_scratch":
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "🏦 Альфа — генерация с нуля\n\nВыберите тип чека:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [{"text": "📱 СБП", "callback_data": "gen_alfa_sbp"}],
+                                    [{"text": "🏦 Альфа-альфа", "callback_data": "gen_alfa_alfa"}],
+                                    [{"text": "💳 Карта", "callback_data": "gen_alfa_card"}],
+                                    [{"text": "🌍 Трансгран", "callback_data": "gen_alfa_transgran"}],
+                                    [{"text": "📱 Моб. связь", "callback_data": "gen_alfa_mobile"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
+                                ],
+                            }),
+                        })
+                        continue
+
+                    if q["data"] in ("gen_alfa_sbp", "gen_alfa_alfa", "gen_alfa_card", "gen_alfa_transgran", "gen_alfa_mobile"):
+                        rtype = q["data"].replace("gen_alfa_", "")
+                        scratch_fields = alfa_get_fields_for_scratch(rtype)
+                        USER_STATE[uid] = {
+                            "awaiting": "alfa_scratch_field",
+                            "alfa_scratch_type": rtype,
+                            "alfa_scratch_fields": scratch_fields,
+                            "alfa_scratch_idx": 0,
+                            "alfa_scratch_values": {},
+                        }
+                        _alfa_send_scratch_field(token, q["message"]["chat"]["id"], USER_STATE[uid])
+                        continue
+
+                    if q["data"] == "alfa_scratch_keep":
+                        if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "alfa_scratch_field":
+                            state = USER_STATE[uid]
+                            state["alfa_scratch_idx"] += 1
+                            if state["alfa_scratch_idx"] >= len(state["alfa_scratch_fields"]):
+                                _run_alfa_scratch_gen(token, uid, q["message"]["chat"]["id"], state, tg_request)
+                            else:
+                                _alfa_send_scratch_field(token, q["message"]["chat"]["id"], state)
+                        continue
+
                     if q["data"] == "gen_type_tbank":
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
@@ -4076,120 +4091,6 @@ def run_bot(token: str) -> None:
                             "tbank_scratch_values": {},
                         }
                         _tbank_send_scratch_field(token, q["message"]["chat"]["id"], USER_STATE[uid])
-                        continue
-
-                    if q["data"] == "gen_alfa_scratch_menu":
-                        tg_request(token, "editMessageText", {
-                            "chat_id": q["message"]["chat"]["id"],
-                            "message_id": q["message"]["message_id"],
-                            "text": "🏦 Альфа — генерация PDF с нуля\n\nВыберите тип чека:",
-                            "reply_markup": json.dumps({
-                                "inline_keyboard": [
-                                    [{"text": "📱 Перевод по СБП", "callback_data": "gen_alfa_scratch_sbp"}],
-                                    [{"text": "💳 По карте", "callback_data": "gen_alfa_scratch_card"}],
-                                    [{"text": "🌐 Трансгран", "callback_data": "gen_alfa_scratch_transgran"}],
-                                    [{"text": "📱 Мобильная связь", "callback_data": "gen_alfa_scratch_mobile"}],
-                                    [{"text": "🏦 Клиенту Альфа-Банка", "callback_data": "gen_alfa_scratch_alfa-alfa"}],
-                                    [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
-                                ],
-                            }),
-                        })
-                        continue
-
-                    if q["data"] in (
-                        "gen_alfa_scratch_sbp",
-                        "gen_alfa_scratch_card",
-                        "gen_alfa_scratch_transgran",
-                        "gen_alfa_scratch_mobile",
-                        "gen_alfa_scratch_alfa-alfa",
-                    ):
-                        receipt_type = q["data"].replace("gen_alfa_scratch_", "")
-                        # Fields we ask user for; the generator fills the rest with safe defaults.
-                        if receipt_type == "sbp":
-                            scratch_fields = [
-                                {"key": "amount", "label": "Сумма", "prompt": "Введите сумму (число):"},
-                                {"key": "date_time", "label": "Дата и время", "prompt": "Введите ДД.ММ.ГГГГ ЧЧ:ММ[:СС] мск (пример: 20.03.2026 14:30:00 мск):"},
-                                {"key": "recipient", "label": "Получатель", "prompt": "Введите получателя (ФИО):"},
-                                {"key": "phone", "label": "Телефон", "prompt": "Введите телефон (пример: +7 (900) 351-70-80):"},
-                                {"key": "bank", "label": "Банк получателя", "prompt": "Введите банк (например: ВТБ):"},
-                                {"key": "account", "label": "Счёт списания", "prompt": "Введите последние 4 цифры счёта (например: 1234):"},
-                            ]
-                            defaults = {
-                                "commission": "0",
-                                "operation_id": "C000000000000000",
-                                "sbp_operation_id": "B000000000000000T0G000000000000000",
-                                "message": "Перевод денежных средств",
-                            }
-                        elif receipt_type == "card":
-                            scratch_fields = [
-                                {"key": "amount", "label": "Сумма", "prompt": "Введите сумму (число):"},
-                                {"key": "date_time", "label": "Дата и время", "prompt": "Введите ДД.ММ.ГГГГ ЧЧ:ММ[:СС] мск (пример: 22.03.2026 06:27:06 мск):"},
-                                {"key": "card_sender", "label": "Карта отправителя", "prompt": "Введите номер карты отправителя (маска):"},
-                                {"key": "card_recipient", "label": "Карта получателя", "prompt": "Введите номер карты получателя (маска):"},
-                                {"key": "auth_code", "label": "Код авторизации", "prompt": "Введите код авторизации (как в чеке):"},
-                                {"key": "terminal_code", "label": "Код терминала", "prompt": "Введите код терминала (как в чеке):"},
-                            ]
-                            defaults = {
-                                "commission": "0",
-                                "operation_id": "Z092203260008552",
-                            }
-                        elif receipt_type == "transgran":
-                            scratch_fields = [
-                                {"key": "amount", "label": "Сумма", "prompt": "Введите сумму (число):"},
-                                {"key": "rate", "label": "Курс", "prompt": "Введите курс (пример: 1 RUR = 140.5800 UZS):"},
-                                {"key": "credited", "label": "Зачисление", "prompt": "Введите зачисление (пример: 1 405,80 UZS):"},
-                                {"key": "date_time", "label": "Дата и время", "prompt": "Введите ДД.ММ.ГГГГ ЧЧ:ММ[:СС] мск (пример: 26.03.2026 01:23:31 мск):"},
-                                {"key": "recipient", "label": "Получатель", "prompt": "Введите получателя (как в чеке):"},
-                                {"key": "phone", "label": "Телефон", "prompt": "Введите телефон: +998... :"},
-                                {"key": "account", "label": "Счёт списания", "prompt": "Введите номер счёта полностью (как в чеке):"},
-                            ]
-                            defaults = {
-                                "commission": "0",
-                                "operation_id": "C822603260006230",
-                            }
-                        elif receipt_type == "mobile":
-                            scratch_fields = [
-                                {"key": "amount", "label": "Сумма", "prompt": "Введите сумму (число):"},
-                                {"key": "date_time", "label": "Дата и время", "prompt": "Введите ДД.ММ.ГГГГ ЧЧ:ММ[:СС] мск (пример: 23.03.2026 15:03:59 мск):"},
-                                {"key": "payer", "label": "Плательщик", "prompt": "Введите плательщика (ФИО):"},
-                                {"key": "account", "label": "Счёт списания", "prompt": "Введите номер счёта полностью (как в чеке):"},
-                                {"key": "phone", "label": "Телефон", "prompt": "Введите номер телефона плательщика: (пример: +79632972008):"},
-                                {"key": "provider", "label": "Провайдер", "prompt": "Введите провайдера (пример: билайн):"},
-                            ]
-                            defaults = {
-                                "commission": "0",
-                                "operation_id": "A012303260343866",
-                            }
-                        else:  # alfa-alfa
-                            scratch_fields = [
-                                {"key": "amount", "label": "Сумма", "prompt": "Введите сумму (число):"},
-                                {"key": "date_time", "label": "Дата и время", "prompt": "Введите ДД.ММ.ГГГГ ЧЧ:ММ[:СС] мск (пример: 20.03.2026 03:14:23 мск):"},
-                                {"key": "recipient", "label": "Получатель", "prompt": "Введите ФИО/маску получателя (как в чеке):"},
-                                {"key": "phone", "label": "Телефон", "prompt": "Введите телефон (как в чеке):"},
-                                {"key": "account", "label": "Счёт списания", "prompt": "Введите номер счёта (как в чеке):"},
-                            ]
-                            defaults = {
-                                "commission": "0",
-                                "operation_id": "C072003260014815",
-                                "message": "Перевод денежных средств",
-                            }
-
-                        USER_STATE[uid] = {
-                            "awaiting": "alfa_scratch_field",
-                            "alfa_scratch_type": receipt_type,
-                            "alfa_scratch_fields": scratch_fields,
-                            "alfa_scratch_idx": 0,
-                            "alfa_scratch_values": dict(defaults),
-                        }
-                        first_prompt = scratch_fields[0]["prompt"]
-                        tg_request(token, "editMessageText", {
-                            "chat_id": q["message"]["chat"]["id"],
-                            "message_id": q["message"]["message_id"],
-                            "text": (
-                                f"🧱 Альфа — генерация с нуля ({receipt_type})\n\n"
-                                f"Шаг 1/{len(scratch_fields)}: {first_prompt}"
-                            ),
-                        })
                         continue
 
                     if q["data"] == "tbank_scratch_keep":
