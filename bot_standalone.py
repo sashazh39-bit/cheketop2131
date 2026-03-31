@@ -706,6 +706,106 @@ def _do_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) ->
         _send_main_menu_button(token, chat_id, tg_req)
 
 
+def _format_alfa_card_commission(val: str) -> str:
+    """Форматирует комиссию для замены в PDF: '729' → '729 RUR', '729,50' → '729,50 RUR'."""
+    v = val.strip().replace(" ", "").replace("\xa0", "")
+    v = v.replace(".", ",")
+    if "," in v:
+        parts = v.split(",", 1)
+        whole = parts[0].lstrip("0") or "0"
+        frac = (parts[1] + "00")[:2]
+        if frac == "00":
+            return f"{format_amount_display(int(whole))} RUR"
+        return f"{format_amount_display(int(whole))},{frac} RUR"
+    digits = re.sub(r"\D", "", v)
+    if not digits:
+        return "0 RUR"
+    return f"{format_amount_display(int(digits))} RUR"
+
+
+def _run_alfa_card_patch(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Патч Альфа «по карте»: сумма + комиссия через CID-замены."""
+    from cid_patch_amount import patch_replacements
+
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    inp = Path(state["file_path"])
+    out_stem = _increment_filename(Path(state["file_name"]).stem)
+    out_name = out_stem + ".pdf"
+
+    send("⏳ Обрабатываю чек...")
+
+    try:
+        old_amt_raw = state.get("alfa_card_old_amount", "")
+        old_comm_raw = state.get("alfa_card_old_commission", "")
+        new_amt_val = state.get("alfa_card_new_amount")
+        new_comm_val = state.get("alfa_card_new_commission")
+
+        old_amt = old_amt_raw.replace("\xa0", " ").strip()
+        old_comm = old_comm_raw.replace("\xa0", " ").strip()
+
+        pairs: list[tuple[str, str]] = []
+
+        if new_amt_val is not None:
+            new_amt = f"{format_amount_display(new_amt_val)} RUR"
+            if old_amt and old_amt != new_amt:
+                pairs.append((old_amt, new_amt))
+
+        if new_comm_val is not None:
+            new_comm = _format_alfa_card_commission(new_comm_val)
+            if old_comm and old_comm != new_comm:
+                pairs.append((old_comm, new_comm))
+
+        if not pairs:
+            send("ℹ️ Нет изменений. Значения совпадают с текущими.")
+            _send_main_menu_button(token, chat_id, tg_req)
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            out_path = tf.name
+
+        ok = patch_replacements(inp, Path(out_path), pairs)
+        if not ok:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            send("❌ Не удалось применить замены.")
+            _send_main_menu_button(token, chat_id, tg_req)
+            return
+
+        pdf_bytes = Path(out_path).read_bytes()
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(str(inp))
+        except OSError:
+            pass
+        del USER_STATE[uid]
+
+        summary = []
+        if new_amt_val is not None:
+            summary.append(f"Сумма → {format_amount_display(new_amt_val)} ₽")
+        if new_comm_val is not None:
+            summary.append(f"Комиссия → {new_comm_val}")
+        caption = "✅ Альфа по карте\n" + "\n".join(summary)
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (out_name, pdf_bytes)})
+        stats_record_pdf(uid, "receipt", "alfa")
+        _send_main_menu_button(token, chat_id, tg_req)
+    except Exception as e:
+        try:
+            os.unlink(str(inp))
+        except OSError:
+            pass
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        send(f"❌ Ошибка: {e}\n\nПопробуй снова или отправь чек заново.")
+        _send_main_menu_button(token, chat_id, tg_req)
+
+
 def run_check_caps(payer: str, recipient: str) -> tuple[bool, str]:
     """Проверка ФИО: получатся ли заглавные буквы. Возвращает (ok, output)."""
     if not _ADD_GLYPHS_SCRIPT.exists():
@@ -3923,6 +4023,52 @@ def run_bot(token: str) -> None:
                         _send_main_menu_button(token, chat_id, tg_request)
                         continue
 
+                    # Альфа по карте: ввод суммы (шаг 1)
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "alfa_card_amount":
+                        state = USER_STATE[uid]
+                        t = text.strip()
+                        if t == "-":
+                            state["alfa_card_new_amount"] = None
+                        else:
+                            nums = re.findall(r"\d+", t)
+                            if not nums:
+                                tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите число (например: 40000)"})
+                                continue
+                            state["alfa_card_new_amount"] = int("".join(nums))
+                        old_comm = state.get("alfa_card_old_commission", "")
+                        comm_display = old_comm.replace("\xa0", " ").replace("RUR", "₽").strip() if old_comm else "нет"
+                        if old_comm:
+                            state["awaiting"] = "alfa_card_commission"
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": (
+                                    "✅ Принято.\n\n"
+                                    f"📌 Текущая комиссия: {comm_display}\n\n"
+                                    "Шаг 2/2: введите новую комиссию (например: 729 или 729,50)\n"
+                                    "Отправьте - чтобы оставить без изменений."
+                                ),
+                                "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⏭ Оставить", "callback_data": "alfa_card_skip_comm"}]]}),
+                            })
+                        else:
+                            state["alfa_card_new_commission"] = None
+                            _run_alfa_card_patch(token, uid, chat_id, state, tg_request)
+                        continue
+
+                    # Альфа по карте: ввод комиссии (шаг 2)
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "alfa_card_commission":
+                        state = USER_STATE[uid]
+                        t = text.strip()
+                        if t in ("-", "—", "пропустить", "skip"):
+                            state["alfa_card_new_commission"] = None
+                        else:
+                            t_clean = t.replace(" ", "").replace("\xa0", "")
+                            if not re.match(r"^\d+([.,]\d{1,2})?$", t_clean):
+                                tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Введите число (например: 729 или 729,50)"})
+                                continue
+                            state["alfa_card_new_commission"] = t_clean.replace(".", ",")
+                        _run_alfa_card_patch(token, uid, chat_id, state, tg_request)
+                        continue
+
                     # Новый ввод суммы: только новое значение (auto-detect текущего)
                     if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "amount_new_only":
                         state = USER_STATE[uid]
@@ -4938,7 +5084,8 @@ def run_bot(token: str) -> None:
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [{"text": "💰 Только сумма", "callback_data": "bank_alfa_amount"}],
-                                    [{"text": "📋 Все поля", "callback_data": "bank_alfa_full"}],
+                                    [{"text": "💳 По карте", "callback_data": "bank_alfa_card"}],
+                                    [{"text": "📋 Все поля (СБП)", "callback_data": "bank_alfa_full"}],
                                     [{"text": "🌐 Трансгран", "callback_data": "bank_alfa_transgran"}],
                                     [{"text": "⬅️ Назад", "callback_data": "cancel"}],
                                 ],
@@ -5198,6 +5345,48 @@ def run_bot(token: str) -> None:
                             "text": f"🏦 Альфа — только сумма\n\n{amt_txt}Введите новую сумму:",
                         })
                         continue
+                    if q["data"] == "bank_alfa_card":
+                        if uid not in USER_STATE:
+                            tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        USER_STATE[uid]["bank"] = "alfa"
+                        inp = USER_STATE[uid]["file_path"]
+                        try:
+                            from alfa_karta_service import extract_alfa_karta_fields
+                            fields = extract_alfa_karta_fields(inp)
+                            amt_raw = fields.get("amount_raw", "")
+                            comm_raw = fields.get("commission_raw", "")
+                            if not amt_raw:
+                                tg_request(token, "editMessageText", {
+                                    "chat_id": q["message"]["chat"]["id"],
+                                    "message_id": q["message"]["message_id"],
+                                    "text": "❌ Не удалось прочитать сумму из чека. Убедитесь что это квитанция Альфа «по карте».",
+                                    "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "bank_alfa_sub"}]]}),
+                                })
+                                continue
+                            amt_display = amt_raw.replace("\xa0", " ").replace("RUR", "₽").strip()
+                            comm_display = comm_raw.replace("\xa0", " ").replace("RUR", "₽").strip() if comm_raw else "нет"
+                            USER_STATE[uid]["alfa_card_old_amount"] = amt_raw
+                            USER_STATE[uid]["alfa_card_old_commission"] = comm_raw
+                            USER_STATE[uid]["awaiting"] = "alfa_card_amount"
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": (
+                                    "💳 Альфа — по карте\n\n"
+                                    f"📌 Текущая сумма: {amt_display}\n"
+                                    f"📌 Текущая комиссия: {comm_display}\n\n"
+                                    "Шаг 1/2: введите новую сумму (число, например: 40000)\n"
+                                    "Отправьте - чтобы оставить без изменений."
+                                ),
+                            })
+                        except Exception as e:
+                            tg_request(token, "editMessageText", {
+                                "chat_id": q["message"]["chat"]["id"],
+                                "message_id": q["message"]["message_id"],
+                                "text": f"❌ Ошибка чтения чека: {e}",
+                            })
+                        continue
                     if q["data"] == "bank_vtb_amount":
                         if uid not in USER_STATE:
                             tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": "❌ Чек не найден. Отправьте PDF заново."})
@@ -5281,6 +5470,11 @@ def run_bot(token: str) -> None:
                         if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "amount_commission":
                             USER_STATE[uid]["commission_to"] = None
                             _do_amount_patch(token, uid, q["message"]["chat"]["id"], USER_STATE[uid], tg_request)
+                        continue
+                    if q["data"] == "alfa_card_skip_comm":
+                        if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "alfa_card_commission":
+                            USER_STATE[uid]["alfa_card_new_commission"] = None
+                            _run_alfa_card_patch(token, uid, q["message"]["chat"]["id"], USER_STATE[uid], tg_request)
                         continue
 
                     if uid not in USER_STATE:
