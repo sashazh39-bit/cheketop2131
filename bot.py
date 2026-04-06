@@ -3,8 +3,10 @@
 Отправьте чек → выберите банк → введите "с какой на какую" → получите готовый PDF.
 Или /create_statement для создания выписки.
 """
+import logging
 import os
 import re
+import traceback
 
 try:
     from dotenv import load_dotenv
@@ -15,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, TimedOut, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,10 +27,28 @@ from telegram.ext import (
     filters,
 )
 
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
 from pdf_patcher import patch_pdf_file
 
 # Состояние пользователя: {file_path, file_name, bank} или {mode, step, ...} для выписки
 USER_STATE: dict[int, dict] = {}
+
+# Белый список — только эти пользователи могут использовать бота
+ALLOWED_USERS: set[int] = {1445265832, 7076663447, 8178442784}
+
+
+def is_allowed(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    return uid in ALLOWED_USERS
 
 # Поля для пошагового ввода Альфа СБП
 ALFA_SBP_FIELDS = [
@@ -72,6 +93,8 @@ def parse_custom_replacement(text: str) -> tuple[str, str] | None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
     uid = update.effective_user.id
     if uid in USER_STATE and "file_path" in USER_STATE[uid]:
         try:
@@ -95,6 +118,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_create_statement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда создания выписки — выбор варианта."""
+    if not is_allowed(update):
+        return
     uid = update.effective_user.id
     if uid in USER_STATE:
         if "file_path" in USER_STATE[uid]:
@@ -122,6 +147,8 @@ async def cmd_create_statement(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_stmt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка выбора варианта выписки."""
+    if not is_allowed(update):
+        return
     query = update.callback_query
     await query.answer()
 
@@ -151,6 +178,8 @@ async def handle_stmt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
     doc = update.message.document
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("❌ Отправьте PDF-файл.")
@@ -185,13 +214,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             InlineKeyboardButton("🏛 ВТБ", callback_data="bank_vtb"),
         ],
         [
+            InlineKeyboardButton("💛 Т-Банк", callback_data="bank_tbank"),
+        ],
+        [
             InlineKeyboardButton("🏦 Альфа СБП (все поля)", callback_data="bank_alfa_sbp_full"),
         ],
         [InlineKeyboardButton("🔍 Авто", callback_data="bank_auto")],
     ]
     await update.message.reply_text(
         "📎 Чек получен. Выберите банк:\n\n"
-        "• *Альфа-Банк / ВТБ / Авто* — замена только суммы\n"
+        "• *Альфа-Банк / ВТБ / Т-Банк / Авто* — замена только суммы\n"
         "• *Альфа СБП (все поля)* — замена суммы, даты, получателя, телефона, банка, счёта",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -271,6 +303,8 @@ async def _handle_statement_document(
 
 
 async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
     query = update.callback_query
     await query.answer()
 
@@ -294,9 +328,9 @@ async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    bank_map = {"bank_alfa": "alfa", "bank_vtb": "vtb", "bank_auto": "auto"}
+    bank_map = {"bank_alfa": "alfa", "bank_vtb": "vtb", "bank_tbank": "tbank", "bank_auto": "auto"}
     bank = bank_map.get(query.data, "auto")
-    bank_name = {"alfa": "Альфа-Банк", "vtb": "ВТБ", "auto": "Авто"}[bank]
+    bank_name = {"alfa": "Альфа-Банк", "vtb": "ВТБ", "tbank": "Т-Банк", "auto": "Авто"}[bank]
     USER_STATE[user_id]["bank"] = bank
 
     await query.edit_message_text(
@@ -308,6 +342,8 @@ async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_amounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
     user_id = update.effective_user.id
     state = USER_STATE.get(user_id, {})
 
@@ -799,6 +835,8 @@ async def _handle_statement_text(
 
 async def handle_stmt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка callback для выписки: stmt_skip, stmt_next, stmt_custom, stmt_retry_fio, stmt_skip_fio."""
+    if not is_allowed(update):
+        return
     query = update.callback_query
     await query.answer()
 
@@ -894,22 +932,45 @@ async def _do_stmt_apply(
         pass
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок — логирует и не роняет бота."""
+    err = context.error
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning("Сетевая ошибка (автоматический retry): %s", err)
+        return
+    logger.error("Необработанное исключение:\n%s", traceback.format_exc())
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Попробуйте ещё раз или начните заново /start")
+        except TelegramError:
+            pass
+
+
 async def _post_init(app: Application) -> None:
     """Сброс webhook перед polling — иначе getUpdates не получает обновления."""
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook сброшен, polling готов", flush=True)
+        logger.info("Webhook сброшен, polling готов")
     except Exception as e:
-        print(f"Webhook: {e}", flush=True)
+        logger.warning("Webhook: %s", e)
 
 
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        print("Задайте TELEGRAM_BOT_TOKEN")
+        logger.error("Задайте TELEGRAM_BOT_TOKEN")
         return
 
-    app = Application.builder().token(token).post_init(_post_init).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("create_statement", cmd_create_statement))
@@ -919,8 +980,13 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_stmt_callback, pattern="^stmt_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amounts))
 
-    print("Бот запущен...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_error_handler(error_handler)
+
+    logger.info("Бот запущен...")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":

@@ -16,3 +16,15 @@ venv/
 *.tmp
 .temp_*
 receipt_test_*.pdf
+
+# PDF тестовые / рабочие файлы
+*.pdf
+tmp_*/
+tmp_alfa_scratch/
+vtb-generator/
+
+# Логи
+*.log
+
+# Изображения тестовые
+img_*.png
