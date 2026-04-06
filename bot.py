@@ -43,7 +43,7 @@ from pdf_patcher import patch_pdf_file
 USER_STATE: dict[int, dict] = {}
 
 # Белый список — только эти пользователи могут использовать бота
-ALLOWED_USERS: set[int] = {1445265832, 7076663447, 8178442784}
+ALLOWED_USERS: set[int] = {1445265832, 7076663447, 8178442784, 6646800148}
 
 
 def is_allowed(update: Update) -> bool:
