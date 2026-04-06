@@ -6,6 +6,7 @@
 import logging
 import os
 import re
+import time
 import traceback
 
 try:
@@ -17,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import NetworkError, TimedOut, TelegramError
+from telegram.error import Conflict, InvalidToken, NetworkError, TimedOut, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -49,6 +50,18 @@ ALLOWED_USERS: set[int] = {1445265832, 7076663447, 8178442784, 6646800148}
 def is_allowed(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
     return uid in ALLOWED_USERS
+
+
+async def answer_callback_query_safe(update: Update) -> None:
+    """Снимает «часики» у inline-кнопки; без ответа Telegram может копить запросы и вести себя нестабильно."""
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
+
 
 # Поля для пошагового ввода Альфа СБП
 ALFA_SBP_FIELDS = [
@@ -95,6 +108,9 @@ def parse_custom_replacement(text: str) -> tuple[str, str] | None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
+    msg = update.effective_message
+    if not msg:
+        return
     uid = update.effective_user.id
     if uid in USER_STATE and "file_path" in USER_STATE[uid]:
         try:
@@ -102,7 +118,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except OSError:
             pass
         del USER_STATE[uid]
-    await update.message.reply_text(
+    await msg.reply_text(
         "👋 Привет! Я помогу изменить чек.\n\n"
         "📋 **Как пользоваться:**\n"
         "1. Отправьте PDF-чек\n"
@@ -119,6 +135,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_create_statement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда создания выписки — выбор варианта."""
     if not is_allowed(update):
+        return
+    msg = update.effective_message
+    if not msg:
         return
     uid = update.effective_user.id
     if uid in USER_STATE:
@@ -137,7 +156,7 @@ async def cmd_create_statement(update: Update, context: ContextTypes.DEFAULT_TYP
             InlineKeyboardButton("📄 Выписка по чеку", callback_data="stmt_receipt"),
         ],
     ]
-    await update.message.reply_text(
+    await msg.reply_text(
         "📄 **Создание выписки**\n\n"
         "Выберите вариант:",
         parse_mode="Markdown",
@@ -147,10 +166,12 @@ async def cmd_create_statement(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_stmt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка выбора варианта выписки."""
+    await answer_callback_query_safe(update)
     if not is_allowed(update):
         return
     query = update.callback_query
-    await query.answer()
+    if not query:
+        return
 
     uid = update.effective_user.id
     data = query.data
@@ -180,9 +201,12 @@ async def handle_stmt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    doc = update.message.document
+    msg = update.effective_message
+    if not msg:
+        return
+    doc = msg.document
     if not doc or not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("❌ Отправьте PDF-файл.")
+        await msg.reply_text("❌ Отправьте PDF-файл.")
         return
 
     uid = update.effective_user.id
@@ -221,7 +245,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ],
         [InlineKeyboardButton("🔍 Авто", callback_data="bank_auto")],
     ]
-    await update.message.reply_text(
+    await msg.reply_text(
         "📎 Чек получен. Выберите банк:\n\n"
         "• *Альфа-Банк / ВТБ / Т-Банк / Авто* — замена только суммы\n"
         "• *Альфа СБП (все поля)* — замена суммы, даты, получателя, телефона, банка, счёта",
@@ -235,6 +259,9 @@ async def _handle_statement_document(
     doc, uid: int, state: dict,
 ) -> None:
     """Обработка документа в режиме выписки."""
+    msg = update.effective_message
+    if not msg:
+        return
     file = await context.bot.get_file(doc.file_id)
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fp:
         await file.download_to_drive(fp.name)
@@ -259,7 +286,7 @@ async def _handle_statement_document(
             "transactions": transactions,
             "amounts_found": amounts,
         }
-        await update.message.reply_text(
+        await msg.reply_text(
             "✅ Выписка получена.\n\n"
             "💰 Введите замены сумм: *с какой на какую*\n"
             "Например: `10 10000` или `10 5000 50 1000`",
@@ -273,7 +300,7 @@ async def _handle_statement_document(
         extracted = extract_from_receipt(Path(fp.name))
         amount = extracted.get("amount")
         if not amount:
-            await update.message.reply_text("❌ Не удалось извлечь сумму из чека.")
+            await msg.reply_text("❌ Не удалось извлечь сумму из чека.")
             try:
                 os.unlink(fp.name)
             except OSError:
@@ -294,7 +321,7 @@ async def _handle_statement_document(
             "amount": amount,
             "generated_fio": generated_fio,
         }
-        await update.message.reply_text(
+        await msg.reply_text(
             f"✅ Чек получен.\n\n"
             f"📊 Сумма: {amount} ₽\n"
             f"👤 ФИО (сгенерировано): {generated_fio}\n\n"
@@ -303,10 +330,12 @@ async def _handle_statement_document(
 
 
 async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await answer_callback_query_safe(update)
     if not is_allowed(update):
         return
     query = update.callback_query
-    await query.answer()
+    if not query:
+        return
 
     user_id = update.effective_user.id
     if user_id not in USER_STATE:
@@ -344,6 +373,9 @@ async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_amounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
     user_id = update.effective_user.id
     state = USER_STATE.get(user_id, {})
 
@@ -359,19 +391,19 @@ async def handle_amounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Режим чека
     if user_id not in USER_STATE or "bank" not in USER_STATE[user_id]:
-        await update.message.reply_text("❌ Сначала отправьте чек и выберите банк.")
+        await msg.reply_text("❌ Сначала отправьте чек и выберите банк.")
         return
 
-    parsed = parse_amounts(update.message.text)
+    parsed = parse_amounts(msg.text)
     if not parsed:
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ Неверный формат. Введите две суммы, например: 10 5000",
         )
         return
 
     amount_from, amount_to = parsed
     if amount_from <= 0 or amount_to <= 0:
-        await update.message.reply_text("❌ Суммы должны быть больше 0.")
+        await msg.reply_text("❌ Суммы должны быть больше 0.")
         return
 
     state = USER_STATE[user_id]
@@ -391,7 +423,7 @@ async def handle_amounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     del USER_STATE[user_id]
 
     if not ok:
-        await update.message.reply_text(f"❌ Ошибка: {err}")
+        await msg.reply_text(f"❌ Ошибка: {err}")
         try:
             os.unlink(out_path)
         except OSError:
@@ -399,7 +431,7 @@ async def handle_amounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     with open(out_path, "rb") as f:
-        await update.message.reply_document(
+        await msg.reply_document(
             document=f,
             filename=out_name,
             caption=f"✅ Готово: {amount_from} ₽ → {amount_to} ₽",
@@ -416,7 +448,10 @@ async def _handle_alfa_sbp_step(
     uid: int, state: dict,
 ) -> None:
     """Пошаговый ввод полей Альфа СБП."""
-    text = update.message.text.strip()
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    text = msg.text.strip()
     step = state.get("step", 0)
     fields = state.setdefault("alfa_fields", {})
 
@@ -429,14 +464,14 @@ async def _handle_alfa_sbp_step(
         if field_key == "amount":
             nums = re.findall(r"\d+", text)
             if not nums:
-                await update.message.reply_text("❌ Введите число (например: 5000)")
+                await msg.reply_text("❌ Введите число (например: 5000)")
                 return
             fields["amount"] = int("".join(nums))
         elif field_key == "account":
             digits = re.findall(r"\d+", text)
             last4 = "".join(digits)
             if len(last4) < 4:
-                await update.message.reply_text("❌ Нужно ровно 4 цифры (например: 1234)")
+                await msg.reply_text("❌ Нужно ровно 4 цифры (например: 1234)")
                 return
             last4 = last4[-4:]
             fields["account_last4"] = last4
@@ -448,7 +483,7 @@ async def _handle_alfa_sbp_step(
 
     if step < len(ALFA_SBP_FIELDS):
         field_key_next, prompt_next = ALFA_SBP_FIELDS[step]
-        await update.message.reply_text(
+        await msg.reply_text(
             f"✅ Принято.\n\nШаг {step + 1}/{len(ALFA_SBP_FIELDS)}: {prompt_next}\n"
             "Отправьте `-` чтобы пропустить.",
         )
@@ -459,7 +494,7 @@ async def _handle_alfa_sbp_step(
             summary_lines.append(f"  {label.split('(')[0].strip()}: {val or '(без изменений)'}")
         summary = "\n".join(summary_lines)
 
-        await update.message.reply_text(f"📋 Параметры:\n{summary}\n\n⏳ Генерирую PDF...")
+        await msg.reply_text(f"📋 Параметры:\n{summary}\n\n⏳ Генерирую PDF...")
 
         await _apply_alfa_sbp_patch(update, context, uid, state)
 
@@ -471,6 +506,10 @@ async def _apply_alfa_sbp_patch(
     """Применяет все замены к Альфа СБП чеку через cid_patch_amount (zero-delta для счёта)."""
     import zlib
     from pathlib import Path
+
+    msg = update.effective_message
+    if not msg:
+        return
 
     fields = state.get("alfa_fields", {})
     inp_path = Path(state["file_path"])
@@ -612,7 +651,7 @@ async def _apply_alfa_sbp_patch(
             if text_reps:
                 applied_text = patch_replacements(inp_path, Path(out_path), text_reps)
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Ошибка текстовых замен: {e}")
+            await msg.reply_text(f"⚠️ Ошибка текстовых замен: {e}")
 
     if not applied_text:
         import shutil
@@ -651,9 +690,9 @@ async def _apply_alfa_sbp_patch(
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-                await update.message.reply_text("⚠️ Не удалось заменить счёт (возможно, номер не найден в PDF)")
+                await msg.reply_text("⚠️ Не удалось заменить счёт (возможно, номер не найден в PDF)")
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Ошибка замены счёта: {e}")
+            await msg.reply_text(f"⚠️ Ошибка замены счёта: {e}")
 
     # Отправляем результат
     try:
@@ -674,13 +713,13 @@ async def _apply_alfa_sbp_patch(
                 caption_parts.append(f"Получатель: {fields['recipient']}")
             caption = "✅ Готово! " + ", ".join(caption_parts) if caption_parts else "✅ Готово!"
 
-            await update.message.reply_document(
+            await msg.reply_document(
                 document=f,
                 filename=out_name,
                 caption=caption,
             )
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка отправки: {e}")
+        await msg.reply_text(f"❌ Ошибка отправки: {e}")
 
     try:
         os.unlink(out_path)
@@ -693,15 +732,18 @@ async def _handle_statement_text(
     uid: int, state: dict,
 ) -> None:
     """Обработка текста в режиме выписки."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
     mode = state.get("mode", "")
     step = state.get("step", "")
-    text = update.message.text.strip()
+    text = msg.text.strip()
 
     if mode == "statement_edit":
         if step == "amounts":
             pairs = parse_amount_pairs(text)
             if not pairs:
-                await update.message.reply_text(
+                await msg.reply_text(
                     "❌ Неверный формат. Введите пары: `10 10000` или `10 5000 50 1000`",
                 )
                 return
@@ -723,7 +765,7 @@ async def _handle_statement_text(
                 ],
                 [InlineKeyboardButton("➕ Свои замены", callback_data="stmt_custom")],
             ]
-            await update.message.reply_text(
+            await msg.reply_text(
                 f"✅ Замены: {amounts}\n\n"
                 f"📊 Расходы: {expenses:.2f} ₽\n"
                 f"📊 Баланс на конец: {balance_end:.2f} ₽\n\n"
@@ -734,7 +776,7 @@ async def _handle_statement_text(
         elif step == "custom":
             parsed = parse_custom_replacement(text)
             if not parsed:
-                await update.message.reply_text(
+                await msg.reply_text(
                     "❌ Формат: `поле=значение`\n"
                     "Например: ФИО=Иванов Иван И. или баланс_начало=55242.65",
                 )
@@ -754,7 +796,7 @@ async def _handle_statement_text(
                             InlineKeyboardButton("⏭ Без замены ФИО", callback_data="stmt_skip_fio"),
                         ],
                     ]
-                    await update.message.reply_text(
+                    await msg.reply_text(
                         f"⚠️ Недоступные символы в выписке: {''.join(missing)}\n"
                         "Повторите с другими символами или пропустите.",
                         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -766,14 +808,14 @@ async def _handle_statement_text(
                 try:
                     repl["balance_start"] = float(value.replace(",", "."))
                 except ValueError:
-                    await update.message.reply_text("❌ Введите число для баланса.")
+                    await msg.reply_text("❌ Введите число для баланса.")
                     return
             elif key in ("телефон", "phone"):
                 repl["phone"] = value
             elif key in ("номер_заявки", "application_id"):
                 repl["application_id"] = value
 
-            await update.message.reply_text(
+            await msg.reply_text(
                 f"✅ Добавлено: {key}={value}\n\n"
                 "Введите ещё замены или нажмите Далее.",
             )
@@ -782,7 +824,7 @@ async def _handle_statement_text(
         try:
             balance_start = float(text.replace(",", ".").replace(" ", ""))
         except ValueError:
-            await update.message.reply_text("❌ Введите число (баланс на начало).")
+            await msg.reply_text("❌ Введите число (баланс на начало).")
             return
 
         from vyписка_service import BASE_STATEMENT, patch_statement, calculate_balance_and_expenses
@@ -812,7 +854,7 @@ async def _handle_statement_text(
         del USER_STATE[uid]
 
         if not ok:
-            await update.message.reply_text(f"❌ Ошибка: {err}")
+            await msg.reply_text(f"❌ Ошибка: {err}")
             try:
                 os.unlink(out_path)
             except OSError:
@@ -821,7 +863,7 @@ async def _handle_statement_text(
 
         out_name = f"выписка_{amount}.pdf"
         with open(out_path, "rb") as f:
-            await update.message.reply_document(
+            await msg.reply_document(
                 document=f,
                 filename=out_name,
                 caption=f"✅ Выписка готова: {amount} ₽",
@@ -835,10 +877,12 @@ async def _handle_statement_text(
 
 async def handle_stmt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка callback для выписки: stmt_skip, stmt_next, stmt_custom, stmt_retry_fio, stmt_skip_fio."""
+    await answer_callback_query_safe(update)
     if not is_allowed(update):
         return
     query = update.callback_query
-    await query.answer()
+    if not query:
+        return
 
     uid = update.effective_user.id
     state = USER_STATE.get(uid, {})
@@ -871,6 +915,11 @@ async def _do_stmt_apply(
     uid: int, state: dict, skip_custom: bool,
 ) -> None:
     """Применить патч выписки и отправить PDF."""
+    cq = update.callback_query
+    if not cq or cq.message is None:
+        logger.error("_do_stmt_apply: нет callback_query или message")
+        return
+
     from vyписка_service import (
         patch_statement,
         calculate_balance_and_expenses,
@@ -911,7 +960,10 @@ async def _do_stmt_apply(
     del USER_STATE[uid]
 
     if not ok:
-        await update.callback_query.edit_message_text(f"❌ Ошибка: {err}")
+        try:
+            await cq.edit_message_text(f"❌ Ошибка: {err}")
+        except TelegramError:
+            pass
         try:
             os.unlink(out_path)
         except OSError:
@@ -920,7 +972,7 @@ async def _do_stmt_apply(
 
     out_name = Path(state.get("file_name", "выписка.pdf")).stem + "_patched.pdf"
     with open(out_path, "rb") as f:
-        await update.callback_query.message.reply_document(
+        await cq.message.reply_document(
             document=f,
             filename=out_name,
             caption="✅ Выписка готова",
@@ -936,14 +988,35 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     """Глобальный обработчик ошибок — логирует и не роняет бота."""
     err = context.error
     if isinstance(err, (TimedOut, NetworkError)):
-        logger.warning("Сетевая ошибка (автоматический retry): %s", err)
+        logger.warning("Сеть Telegram (retry у polling): %s", err)
         return
-    logger.error("Необработанное исключение:\n%s", traceback.format_exc())
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Попробуйте ещё раз или начните заново /start")
-        except TelegramError:
-            pass
+    if isinstance(err, Conflict):
+        logger.error(
+            "Telegram Conflict: с одним токеном запущено несколько ботов. "
+            "Остановите лишние процессы или второй экземпляр."
+        )
+        return
+
+    tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    logger.error("Исключение: %s\n%s", err, tb)
+
+    if not isinstance(update, Update):
+        return
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Внутренняя ошибка. Попробуйте ещё раз или начните с /start",
+            )
+        elif update.callback_query:
+            try:
+                await update.callback_query.answer(
+                    "Ошибка. Попробуйте /start",
+                    show_alert=True,
+                )
+            except TelegramError:
+                pass
+    except TelegramError:
+        pass
 
 
 async def _post_init(app: Application) -> None:
@@ -955,13 +1028,8 @@ async def _post_init(app: Application) -> None:
         logger.warning("Webhook: %s", e)
 
 
-def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        logger.error("Задайте TELEGRAM_BOT_TOKEN")
-        return
-
-    app = (
+def _build_app(token: str) -> Application:
+    return (
         Application.builder()
         .token(token)
         .post_init(_post_init)
@@ -969,9 +1037,15 @@ def main() -> None:
         .write_timeout(30)
         .connect_timeout(30)
         .pool_timeout(30)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_pool_timeout(30)
         .build()
     )
 
+
+def _register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("create_statement", cmd_create_statement))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
@@ -979,14 +1053,38 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_stmt_choice, pattern="^stmt_edit$|^stmt_receipt$"))
     app.add_handler(CallbackQueryHandler(handle_stmt_callback, pattern="^stmt_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amounts))
-
     app.add_error_handler(error_handler)
 
-    logger.info("Бот запущен...")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+
+def main() -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("Задайте TELEGRAM_BOT_TOKEN")
+        return
+
+    restart_delay = int(os.environ.get("BOT_RESTART_DELAY_SEC", "8"))
+
+    while True:
+        try:
+            app = _build_app(token)
+            _register_handlers(app)
+            logger.info("Бот запущен (polling)...")
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                bootstrap_retries=-1,
+            )
+            logger.info("Polling завершён штатно.")
+            break
+        except InvalidToken:
+            logger.critical("Неверный TELEGRAM_BOT_TOKEN")
+            raise SystemExit(1) from None
+        except Exception:
+            logger.exception(
+                "Сбой polling/приложения, перезапуск через %s с (или задайте BOT_RESTART_DELAY_SEC)",
+                restart_delay,
+            )
+            time.sleep(restart_delay)
 
 
 if __name__ == "__main__":
