@@ -28,13 +28,16 @@ from telegram.ext import (
     filters,
 )
 
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    _log_handlers.insert(0, logging.FileHandler("bot.log", encoding="utf-8"))
+except OSError:
+    pass  # на некоторых средах (Render) файл недоступен — используем только stdout
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
 
@@ -1397,6 +1400,8 @@ def _register_handlers(app: Application) -> None:
 
 
 def main() -> None:
+    import asyncio as _asyncio
+
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("Задайте TELEGRAM_BOT_TOKEN")
@@ -1405,6 +1410,12 @@ def main() -> None:
     restart_delay = int(os.environ.get("BOT_RESTART_DELAY_SEC", "8"))
 
     while True:
+        # Каждый раз создаём свежий event loop — после краша предыдущий
+        # закрывается (close_loop=True по умолчанию) и повторный вызов
+        # run_polling() без нового loop даёт RuntimeError: Event loop is closed.
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+
         try:
             app = _build_app(token)
             _register_handlers(app)
@@ -1412,19 +1423,33 @@ def main() -> None:
             app.run_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
-                bootstrap_retries=-1,
+                bootstrap_retries=5,
             )
             logger.info("Polling завершён штатно.")
             break
         except InvalidToken:
-            logger.critical("Неверный TELEGRAM_BOT_TOKEN")
+            logger.critical("Неверный TELEGRAM_BOT_TOKEN — проверьте переменную TELEGRAM_BOT_TOKEN")
             raise SystemExit(1) from None
+        except Conflict:
+            print(
+                "[BOT] Conflict (409): другой экземпляр бота уже запущен. "
+                f"Жду 30 с перед перезапуском...",
+                flush=True,
+            )
+            time.sleep(30)
         except Exception:
             logger.exception(
-                "Сбой polling/приложения, перезапуск через %s с (или задайте BOT_RESTART_DELAY_SEC)",
+                "Сбой polling/приложения, перезапуск через %s с",
                 restart_delay,
             )
             time.sleep(restart_delay)
+        finally:
+            # Закрываем loop явно чтобы не было утечек
+            try:
+                loop.close()
+            except Exception:
+                pass
+            _asyncio.set_event_loop(None)
 
 
 if __name__ == "__main__":
