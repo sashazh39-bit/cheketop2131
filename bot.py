@@ -38,7 +38,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+from bot_usage_log import log_usage
 from pdf_patcher import patch_pdf_file
+from sbp_pool import SBPPool
+
+_sbp_pool = SBPPool()
 
 # Состояние пользователя: {file_path, file_name, bank} или {mode, step, ...} для выписки
 USER_STATE: dict[int, dict] = {}
@@ -74,6 +78,43 @@ ALFA_SBP_FIELDS = [
 ]
 
 
+_CHECK_MODES = {
+    "gpb_sbp": "Газпромбанк СБП",
+    "gpb": "Газпромбанк СБП",
+    "alfa_sbp": "Альфа-Банк СБП",
+    "alfa": "Альфа-Банк СБП",
+    "alfa_card": "Альфа-Банк карта",
+    "card": "Альфа-Банк карта",
+    "alfa_transgran": "Альфа-Банк трансгран",
+    "transgran": "Альфа-Банк трансгран",
+    "tajik": "Альфа-Банк трансгран",
+}
+
+# Modes that produce alfa/2 → require OnlyPDF wrapping before use
+_ONLYPDF_MODES = {"alfa_card", "card", "alfa_transgran", "transgran", "tajik"}
+
+
+def _parse_check_fields(text: str) -> dict[str, str]:
+    """Parse /check multi-line field format.
+
+    Each line: 'key: value' or 'key: auto // comment'
+    """
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("/check"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        key = key.strip().lower().replace("-", "_").replace(" ", "_")
+        value = rest.split("//")[0].strip()
+        if value.lower() in ("auto", "авто", ""):
+            value = "auto"
+        fields[key] = value
+    return fields
+
+
 def parse_amounts(text: str) -> tuple[int, int] | None:
     """Разбор '10 5000' или '10 5 000' → (10, 5000)."""
     nums = re.findall(r"\d+", text.strip())
@@ -105,6 +146,263 @@ def parse_custom_replacement(text: str) -> tuple[str, str] | None:
 # --- Чеки (текущий flow) ---
 
 
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate a receipt from /check multi-line command.
+
+    Format:
+        /check
+        mode: gpb_sbp | alfa_sbp | alfa_card
+        amount: 15000
+        ...fields...
+    """
+    if not is_allowed(update):
+        return
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    uid = update.effective_user.id
+
+    fields = _parse_check_fields(msg.text)
+
+    mode = fields.get("mode", "alfa_sbp").lower()
+    mode = mode.replace(" ", "_")
+
+    if mode not in _CHECK_MODES:
+        await msg.reply_text(
+            "❌ Неверный режим. Укажите:\n"
+            "  `mode: gpb_sbp` — Газпромбанк СБП\n"
+            "  `mode: alfa_sbp` — Альфа-Банк СБП\n"
+            "  `mode: alfa_card` — Альфа-Банк карта",
+            parse_mode="Markdown",
+        )
+        return
+
+    await msg.reply_text(f"⏳ Генерирую чек ({_CHECK_MODES[mode]})...")
+
+    used_pool_id = False
+    try:
+        if mode in ("gpb_sbp", "gpb"):
+            pdf_bytes, filename = await _generate_gpb(fields)
+        elif mode in ("alfa_sbp", "alfa"):
+            pdf_bytes, filename, used_pool_id = await _generate_alfa_sbp(fields)
+        elif mode in ("alfa_card", "card"):
+            pdf_bytes, filename = await _generate_alfa_card(fields)
+        elif mode in ("alfa_transgran", "transgran", "tajik"):
+            pdf_bytes, filename = await _generate_alfa_transgran(fields)
+        else:
+            await msg.reply_text("❌ Неизвестный режим.")
+            return
+    except FileNotFoundError as e:
+        await msg.reply_text(f"❌ Нет донор-файлов: {e}")
+        return
+    except Exception as e:
+        logger.exception("cmd_check error")
+        await msg.reply_text(f"❌ Ошибка генерации: {e}")
+        return
+
+    # Determine if OnlyPDF wrapping is needed
+    needs_onlypdf = mode in _ONLYPDF_MODES or (
+        mode in ("alfa_sbp", "alfa") and not used_pool_id
+    )
+
+    caption = f"✅ {_CHECK_MODES[mode]} | {fields.get('amount', '?')} руб."
+    if needs_onlypdf:
+        caption += "\n\n⚠️ Перед использованием обернуть в OnlyPDF"
+
+    import io
+    await msg.reply_document(
+        document=io.BytesIO(pdf_bytes),
+        filename=filename,
+        caption=caption,
+    )
+    log_usage(uid, "check_generated", mode=mode)
+
+
+def _field(fields: dict[str, str], key: str, default: str) -> str:
+    """Get field value, returning default when missing or 'auto'."""
+    v = fields.get(key, "auto")
+    return default if v in ("auto", "") else v
+
+
+async def _generate_gpb(fields: dict[str, str]) -> tuple[bytes, str]:
+    from gen_gpb_receipt import generate_gpb_receipt
+
+    amount_str = fields.get("amount", "1000")
+    amount = int(re.sub(r"\D", "", amount_str) or "1000")
+
+    # Extract last 4 digits from card mask like "**** **** **** 8527"
+    raw_card = _field(fields, "sender_card", "8527")
+    sender_card = re.sub(r"[^\d]", "", raw_card)[-4:] or "8527"
+
+    return generate_gpb_receipt(
+        amount=amount,
+        sender_name=_field(fields, "sender_name", "ИВАН ИВАНОВИЧ И."),
+        sender_card=sender_card,
+        recipient_name=_field(fields, "recipient_name", "Анна Ивановна И."),
+        recipient_phone=_field(fields, "recipient_phone", "+7(900)000-00-00"),
+        recipient_bank=_field(fields, "recipient_bank", "Сбербанк"),
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+        sbp_number=fields.get("spb_number") or fields.get("sbp_number", "auto"),
+    )
+
+
+async def _generate_alfa_sbp(fields: dict[str, str]) -> tuple[bytes, str, bool]:
+    from gen_sbp_receipt import generate_sbp_receipt
+
+    amount_str = fields.get("amount", "1000")
+    amount = int(re.sub(r"\D", "", amount_str) or "1000")
+
+    sbp_id_override = None
+    used_pool_id = False
+    sbp_entry = _sbp_pool.consume()
+    if sbp_entry:
+        sbp_id_override = sbp_entry["id"]
+        used_pool_id = True
+        logger.info(f"Using SBP ID from pool: {sbp_id_override}")
+    else:
+        logger.info("SBP pool empty — generating SBP ID algorithmically (alfa/2 expected)")
+
+    account = fields.get("account")
+    if account in (None, "auto", ""):
+        account = None
+
+    result = generate_sbp_receipt(
+        amount=amount,
+        recipient=_field(fields, "recipient_name", "Виктория Игоревна С"),
+        phone=_field(fields, "recipient_phone", "+7(900)000-00-00"),
+        bank=_field(fields, "recipient_bank", "Сбербанк"),
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+        account=account,
+        message=_field(fields, "message", "Перевод денежных средств"),
+        sbp_id_override=sbp_id_override,
+    )
+    return result[0], result[1], used_pool_id
+
+
+async def _generate_alfa_transgran(fields: dict[str, str]) -> tuple[bytes, str]:
+    from gen_tajik_receipt import generate_tajik_receipt
+
+    amount_str = fields.get("amount", "1000")
+    amount = int(re.sub(r"\D", "", amount_str) or "1000")
+
+    commission_str = fields.get("commission", "0")
+    commission = int(re.sub(r"\D", "", commission_str) or "0")
+
+    credited_currency = fields.get("credited_currency", "TJS").strip().upper() or "TJS"
+
+    amount_int_str = fields.get("amount_int", "auto")
+    amount_credited: int | None = None
+    if amount_int_str not in ("auto", "", None):
+        amount_credited = int(re.sub(r"\D", "", amount_int_str) or "0") or None
+
+    receipt_number = fields.get("receipt_number", "auto")
+
+    pdf_bytes = generate_tajik_receipt(
+        amount=amount,
+        recipient_name=_field(fields, "recipient_name", "Rahimov A."),
+        recipient_phone=_field(fields, "recipient_phone", "+992900000000"),
+        credited_currency=credited_currency,
+        amount_credited=amount_credited,
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+        receipt_number=receipt_number,
+        commission=commission,
+        account=fields.get("account") if fields.get("account") not in (None, "auto", "") else None,
+    )
+
+    import time as _time
+    filename = f"AM_{int(_time.time() * 1000)}.pdf"
+    return pdf_bytes, filename
+
+
+async def _generate_alfa_card(fields: dict[str, str]) -> tuple[bytes, str]:
+    from gen_card_receipt import generate_card_receipt
+
+    amount_str = fields.get("amount", "1000")
+    amount = int(re.sub(r"\D", "", amount_str) or "1000")
+
+    raw_sender = _field(fields, "sender_card", "9999")
+    raw_recipient = _field(fields, "recipient_card", "1234")
+    sender_card = re.sub(r"[^\d]", "", raw_sender)[-4:] or "9999"
+    recipient_card = re.sub(r"[^\d]", "", raw_recipient)[-4:] or "1234"
+
+    return generate_card_receipt(
+        amount=amount,
+        sender_card=sender_card,
+        recipient_card=recipient_card,
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+    )
+
+
+async def cmd_add_sbp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add SBP IDs to the pool.
+
+    Usage:
+        /add_sbp A61051018121260A0B10040011740901
+        /add_sbp A61051018121260A0B10040011740901 A61051018122850B0B10040011740901
+    Or send IDs as multi-line message after /add_sbp.
+    """
+    if not is_allowed(update):
+        return
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    uid = update.effective_user.id
+
+    text = msg.text
+    if text.startswith("/add_sbp"):
+        text = text[len("/add_sbp"):].strip()
+
+    if not text:
+        await msg.reply_text(
+            "Отправьте SBP ID (по одному на строку или через пробел):\n"
+            "`/add_sbp A61051018121260A0B10040011740901`\n\n"
+            "Каждый ID должен быть ровно 32 символа.",
+            parse_mode="Markdown",
+        )
+        return
+
+    added, skipped = _sbp_pool.add_bulk(text)
+    total, used, avail = _sbp_pool.status()
+    await msg.reply_text(
+        f"✅ Добавлено: {added} | Пропущено (дубли/неверные): {skipped}\n\n"
+        f"📊 Пул: всего {total} | использовано {used} | доступно {avail}",
+    )
+    log_usage(uid, "add_sbp", added=added)
+
+
+async def cmd_pool(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show SBP ID pool status."""
+    if not is_allowed(update):
+        return
+    msg = update.effective_message
+    if not msg:
+        return
+    uid = update.effective_user.id
+
+    total, used, avail = _sbp_pool.status()
+    entries = _sbp_pool.list_available()
+
+    lines = [
+        f"📊 **Пул SBP ID**",
+        f"Всего: {total} | Использовано: {used} | Доступно: {avail}",
+    ]
+    if entries:
+        lines.append("\n🟢 Доступные (первые 10):")
+        for e in entries[:10]:
+            bank = e.get("bank", "")
+            date = e.get("date", "")
+            lines.append(f"  `{e['id']}`  {bank} {date}".strip())
+    else:
+        lines.append("\n⚠️ Пул пуст. Добавьте ID: `/add_sbp AAAA...`")
+
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+    log_usage(uid, "pool_status")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -119,17 +417,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
         del USER_STATE[uid]
     await msg.reply_text(
-        "👋 Привет! Я помогу изменить чек.\n\n"
-        "📋 **Как пользоваться:**\n"
-        "1. Отправьте PDF-чек\n"
-        "2. Выберите режим:\n"
-        "   • *Альфа-Банк / ВТБ / Авто* — замена суммы\n"
-        "   • *Альфа СБП (все поля)* — сумма, дата, получатель, телефон, банк, счёт\n"
-        "3. Введите новые значения\n\n"
-        "📄 Создать выписку: /create_statement\n\n"
-        "✅ Структура PDF, метаданные и контрольные ключи сохраняются.",
+        "👋 Привет! Я помогу изменить или создать чек.\n\n"
+        "📋 **Команды:**\n"
+        "• `/check` — создать чек с нуля\n"
+        "• `/add_sbp` — добавить SBP ID в пул\n"
+        "• `/pool` — статус пула SBP ID\n"
+        "• `/create_statement` — создать выписку\n"
+        "• Отправить PDF → выбрать банк → заменить поля\n\n"
+        "**Режимы `/check`:**\n"
+        "• `gpb_sbp` — Газпромбанк СБП ✅ проходит проверку\n"
+        "• `alfa_sbp` — Альфа-Банк СБП _(нужен SBP ID из пула для ✅, иначе alfa/2 → OnlyPDF)_\n"
+        "• `alfa_card` — Альфа-Банк перевод карта-карта ✅\n"
+        "• `alfa_transgran` — Альфа-Банк трансгран (Таджикистан) ⚠️ OnlyPDF\n\n"
+        "**Газпромбанк СБП:**\n"
+        "```\n/check\nmode: gpb_sbp\namount: 15000\n"
+        "sender_name: ДАНИЛ АЛЕКСАНДРОВИЧ С.\nsender_card: 8527\n"
+        "recipient_name: Байжигит Максатбекович М.\n"
+        "recipient_phone: +7(915)333-60-13\nrecipient_bank: ВТБ\n"
+        "operation_date: 15.04.2026\noperation_time: 14:52:00\n```\n\n"
+        "**Альфа СБП:**\n"
+        "```\n/check\nmode: alfa_sbp\namount: 5000\n"
+        "recipient_name: Иван Петрович С\n"
+        "recipient_phone: +7(900)123-45-67\nrecipient_bank: Сбербанк\n```\n\n"
+        "**Альфа карта:**\n"
+        "```\n/check\nmode: alfa_card\namount: 3000\n"
+        "sender_card: 9876\nrecipient_card: 1234\n```\n\n"
+        "**Альфа трансгран:**\n"
+        "```\n/check\nmode: alfa_transgran\namount: 3000\n"
+        "recipient_name: Rahimov A.\n"
+        "recipient_phone: +992938999964\n"
+        "credited_currency: TJS\namount_int: 354\n```",
         parse_mode="Markdown",
     )
+    log_usage(uid, "start")
 
 
 async def cmd_create_statement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,6 +482,7 @@ async def cmd_create_statement(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    log_usage(uid, "create_statement_menu")
 
 
 async def handle_stmt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,6 +502,7 @@ async def handle_stmt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "mode": "statement_edit",
             "step": "upload",
         }
+        log_usage(uid, "statement_variant", variant="edit_own")
         await query.edit_message_text(
             "✏️ **Редактирование своей выписки**\n\n"
             "Отправьте PDF-файл выписки.",
@@ -191,6 +513,7 @@ async def handle_stmt_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "mode": "statement_from_receipt",
             "step": "upload",
         }
+        log_usage(uid, "statement_variant", variant="from_receipt")
         await query.edit_message_text(
             "📄 **Выписка по чеку**\n\n"
             "Отправьте PDF-файл чека.",
@@ -252,6 +575,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    log_usage(uid, "pdf_upload", flow="check")
 
 
 async def _handle_statement_document(
@@ -292,6 +616,7 @@ async def _handle_statement_document(
             "Например: `10 10000` или `10 5000 50 1000`",
             parse_mode="Markdown",
         )
+        log_usage(uid, "pdf_upload", flow="statement_edit")
 
     elif mode == "statement_from_receipt":
         from receipt_extractor import extract_from_receipt, generate_fio_from_first_letter
@@ -327,7 +652,7 @@ async def _handle_statement_document(
             f"👤 ФИО (сгенерировано): {generated_fio}\n\n"
             "💰 Введите баланс на начало периода (число):",
         )
-
+        log_usage(uid, "pdf_upload", flow="statement_from_receipt")
 
 async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await answer_callback_query_safe(update)
@@ -347,6 +672,7 @@ async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         USER_STATE[user_id]["mode"] = "alfa_sbp_full"
         USER_STATE[user_id]["step"] = 0
         USER_STATE[user_id]["alfa_fields"] = {}
+        log_usage(user_id, "bank_selected", bank="alfa_sbp_full")
         field_key, prompt = ALFA_SBP_FIELDS[0]
         await query.edit_message_text(
             "🏦 **Альфа-Банк СБП — замена всех полей**\n\n"
@@ -361,6 +687,7 @@ async def handle_bank_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     bank = bank_map.get(query.data, "auto")
     bank_name = {"alfa": "Альфа-Банк", "vtb": "ВТБ", "tbank": "Т-Банк", "auto": "Авто"}[bank]
     USER_STATE[user_id]["bank"] = bank
+    log_usage(user_id, "bank_selected", bank=bank)
 
     await query.edit_message_text(
         f"✅ Банк: {bank_name}\n\n"
@@ -423,6 +750,7 @@ async def handle_amounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     del USER_STATE[user_id]
 
     if not ok:
+        log_usage(user_id, "receipt_patch_failed", bank=bank)
         await msg.reply_text(f"❌ Ошибка: {err}")
         try:
             os.unlink(out_path)
@@ -436,6 +764,7 @@ async def handle_amounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             filename=out_name,
             caption=f"✅ Готово: {amount_from} ₽ → {amount_to} ₽",
         )
+    log_usage(user_id, "receipt_patched", bank=bank)
 
     try:
         os.unlink(out_path)
@@ -718,7 +1047,9 @@ async def _apply_alfa_sbp_patch(
                 filename=out_name,
                 caption=caption,
             )
+            log_usage(uid, "alfa_sbp_patched")
     except Exception as e:
+        log_usage(uid, "alfa_sbp_patch_send_failed")
         await msg.reply_text(f"❌ Ошибка отправки: {e}")
 
     try:
@@ -854,6 +1185,7 @@ async def _handle_statement_text(
         del USER_STATE[uid]
 
         if not ok:
+            log_usage(uid, "statement_from_receipt_failed", error=str(err)[:200] if err else "")
             await msg.reply_text(f"❌ Ошибка: {err}")
             try:
                 os.unlink(out_path)
@@ -868,6 +1200,7 @@ async def _handle_statement_text(
                 filename=out_name,
                 caption=f"✅ Выписка готова: {amount} ₽",
             )
+        log_usage(uid, "statement_from_receipt_done")
 
         try:
             os.unlink(out_path)
@@ -889,8 +1222,10 @@ async def handle_stmt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     data = query.data
 
     if data == "stmt_skip":
+        log_usage(uid, "statement_apply", skip_custom=True)
         await _do_stmt_apply(update, context, uid, state, skip_custom=True)
     elif data == "stmt_next":
+        log_usage(uid, "statement_apply", skip_custom=False)
         await _do_stmt_apply(update, context, uid, state, skip_custom=False)
     elif data == "stmt_custom":
         USER_STATE[uid]["step"] = "custom"
@@ -960,6 +1295,7 @@ async def _do_stmt_apply(
     del USER_STATE[uid]
 
     if not ok:
+        log_usage(uid, "statement_edit_patch_failed", error=str(err)[:200] if err else "")
         try:
             await cq.edit_message_text(f"❌ Ошибка: {err}")
         except TelegramError:
@@ -977,6 +1313,7 @@ async def _do_stmt_apply(
             filename=out_name,
             caption="✅ Выписка готова",
         )
+    log_usage(uid, "statement_edit_patched")
 
     try:
         os.unlink(out_path)
@@ -1048,6 +1385,9 @@ def _build_app(token: str) -> Application:
 def _register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("create_statement", cmd_create_statement))
+    app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("add_sbp", cmd_add_sbp))
+    app.add_handler(CommandHandler("pool", cmd_pool))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(CallbackQueryHandler(handle_bank_callback, pattern="^bank_"))
     app.add_handler(CallbackQueryHandler(handle_stmt_choice, pattern="^stmt_edit$|^stmt_receipt$"))

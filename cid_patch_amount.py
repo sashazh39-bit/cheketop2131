@@ -156,9 +156,7 @@ def patch_replacements(
                     print(f"[OK] {display[:50].replace(chr(10), '\\\\n')} (anchored) -> {target_new[:50]}")
 
         if new_dec != dec:
-            orig_raw = bytes(data[stream_start : stream_start + stream_len])
-            level = _detect_zlib_level(orig_raw)
-            new_raw = zlib.compress(new_dec, level)
+            new_raw = zlib.compress(new_dec, 6)
             mods.append((stream_start, stream_len, len_num_start, dec, new_raw))
 
     if not mods:
@@ -282,6 +280,327 @@ def _find_old_hex(old_val: str, uni_to_cid: dict, dec: bytes) -> bytes | None:
     return None
 
 
+def _find_noop_padded_raw(dec: bytes, target_len: int, base_level: int) -> bytes | None:
+    """Return a zlib-compressed stream of exactly *target_len* bytes by appending
+    PDF no-op operators to *dec* until the compressed output matches the target.
+
+    Uses '0 Tc\r\n' (set character spacing to 0 — default, harmless) as padding.
+    Falls back to other no-ops if needed.  Returns None if no match found.
+
+    The returned stream has no trailing unused bytes (unused_data == 0), which
+    avoids the zero-padding forgery detector.
+    """
+    current = len(zlib.compress(dec, base_level))
+    if current == target_len:
+        return zlib.compress(dec, base_level)
+    if current > target_len:
+        return None  # already too large — caller handles this
+
+    noop_ops = [b"0 Tc\r\n", b"0 Tw\r\n", b"0 Tr\r\n", b"\t"]
+    for noop in noop_ops:
+        for n in range(1, 512):
+            candidate_dec = dec + noop * n
+            candidate_raw = zlib.compress(candidate_dec, base_level)
+            if len(candidate_raw) == target_len:
+                return candidate_raw
+            if len(candidate_raw) > target_len:
+                break
+    return None
+
+
+def patch_replacements_zero_delta(
+    in_path: Path, out_path: Path, replacements: list[tuple[str, str]]
+) -> bool:
+    """
+    Zero-delta variant of patch_replacements.
+
+    Identical CID-replacement logic, but after recompression the stream bytes
+    are padded with \\x00 to match the original /Length exactly.  This means:
+      - /Length stays untouched
+      - xref offsets stay untouched
+      - startxref stays untouched
+      - file size stays untouched
+
+    zlib.decompress() stops at the end of valid compressed data and ignores any
+    trailing bytes, so PDF readers see the correct decompressed content.
+
+    Falls back to standard patch_replacements if the recompressed stream would
+    be *larger* than the original (should not happen in practice for small text
+    substitutions of equal byte-length).
+
+    The function also enforces equal-length CID substitutions: if _find_old_hex
+    matched a trailing-space variant (making old_hex longer than new_hex), the
+    new_hex is padded with the space CID so the decompressed stream length is
+    preserved.
+    """
+    if not replacements:
+        return False
+
+    data = bytearray(in_path.read_bytes())
+    all_cmaps = _parse_tounicode_all(bytes(data))
+    if not all_cmaps:
+        print("[ERROR] ToUnicode CMap не найден", file=sys.stderr)
+        return False
+    uni_to_cid_primary = dict(all_cmaps[0])
+
+    flat_replacements: list[tuple[str, str, str | None]] = []
+    anchored_pairs: list[tuple[str, str, str, str]] = []
+    for old_val, new_val in replacements:
+        if "\n" in old_val:
+            old_lines = old_val.split("\n")
+            new_lines = new_val.split("\n")
+            if old_lines[0] == (new_lines[0] if new_lines else ""):
+                if len(old_lines) >= 2:
+                    ol1 = old_lines[1]
+                    nl1 = new_lines[1] if len(new_lines) > 1 else ""
+                    if ol1 and ol1 != nl1:
+                        anchored_pairs.append((old_lines[0], ol1, nl1, old_val))
+                for i in range(2, len(old_lines)):
+                    ol = old_lines[i]
+                    nl = new_lines[i] if i < len(new_lines) else ""
+                    if ol and ol != nl:
+                        flat_replacements.append((ol, nl, old_val))
+            else:
+                for i, old_line in enumerate(old_lines):
+                    new_line = new_lines[i] if i < len(new_lines) else ""
+                    if old_line and old_line != new_line:
+                        flat_replacements.append((old_line, new_line, old_val))
+        else:
+            flat_replacements.append((old_val, new_val, None))
+
+    required_chars: set[int] = set()
+    for _old, new_val, _parent in flat_replacements:
+        for c in new_val:
+            cp = ord(c)
+            if cp == 0x20:
+                required_chars.add(0x20)
+                required_chars.add(0xA0)
+            elif cp >= 0x20:
+                required_chars.add(cp)
+    for _anchor, _told, tnew, _parent in anchored_pairs:
+        for c in tnew:
+            cp = ord(c)
+            if cp == 0x20:
+                required_chars.add(0x20)
+                required_chars.add(0xA0)
+            elif cp >= 0x20:
+                required_chars.add(cp)
+    data, uni_to_cid = _extend_tounicode_identity(data, required_chars, uni_to_cid_primary)
+    extra_cmaps = [dict(m) for m in all_cmaps[1:]]
+    candidate_maps: list[dict] = [uni_to_cid] + extra_cmaps
+
+    streams: list[tuple[int, int, int, bytes]] = []
+    for m in re.finditer(rb"<<(.*?)/Length\s+(\d+)(.*?)>>\s*stream\r?\n", data, re.DOTALL):
+        stream_len = int(m.group(2))
+        stream_start = m.end()
+        if stream_start + stream_len > len(data):
+            continue
+        try:
+            dec = zlib.decompress(bytes(data[stream_start : stream_start + stream_len]))
+        except zlib.error:
+            continue
+        if b"BT" not in dec:
+            continue
+        streams.append((stream_start, stream_len, m.start(2), dec))
+
+    _ANCHOR_WINDOW = 2048
+    total_replaced = 0
+    logged_parents: set[str] = set()
+    any_fallback = False
+
+    for stream_start, stream_len, len_num_start, dec in streams:
+        new_dec = dec
+
+        for old_val, new_val, parent in flat_replacements:
+            pair = _find_hex_pair_zero_delta(old_val, new_val, candidate_maps, new_dec)
+            if not pair:
+                continue
+            old_hex, new_hex = pair
+            if old_hex not in new_dec:
+                continue
+            is_lower = any(c in b"abcdef" for c in old_hex)
+            if is_lower:
+                new_hex = new_hex.lower()
+            new_dec = new_dec.replace(old_hex, new_hex)
+            total_replaced += 1
+            display = parent or old_val
+            if display not in logged_parents:
+                logged_parents.add(display)
+                short_old = display[:50].replace("\n", "\\n")
+                short_new = new_val[:50].replace("\n", "\\n")
+                print(f"[OK] {short_old} -> {short_new}")
+
+        for anchor_text, target_old, target_new, parent in anchored_pairs:
+            anchored = _find_anchored_hex_pair(
+                anchor_text, target_old, target_new, candidate_maps, new_dec
+            )
+            if not anchored:
+                continue
+            a_hex, t_hex, n_hex = anchored
+            # Apply same length-preservation to anchored target
+            n_hex_fixed = _pad_new_hex_to_length(t_hex, n_hex, candidate_maps)
+            is_lower = any(c in b"abcdef" for c in t_hex)
+            if is_lower:
+                n_hex_fixed = n_hex_fixed.lower()
+            anchor_pos = new_dec.find(a_hex)
+            if anchor_pos < 0:
+                continue
+            search_start = anchor_pos + len(a_hex)
+            search_end = min(search_start + _ANCHOR_WINDOW, len(new_dec))
+            t_pos = new_dec.find(t_hex, search_start, search_end)
+            if t_pos >= 0:
+                new_dec = new_dec[:t_pos] + n_hex_fixed + new_dec[t_pos + len(t_hex) :]
+                total_replaced += 1
+                display = parent or target_old
+                if display not in logged_parents:
+                    logged_parents.add(display)
+                    print(f"[OK] {display[:50].replace(chr(10), chr(10))} (anchored) -> {target_new[:50]}")
+
+        if new_dec == dec:
+            continue
+
+        if len(new_dec) != len(dec):
+            # Decompressed length changed — can't do zero-delta, fall back
+            print(
+                f"[WARN] zero-delta: decompressed length changed "
+                f"({len(dec)} -> {len(new_dec)}), falling back to standard patch",
+                file=sys.stderr,
+            )
+            any_fallback = True
+            continue
+
+        # Recompress at level 6 (genuine Oracle BI Publisher level)
+        new_raw = zlib.compress(new_dec, 6)
+        if len(new_raw) > stream_len:
+            for try_level in range(7, 10):
+                candidate = zlib.compress(new_dec, try_level)
+                if len(candidate) <= stream_len:
+                    new_raw = candidate
+                    break
+            else:
+                print(
+                    f"[WARN] zero-delta: recompressed stream too large "
+                    f"({len(new_raw)} > {stream_len}), falling back",
+                    file=sys.stderr,
+                )
+                any_fallback = True
+                continue
+
+        # Try to find exact match via PDF no-op padding (0 Tc\r\n) instead of zero-bytes.
+        # This avoids unused_data / recompress-mismatch detection.
+        final_raw = _find_noop_padded_raw(new_dec, stream_len, 6)
+        if final_raw is None:
+            # Fallback: pad with \x00
+            final_raw = new_raw + b"\x00" * (stream_len - len(new_raw))
+
+        assert len(final_raw) == stream_len
+
+        # In-place replacement — ONLY the stream bytes, nothing else
+        data[stream_start : stream_start + stream_len] = final_raw
+
+    if total_replaced == 0:
+        if not any_fallback:
+            print("[ERROR] Ни одна замена не применена", file=sys.stderr)
+        return any_fallback
+
+    out_path.write_bytes(bytes(data))
+    print(f"[OK] zero-delta: применено замен: {total_replaced}")
+    return True
+
+
+def _pad_new_hex_to_length(old_hex: bytes, new_hex: bytes, candidate_maps: list[dict]) -> bytes:
+    """Pad new_hex (inner bytes without angle brackets) to match len(old_hex).
+
+    When _find_old_hex matched a trailing-space variant the old_hex is longer.
+    We pad new_hex with a space CID so the decompressed stream length stays
+    identical.
+    """
+    if len(old_hex) == len(new_hex):
+        return new_hex
+
+    diff = len(old_hex) - len(new_hex)
+    if diff <= 0:
+        return new_hex  # new is already longer — caller handles
+
+    # Determine if these are inner (no angle brackets) or full hex strings
+    is_inner = not old_hex.startswith(b"<")
+
+    # Find a space CID (one 4-hex-char CID = 4 bytes in inner representation)
+    space_cid: bytes | None = None
+    for umap in candidate_maps:
+        for cp in (0xA0, 0x20):
+            if cp in umap:
+                space_cid = umap[cp].encode()  # e.g. b"0022"
+                break
+        if space_cid:
+            break
+
+    if not space_cid or diff % len(space_cid) != 0:
+        return new_hex  # can't pad cleanly
+
+    pad_units = diff // len(space_cid)
+    padding = space_cid * pad_units
+
+    if is_inner:
+        return new_hex + padding
+    else:
+        # new_hex is b"<....XXXX>"
+        return new_hex[:-1] + padding + b">"
+
+
+def _find_hex_pair_zero_delta(
+    old_val: str,
+    new_val: str,
+    candidate_maps: list[dict],
+    dec: bytes,
+) -> tuple[bytes, bytes] | None:
+    """Like _find_hex_pair_for_maps but ensures old_hex and new_hex are the
+    same length so the decompressed stream length is preserved.
+
+    When _find_old_hex matched a trailing-space variant (old_hex longer than
+    the bare encoding), new_hex is padded with space CIDs to compensate.
+    """
+    for umap in candidate_maps:
+        old_hex = _find_old_hex(old_val, umap, dec)
+        if not old_hex:
+            continue
+        new_hex = _encode_cid(new_val, umap)
+        if not new_hex:
+            continue
+        # Strip angle brackets from new_hex to work in inner representation
+        is_full = old_hex.startswith(b"<")
+        if is_full:
+            old_inner = old_hex[1:-1]
+            new_inner = new_hex[1:-1]
+        else:
+            old_inner = old_hex
+            new_inner = new_hex[1:-1]
+
+        if len(old_inner) != len(new_inner):
+            # Pad new_inner to match old_inner length with space CIDs
+            diff = len(old_inner) - len(new_inner)
+            if diff > 0:
+                space_cid: bytes | None = None
+                for cp in (0xA0, 0x20):
+                    if cp in umap:
+                        space_cid = umap[cp].encode()
+                        break
+                if space_cid and diff % len(space_cid) == 0:
+                    new_inner = new_inner + space_cid * (diff // len(space_cid))
+                else:
+                    continue  # can't fix length, try next map
+            else:
+                continue  # new is longer than old — skip
+
+        if is_full:
+            # Both returned with angle brackets; caller does plain replace(old, new)
+            return (b"<" + old_inner + b">", b"<" + new_inner + b">")
+        else:
+            # Both inner (no brackets)
+            return (old_inner, new_inner)
+    return None
+
+
 def patch_amount(in_path: Path, out_path: Path, old_amount: str, new_amount: str) -> bool:
     """
     Заменить old_amount на new_amount в PDF (например "160 RUR" -> "1 600 RUR").
@@ -349,8 +668,7 @@ def patch_amount(in_path: Path, out_path: Path, old_amount: str, new_amount: str
         new_dec = dec.replace(old_hex, new_hex)
         if new_dec == dec:
             continue
-        level = _detect_zlib_level(bytes(data[stream_start:stream_end]))
-        new_raw = zlib.compress(new_dec, level)
+        new_raw = zlib.compress(new_dec, 6)
         delta = len(new_raw) - stream_len
 
         # 1. Заменить stream (concat вместо slice — избегаем BufferError при resize)
@@ -481,7 +799,7 @@ def _extend_tounicode_identity(
         new_entries = []
         for cp in sorted(missing):
             cid_hex = f"{cp:04X}"
-            new_entries.append(f"<{cid_hex}><{cid_hex}>".encode())
+            new_entries.append(f"<{cid_hex}> <{cid_hex}>".encode())
             uni_to_cid[cp] = cid_hex
 
         insert_pos = dec.find(b"endbfchar")
@@ -492,10 +810,12 @@ def _extend_tounicode_identity(
             old_count = int(count_m.group(1))
             new_count = old_count + len(new_entries)
             dec = dec[: count_m.start(1)] + str(new_count).encode() + dec[count_m.end(1) :]
-        new_block = b"\r\n" + b"\r\n".join(new_entries) + b"\r\n"
+        # Use the same line ending as the existing CMap to avoid mixed endings
+        eol = b"\r\n" if b"\r\n" in dec else b"\n"
+        new_block = eol.join(new_entries) + eol
         insert_pos = dec.find(b"endbfchar")
         new_dec = dec[:insert_pos] + new_block + dec[insert_pos:]
-        new_raw = zlib.compress(new_dec, 9)
+        new_raw = zlib.compress(new_dec, 6)
         delta = len(new_raw) - stream_len
 
         new_data = (

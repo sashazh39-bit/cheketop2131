@@ -107,7 +107,8 @@ def update_id(data: bytearray) -> bool:
     id_m = re.search(rb'/ID\s*\[\s*(<[0-9a-fA-F]+>\s*<[0-9a-fA-F]+>)\s*\]', bytes(data))
     if id_m:
         old_id = id_m.group(1)
-        h = hashlib.md5(bytes(data)).hexdigest().upper()
+        # Oracle BI Publisher always emits lowercase hex in /ID — never uppercase
+        h = hashlib.md5(bytes(data)).hexdigest().lower()
         new_id = f"<{h}> <{h}>".encode()
         data[id_m.start(1) : id_m.end(1)] = new_id[: len(old_id)].ljust(len(old_id))
         return True
@@ -232,6 +233,39 @@ def patch_amount(
         ), None
 
 
+def _is_tbank_pdf(data: bytes) -> bool:
+    """Detect T-Bank receipt by characteristic markers."""
+    return (
+        b"OpenPDF" in data
+        and b"JasperReports" in data
+        and (b"TinkoffSans" in data or b"tbank.ru" in data or b"TBANK" in data)
+    )
+
+
+def _patch_tbank(
+    input_path: Path,
+    output_path: Path,
+    amount_to: int,
+) -> tuple[bool, Optional[str]]:
+    """T-Bank patching: only content stream + xref, NO metadata changes."""
+    try:
+        from tbank_check_service import (
+            detect_receipt_type,
+            patch_amount as tbank_patch_amount,
+        )
+
+        rtype = detect_receipt_type(str(input_path))
+        tbank_patch_amount(
+            str(input_path),
+            float(amount_to),
+            receipt_type=rtype,
+            output_path=str(output_path),
+        )
+        return True, None
+    except Exception as e:
+        return False, f"Ошибка T-Bank патча: {e}"
+
+
 def patch_pdf_file(
     input_path: str | Path,
     output_path: str | Path,
@@ -247,6 +281,12 @@ def patch_pdf_file(
         data = inp.read_bytes()
     except Exception as e:
         return False, f"Ошибка чтения: {e}"
+
+    # T-Bank: dedicated path that preserves integrity (no metadata changes)
+    if bank == "tbank" or (bank == "auto" and _is_tbank_pdf(data)):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        return _patch_tbank(inp, out, amount_to)
+
     ok, err, new_data = patch_amount(data, amount_from, amount_to, bank=bank)
     if ok and new_data is not None:
         try:
@@ -256,9 +296,7 @@ def patch_pdf_file(
             return False, f"Ошибка записи: {e}"
         return True, None
 
-    # Fallback: Альфа-Банк — hex CID (ToUnicode CMap), как в КАК_РАБОТАЕТ_ЗАМЕНА_СУММ_В_ЧЕКЕ.txt
-    # Два формата: "10 RUR" (СБП/AM_*.pdf), "25 637 р." (квитанции)
-    # Fallback: эталон Apple-квитанции Альфы часто содержит "500 RUR"
+    # Fallback: Альфа-Банк — hex CID (ToUnicode CMap)
     if bank in ("alfa", "auto"):
         try:
             from cid_patch_amount import patch_amount as cid_patch
@@ -267,7 +305,6 @@ def patch_pdf_file(
             new_rur = format_amount_display(amount_to) + " RUR"
             new_ru = format_amount_display(amount_to) + " р."
 
-            # 1) Точные замены (с вариантами old+" ", old+"\u00a0" в cid_patch)
             for old_str, new_str in [
                 (format_amount_display(amount_from) + " RUR", new_rur),
                 (str(amount_from) + " RUR", new_rur),
@@ -277,13 +314,11 @@ def patch_pdf_file(
                 if cid_patch(inp, out, old_str, new_str):
                     return True, None
 
-            # 2) Fallback для RUR: если exact не найден — пробуем шаблоны 10, 50, 500
             if "RUR" in new_rur:
                 for old_fb in ["10 RUR ", "10 RUR\u00a0", "10 RUR", "50 RUR ", "50 RUR\u00a0", "50 RUR", "500 RUR ", "500 RUR\u00a0", "500 RUR"]:
                     if cid_patch(inp, out, old_fb, new_rur):
                         return True, None
 
-            # 3) Множественные замены для р.
             if cid_replacements(inp, out, [
                 (format_amount_display(amount_from) + " р.", new_ru),
                 (str(amount_from) + " р.", new_ru),
