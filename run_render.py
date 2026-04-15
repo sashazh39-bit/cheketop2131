@@ -1,163 +1,128 @@
 #!/usr/bin/env python3
 """Запуск бота как Web Service для Render.com (бесплатный тариф).
 
-Render даёт бесплатно Web Service (не Worker). Этот скрипт поднимает
-минимальный HTTP-сервер для health check и запускает бота в фоне.
+Render требует Web Service (не Worker): этот скрипт поднимает HTTP-сервер
+для health check в фоне, а бота запускает в ГЛАВНОМ потоке — это обязательно
+для asyncio (python-telegram-bot v20+).
+
 Без входящих запросов Render засыпает через 15 мин — подключите
 UptimeRobot (бесплатно) для пинга каждые 5 мин.
 """
 import json
 import os
+import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # PORT обязателен для Render: https://render.com/docs/web-services#port-binding
 PORT = int(os.environ.get("PORT", 10000))
-WATCHDOG_TIMEOUT_SEC = int(os.environ.get("WATCHDOG_TIMEOUT_SEC", "180"))
-WATCHDOG_CHECK_INTERVAL_SEC = int(os.environ.get("WATCHDOG_CHECK_INTERVAL_SEC", "10"))
 
-STATE_LOCK = threading.Lock()
-STATE = {
-    "started_at": time.time(),
-    "last_bot_heartbeat": 0.0,
-    "last_bot_error": "",
-    "restart_count": 0,
+_STARTED_AT = time.time()
+_STATE_LOCK = threading.Lock()
+_STATE: dict = {
     "bot_alive": False,
+    "last_error": "",
+    "uptime_started": _STARTED_AT,
 }
 
 
-def _set_state(**kwargs) -> None:
-    with STATE_LOCK:
-        STATE.update(kwargs)
+def _set(**kw) -> None:
+    with _STATE_LOCK:
+        _STATE.update(kw)
 
 
-def _get_state() -> dict:
-    with STATE_LOCK:
-        return dict(STATE)
-
-
-def _heartbeat_loop() -> None:
-    """Периодически обновляет heartbeat пока поток бота жив."""
-    while True:
-        time.sleep(30)
-        _set_state(last_bot_heartbeat=time.time())
-
-
-def run_bot():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        print("TELEGRAM_BOT_TOKEN не задан", flush=True)
-        _set_state(last_bot_error="TELEGRAM_BOT_TOKEN не задан", bot_alive=False)
-        return
-    try:
-        from bot import main as _bot_main
-    except Exception as e:
-        print(f"Bot import error: {e}", flush=True)
-        _set_state(last_bot_error=f"Bot import error: {e}", bot_alive=False)
-        return
-
-    _set_state(last_bot_heartbeat=time.time(), bot_alive=True)
-
-    hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat-thread")
-    hb_thread.start()
-
-    try:
-        _bot_main()
-    except Exception as e:
-        _set_state(
-            last_bot_error=str(e)[:500],
-            restart_count=_get_state()["restart_count"] + 1,
-            bot_alive=False,
-        )
-        print(f"Bot exited with error: {e}", flush=True)
-
-
-def watchdog_loop(bot_thread: threading.Thread) -> None:
-    while True:
-        time.sleep(max(1, WATCHDOG_CHECK_INTERVAL_SEC))
-        st = _get_state()
-        now = time.time()
-        hb = st.get("last_bot_heartbeat", 0.0)
-        hb_age = now - hb if hb else 10**9
-
-        if not bot_thread.is_alive():
-            print("WATCHDOG: bot thread is not alive, exit(1) for Render restart", flush=True)
-            os._exit(1)
-
-        if hb_age > WATCHDOG_TIMEOUT_SEC:
-            print(
-                f"WATCHDOG: heartbeat stale ({int(hb_age)}s > {WATCHDOG_TIMEOUT_SEC}s), exit(1) for Render restart",
-                flush=True,
-            )
-            os._exit(1)
+def _get() -> dict:
+    with _STATE_LOCK:
+        return dict(_STATE)
 
 
 class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            st = _get_state()
-            now = time.time()
-            hb = st.get("last_bot_heartbeat", 0.0)
-            hb_age = now - hb if hb else None
-            healthy = bool(st.get("bot_alive")) and hb_age is not None and hb_age <= WATCHDOG_TIMEOUT_SEC
+    def do_GET(self) -> None:
+        st = _get()
+        alive = st.get("bot_alive", False)
+        uptime = int(time.time() - st.get("uptime_started", time.time()))
 
-            if self.path in ("/", "/healthz"):
-                status = 200 if healthy else 503
-                payload = {
-                    "status": "ok" if healthy else "degraded",
-                    "uptime_sec": int(now - st["started_at"]),
-                    "bot_alive": st["bot_alive"],
-                    "heartbeat_age_sec": None if hb_age is None else int(hb_age),
-                    "restart_count": st["restart_count"],
-                    "last_bot_error": st["last_bot_error"],
-                }
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-
-            if self.path == "/metrics":
-                metrics = (
-                    f"bot_uptime_seconds {int(now - st['started_at'])}\n"
-                    f"bot_restart_count {int(st['restart_count'])}\n"
-                    f"bot_alive {1 if st['bot_alive'] else 0}\n"
-                    f"bot_heartbeat_age_seconds {int(hb_age) if hb_age is not None else -1}\n"
-                ).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(metrics)))
-                self.end_headers()
-                self.wfile.write(metrics)
-                return
-
+        if self.path in ("/", "/healthz"):
+            status = 200 if alive else 503
+            payload = {
+                "status": "ok" if alive else "starting",
+                "uptime_sec": uptime,
+                "bot_alive": alive,
+                "last_error": st.get("last_error", ""),
+            }
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/metrics":
+            body = (
+                f"bot_alive {1 if alive else 0}\n"
+                f"bot_uptime_seconds {uptime}\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
             self.send_response(404)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"Not Found")
 
-        def log_message(self, format, *args):
-            pass
+    def log_message(self, fmt, *args) -> None:  # silence access log
+        pass
+
+
+def _http_server_thread() -> None:
+    class _Server(HTTPServer):
+        allow_reuse_address = True
+
+    server = _Server(("0.0.0.0", PORT), HealthHandler)
+    print(f"[render] HTTP health-check on 0.0.0.0:{PORT}", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except Exception as e:
+        print(f"[render] HTTP server error: {e}", flush=True)
+
+
+def main() -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        print("[render] TELEGRAM_BOT_TOKEN не задан — выход", flush=True)
+        sys.exit(1)
+
+    # Стартуем HTTP-сервер в фоне (для Render health check)
+    t = threading.Thread(target=_http_server_thread, daemon=True, name="http-health")
+    t.start()
+
+    # Импортируем бот — если упадёт здесь, Render увидит exit(1) и перезапустит
+    try:
+        from bot import main as bot_main
+    except Exception as exc:
+        print(f"[render] Ошибка импорта bot.py: {exc}", flush=True)
+        _set(last_error=str(exc))
+        sys.exit(1)
+
+    _set(bot_alive=True)
+    print("[render] Запускаем бота (polling) в главном потоке...", flush=True)
+
+    try:
+        bot_main()  # блокирует; внутри есть restart-loop
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _set(bot_alive=False, last_error=str(exc)[:500])
+        print(f"[render] Бот упал: {exc}", flush=True)
+        sys.exit(1)
+
+    # Если bot_main() вернулся штатно — всё равно выходим,
+    # чтобы Render мог перезапустить при необходимости.
+    print("[render] bot_main() завершился — выход", flush=True)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    class ReusableHTTPServer(HTTPServer):
-        allow_reuse_address = True
-
-    server = ReusableHTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"Listening on 0.0.0.0:{PORT}", flush=True)
-
-    bot_thread = threading.Thread(target=run_bot, daemon=True, name="bot-thread")
-    bot_thread.start()
-
-    watchdog_thread = threading.Thread(target=watchdog_loop, args=(bot_thread,), daemon=True, name="watchdog-thread")
-    watchdog_thread.start()
-
-    try:
-        server.serve_forever(poll_interval=0.5)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    main()
