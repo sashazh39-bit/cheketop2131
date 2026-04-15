@@ -3632,46 +3632,164 @@ def _run_new_gen(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
         _send_main_menu_button(token, chat_id, tg_req)
 
 
-def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
-    """Handle /check command: generate a Tajikistan transgran receipt from inline params.
+_CHECK_MODES = {
+    "gpb_sbp":        "Газпромбанк СБП",
+    "gpb":            "Газпромбанк СБП",
+    "alfa_sbp":       "Альфа-Банк СБП",
+    "alfa":           "Альфа-Банк СБП",
+    "alfa_card":      "Альфа карта-на-карту",
+    "card":           "Альфа карта-на-карту",
+    "alfa_transgran": "Альфа Трансгран",
+    "transgran":      "Альфа Трансгран",
+}
 
-    Expected message format:
-        /check
-        amount: 3000
-        recipient_name: Bobomurodov Kh.
-        recipient_phone: +992938999964
-        credited_currency: TJS
-        amount_int: 354
-        operation_date: 25.09.2025
-        operation_time: 13:45:12
-        receipt_number: auto
-    """
+_CHECK_HELP = """\
+/check — генерация чека с нуля
+
+Поддерживаемые режимы (mode):
+  gpb_sbp       — Газпромбанк СБП ✅
+  alfa_sbp      — Альфа-Банк СБП ⚠️ OnlyPDF если нет SBP ID
+  alfa_card     — Альфа карта-на-карту ⚠️ OnlyPDF
+  alfa_transgran — Альфа Трансгран ⚠️ OnlyPDF
+
+Значение auto — сгенерировать автоматически.
+
+Пример (Газпромбанк СБП):
+/check
+mode: gpb_sbp
+amount: 15000
+sender_name: Данил Александрович С.
+sender_card: 8527
+recipient_name: Иван Сергеевич К.
+recipient_phone: +7(915)348-60-40
+recipient_bank: Сбербанк
+operation_date: auto
+operation_time: auto
+
+Пример (Альфа СБП):
+/check
+mode: alfa_sbp
+amount: 3500
+sender_name: Демид Андреевич В.
+sender_card: ** ** **** 3664
+recipient_name: Иван Сергеевич К.
+recipient_phone: +7(996)321-64-57
+recipient_bank: Сбербанк
+spb_number: auto
+operation_date: auto
+operation_time: auto
+
+Пример (Альфа карта):
+/check
+mode: alfa_card
+amount: 5000
+sender_card: 9876
+recipient_card: 1234
+operation_date: auto
+operation_time: auto
+
+Пример (Альфа Трансгран):
+/check
+mode: alfa_transgran
+amount: 3000
+recipient_name: Rahimov A.
+recipient_phone: +992938999964
+credited_currency: TJS
+amount_int: 354
+operation_date: auto
+operation_time: auto\
+"""
+
+
+def _parse_check_fields(text: str) -> dict[str, str]:
+    """Parse /check multi-line format. Strips 'auto // comment' to just 'auto'."""
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("/check"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().lower().replace("-", "_")
+        val = val.strip()
+        if "//" in val:
+            val = val[: val.index("//")].strip()
+        fields[key] = val
+    return fields
+
+
+def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
+    """Handle /check command: generate receipts for all supported modes."""
+
     def send(txt: str):
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
 
-    try:
-        from gen_tajik_receipt import generate_from_check_command
-    except ImportError as e:
-        send(f"❌ Модуль gen_tajik_receipt недоступен: {e}")
+    # Show help when called with no arguments
+    body = text.strip()
+    lines_with_content = [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith("/check")]
+    if not lines_with_content:
+        send(_CHECK_HELP)
         return
 
-    try:
-        pdf_bytes = generate_from_check_command(text)
-    except (ValueError, KeyError) as e:
-        send(f"❌ Ошибка параметров: {e}\n\nПример:\n/check\namount: 3000\nrecipient_name: Иванов И.И.\nrecipient_phone: +992901234567\ncredited_currency: TJS\namount_int: 354")
-        return
-    except RuntimeError as e:
-        send(f"❌ Ошибка генерации: {e}")
-        return
-    except Exception as e:
-        send(f"❌ Внутренняя ошибка: {e}")
+    fields = _parse_check_fields(text)
+    mode = fields.pop("mode", "alfa_sbp").lower().replace(" ", "_")
+
+    if mode not in _CHECK_MODES:
+        send(
+            "❌ Неверный режим. Доступные:\n"
+            "  mode: gpb_sbp\n"
+            "  mode: alfa_sbp\n"
+            "  mode: alfa_card\n"
+            "  mode: alfa_transgran\n\n"
+            "Отправьте /check без параметров, чтобы увидеть примеры."
+        )
         return
 
-    fname = f"AM_{abs(hash(pdf_bytes)) % 10**16}.pdf"
+    label = _CHECK_MODES[mode]
+    send(f"⏳ Генерирую чек ({label})...")
+
+    try:
+        needs_onlypdf = False
+
+        if mode in ("gpb_sbp", "gpb"):
+            pdf_bytes, filename = _gen_gpb(fields)
+
+        elif mode in ("alfa_sbp", "alfa"):
+            spb_raw = fields.get("spb_number", "auto")
+            sbp_override: str | None = None
+            if spb_raw not in ("", "auto"):
+                sbp_override = spb_raw
+            elif _sbp_pool is not None:
+                entry = _sbp_pool.consume()
+                sbp_override = entry["id"] if entry else None
+            pdf_bytes, filename = _gen_alfa_sbp(fields, sbp_id_override=sbp_override)
+            needs_onlypdf = sbp_override is None
+
+        elif mode in ("alfa_card", "card"):
+            pdf_bytes, filename = _gen_alfa_card(fields)
+            needs_onlypdf = True
+
+        elif mode in ("alfa_transgran", "transgran"):
+            pdf_bytes, filename = _gen_alfa_transgran(fields)
+            needs_onlypdf = True
+
+        else:
+            send("❌ Режим не поддерживается.")
+            return
+
+    except Exception as exc:
+        send(f"❌ Ошибка генерации: {exc}")
+        return
+
+    caption = f"✅ {label} | {fields.get('amount', '?')} руб."
+    if needs_onlypdf:
+        caption += "\n\n⚠️ Перед использованием обернуть в OnlyPDF"
+
     tg_req(token, "sendDocument", {
         "chat_id": chat_id,
-        "caption": "✅ Квитанция сгенерирована",
-    }, files={"document": (fname, pdf_bytes)})
+        "caption": caption,
+    }, files={"document": (filename, pdf_bytes)})
 
 
 def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
@@ -3943,7 +4061,7 @@ def run_bot(token: str) -> None:
                     _parts = text.split()
                     cmd0 = _parts[0].split("@", 1)[0] if _parts else ""
 
-                    # --- /check command: generate Tajikistan transgran receipt ---
+                    # --- /check: генерация чека (gpb_sbp / alfa_sbp / alfa_card / alfa_transgran) ---
                     if cmd0 == "/check":
                         _handle_check_command(token, chat_id, text, tg_request)
                         continue
