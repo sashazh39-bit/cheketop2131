@@ -17,8 +17,12 @@ venv/
 .temp_*
 receipt_test_*.pdf
 
-# PDF тестовые / рабочие файлы
+# PDF тестовые / рабочие файлы (исключаем донорские директории)
 *.pdf
+!СБП/*.pdf
+!GPB/*.pdf
+!карта_на_карту/*.pdf
+!таджикистан/*.pdf
 tmp_*/
 tmp_alfa_scratch/
 vtb-generator/
