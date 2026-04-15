@@ -4551,24 +4551,34 @@ def run_bot(token: str) -> None:
                         })
                         continue
                     if q["data"] == "main_generate":
+                        USER_STATE[uid] = {}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "✨ Сгенерировать чек\n\nВыберите банк:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [{"text": "🏦 Альфа-Банк", "callback_data": "new_gen_alfa_menu"}],
+                                    [{"text": "🔵 Газпромбанк", "callback_data": "new_gen_gpb_menu"}],
+                                    [{"text": "🏛 ВТБ", "callback_data": "gen_bank_menu_vtb"}],
+                                    [{"text": "🅃 Т-Банк", "callback_data": "gen_type_tbank"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "main_check"}],
+                                ],
+                            }),
+                        })
+                        continue
+
+                    if q["data"] == "gen_bank_menu_vtb":
                         USER_STATE[uid] = {"awaiting": "gen_type", "gen_transfer_type": None, "gen_bank_type": None}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": (
-                                "✨ Сгенерировать чек\n\n"
-                                "Выберите тип перевода:"
-                            ),
+                            "text": "🏛 ВТБ — выберите тип:",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
-                                    [{"text": "📱 Перевод по СБП", "callback_data": "gen_type_sbp"}],
-                                    [{"text": "💳 Альфа-карта", "callback_data": "gen_type_card"}],
-                                    [{"text": "🌐 Трансгран (скоро)", "callback_data": "gen_type_transgran"}],
-                                    [{"text": "🏦 Альфа (с нуля)", "callback_data": "gen_type_alfa_scratch"}],
-                                    [{"text": "🅃 ТБанк (с нуля)", "callback_data": "gen_type_tbank"}],
-                                    [{"text": "🏦 Альфа-Банк (новое)", "callback_data": "new_gen_alfa_menu"}],
-                                    [{"text": "🔵 Газпромбанк (новое)", "callback_data": "new_gen_gpb_menu"}],
-                                    [{"text": "⬅️ Назад", "callback_data": "main_check"}],
+                                    [{"text": "📱 ВТБ СБП", "callback_data": "gen_subtype_sbp"}],
+                                    [{"text": "💳 ВТБ на ВТБ", "callback_data": "gen_subtype_vtb_vtb"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
                                 ],
                             }),
                         })
@@ -4618,7 +4628,7 @@ def run_bot(token: str) -> None:
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": "🅃 ТБанк — генерация с нуля\n\nВыберите тип чека:",
+                            "text": "🅃 Т-Банк — выберите тип:",
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [{"text": "📱 СБП", "callback_data": "gen_tbank_sbp"}],
@@ -4654,46 +4664,6 @@ def run_bot(token: str) -> None:
                                 _tbank_send_scratch_field(token, q["message"]["chat"]["id"], state)
                         continue
 
-                    if q["data"] == "gen_type_sbp":
-                        USER_STATE[uid] = {"awaiting": "gen_subtype", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": None}
-                        tg_request(token, "editMessageText", {
-                            "chat_id": q["message"]["chat"]["id"],
-                            "message_id": q["message"]["message_id"],
-                            "text": "✨ Перевод по СБП\n\nВыберите тип чека:",
-                            "reply_markup": json.dumps({
-                                "inline_keyboard": [
-                                    [
-                                        {"text": "🏛 ВТБ СБП", "callback_data": "gen_subtype_sbp"},
-                                        {"text": "🏦 Альфа СБП", "callback_data": "gen_subtype_alfa_sbp"},
-                                    ],
-                                    [{"text": "🏛 ВТБ на ВТБ", "callback_data": "gen_subtype_vtb_vtb"}],
-                                    [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
-                                ],
-                            }),
-                        })
-                        continue
-                    if q["data"] == "gen_subtype_alfa_sbp":
-                        # Проверяем базу Альфа
-                        alfa_base = _BOT_DIR / "база_чеков" / "alfa"
-                        alfa_files = list(alfa_base.glob("*.pdf")) if alfa_base.exists() else []
-                        if not alfa_files:
-                            tg_request(token, "editMessageText", {
-                                "chat_id": q["message"]["chat"]["id"],
-                                "message_id": q["message"]["message_id"],
-                                "text": "⚠️ База Альфа пуста.\n\nДобавьте донорские чеки Альфа-Банк через раздел «База».",
-                                "reply_markup": json.dumps({"inline_keyboard": [
-                                    [{"text": "📂 Открыть Базу", "callback_data": "main_db"}],
-                                    [{"text": "⬅️ Назад", "callback_data": "gen_type_sbp"}],
-                                ]}),
-                            })
-                        else:
-                            tg_request(token, "editMessageText", {
-                                "chat_id": q["message"]["chat"]["id"],
-                                "message_id": q["message"]["message_id"],
-                                "text": f"🏦 Альфа СБП\n\nВ базе {len(alfa_files)} чек(ов).\n⚠️ Функция генерации Альфа СБП в разработке.",
-                                "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "gen_type_sbp"}]]}),
-                            })
-                        continue
                     if q["data"] == "gen_subtype_sbp":
                         USER_STATE[uid] = {"awaiting": "gen_bank", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": "vtb_sbp"}
                         tg_request(token, "editMessageText", {
@@ -4707,7 +4677,7 @@ def run_bot(token: str) -> None:
                             "reply_markup": json.dumps({
                                 "inline_keyboard": [
                                     [{"text": "🏛 ВТБ", "callback_data": "gen_bank_vtb"}],
-                                    [{"text": "⬅️ Назад", "callback_data": "gen_type_sbp"}],
+                                    [{"text": "⬅️ Назад", "callback_data": "gen_bank_menu_vtb"}],
                                 ],
                             }),
                         })
@@ -4773,9 +4743,9 @@ def run_bot(token: str) -> None:
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": "🏦 Альфа-Банк — выберите тип чека:",
+                            "text": "🏦 Альфа-Банк — выберите тип:",
                             "reply_markup": json.dumps({"inline_keyboard": [
-                                [{"text": "📱 СБП", "callback_data": "new_gen_start_alfa_sbp"}],
+                                [{"text": "📱 СБП перевод", "callback_data": "new_gen_start_alfa_sbp"}],
                                 [{"text": "💳 Карта на карту", "callback_data": "new_gen_start_alfa_card"}],
                                 [{"text": "🌍 Трансгран (Таджикистан)", "callback_data": "new_gen_start_alfa_transgran"}],
                                 [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
@@ -4788,9 +4758,9 @@ def run_bot(token: str) -> None:
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
                             "message_id": q["message"]["message_id"],
-                            "text": "🔵 Газпромбанк — выберите тип чека:",
+                            "text": "🔵 Газпромбанк — выберите тип:",
                             "reply_markup": json.dumps({"inline_keyboard": [
-                                [{"text": "📱 СБП", "callback_data": "new_gen_start_gpb_sbp"}],
+                                [{"text": "📱 СБП перевод", "callback_data": "new_gen_start_gpb_sbp"}],
                                 [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
                             ]}),
                         })
