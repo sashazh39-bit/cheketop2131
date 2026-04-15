@@ -3644,17 +3644,14 @@ _CHECK_MODES = {
 }
 
 _CHECK_HELP = """\
-/check — генерация чека с нуля
+✨ Команда /check — генерация чека с нуля
 
-Поддерживаемые режимы (mode):
-  gpb_sbp       — Газпромбанк СБП ✅
-  alfa_sbp      — Альфа-Банк СБП ⚠️ OnlyPDF если нет SBP ID
-  alfa_card     — Альфа карта-на-карту ⚠️ OnlyPDF
-  alfa_transgran — Альфа Трансгран ⚠️ OnlyPDF
+Просто скопируйте нужный шаблон, замените данные и отправьте.
+auto = бот подставит значение сам (дату, время, номер).
 
-Значение auto — сгенерировать автоматически.
-
-Пример (Газпромбанк СБП):
+━━━━━━━━━━━━━━━━━━━━━
+🔵 ГАЗПРОМБАНК — перевод по СБП
+━━━━━━━━━━━━━━━━━━━━━
 /check
 mode: gpb_sbp
 amount: 15000
@@ -3666,7 +3663,12 @@ recipient_bank: Сбербанк
 operation_date: auto
 operation_time: auto
 
-Пример (Альфа СБП):
+  sender_card — последние 4 цифры карты отправителя
+  operation_date — дата чека (формат 25.04.2026) или auto
+
+━━━━━━━━━━━━━━━━━━━━━
+🏦 АЛЬФА-БАНК — перевод по СБП
+━━━━━━━━━━━━━━━━━━━━━
 /check
 mode: alfa_sbp
 amount: 3500
@@ -3679,7 +3681,13 @@ spb_number: auto
 operation_date: auto
 operation_time: auto
 
-Пример (Альфа карта):
+  spb_number — уникальный номер операции СБП.
+    auto = берётся из пула или генерируется.
+    ⚠️ Без реального SBP ID — нужен OnlyPDF.
+
+━━━━━━━━━━━━━━━━━━━━━
+🏦 АЛЬФА-БАНК — перевод карта на карту
+━━━━━━━━━━━━━━━━━━━━━
 /check
 mode: alfa_card
 amount: 5000
@@ -3688,7 +3696,12 @@ recipient_card: 1234
 operation_date: auto
 operation_time: auto
 
-Пример (Альфа Трансгран):
+  sender_card / recipient_card — последние 4 цифры карт
+  ⚠️ Требует обработку в OnlyPDF
+
+━━━━━━━━━━━━━━━━━━━━━
+🏦 АЛЬФА-БАНК — перевод в Таджикистан
+━━━━━━━━━━━━━━━━━━━━━
 /check
 mode: alfa_transgran
 amount: 3000
@@ -3697,7 +3710,11 @@ recipient_phone: +992938999964
 credited_currency: TJS
 amount_int: 354
 operation_date: auto
-operation_time: auto\
+operation_time: auto
+
+  credited_currency — валюта получателя (TJS, UZS и т.д.)
+  amount_int — сумма в валюте получателя
+  ⚠️ Требует обработку в OnlyPDF\
 """
 
 
