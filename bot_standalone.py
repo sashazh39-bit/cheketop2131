@@ -100,6 +100,13 @@ from receipt_db import (
 
 BASE = "https://api.telegram.org/bot"
 
+# --- SBP пул ---
+try:
+    from sbp_pool import SBPPool as _SBPPool
+    _sbp_pool = _SBPPool()
+except Exception:
+    _sbp_pool = None  # type: ignore
+
 VTB_UNSUPPORTED_NOTICE = (
     "⚠️ Нельзя использовать: ё, Ё, неразрывный дефис (‑). "
     "Замените на: е, Е, обычный дефис (-)."
@@ -3375,6 +3382,298 @@ def _run_alfa_sbp_full_patch(token: str, uid: int, chat_id: int, state: dict, tg
             del USER_STATE[uid]
 
 
+# ---------------------------------------------------------------------------
+# Новые генераторы: поля wizard и вспомогательные функции
+# ---------------------------------------------------------------------------
+
+_NEW_GEN_WIZARD_FIELDS: dict[str, list[tuple[str, str]]] = {
+    "alfa_sbp": [
+        ("amount",           "💰 Сумма перевода (число, например: 5000)"),
+        ("recipient_name",   "👤 Получатель (например: Виктория Игоревна С.)"),
+        ("recipient_phone",  "📱 Телефон получателя (например: +7(900)351-70-80)"),
+        ("recipient_bank",   "🏦 Банк получателя (например: ВТБ, Сбербанк, Т-Банк)"),
+        ("operation_date",   "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
+        ("operation_time",   "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
+    ],
+    "alfa_card": [
+        ("amount",           "💰 Сумма перевода (число, например: 5000)"),
+        ("sender_card",      "💳 Последние 4 цифры карты отправителя (например: 9999)"),
+        ("recipient_card",   "💳 Последние 4 цифры карты получателя (например: 1234)"),
+        ("operation_date",   "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
+        ("operation_time",   "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
+    ],
+    "alfa_transgran": [
+        ("amount",              "💰 Сумма в рублях (число, например: 5000)"),
+        ("recipient_name",      "👤 Получатель (например: Rahimov A.)"),
+        ("recipient_phone",     "📱 Телефон получателя (например: +992901234567)"),
+        ("credited_currency",   "💱 Валюта зачисления (TJS, UZS, AMD — или - для TJS)"),
+        ("amount_int",          "💰 Сумма зачисления (или - для авто расчёта)"),
+        ("operation_date",      "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
+        ("operation_time",      "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
+    ],
+    "gpb_sbp": [
+        ("amount",           "💰 Сумма перевода (число, например: 10000)"),
+        ("sender_name",      "👤 Отправитель ЗАГЛАВНЫМИ (например: ДАНИЛ АЛЕКСАНДРОВИЧ С.)"),
+        ("sender_card",      "💳 Последние 4 цифры карты отправителя"),
+        ("recipient_name",   "👤 Получатель (например: Байжигит Максатбекович М.)"),
+        ("recipient_phone",  "📱 Телефон получателя (например: +7(915)333-60-13)"),
+        ("recipient_bank",   "🏦 Банк получателя (например: ВТБ, Сбербанк)"),
+        ("operation_date",   "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
+        ("operation_time",   "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
+    ],
+}
+
+_NEW_GEN_MODE_LABELS = {
+    "alfa_sbp":       "Альфа СБП",
+    "alfa_card":      "Альфа карта-на-карту",
+    "alfa_transgran": "Альфа трансгран",
+    "gpb_sbp":        "Газпромбанк СБП",
+}
+
+
+def _extract_sbp_id_from_pdf(pdf_bytes: bytes) -> str | None:
+    """Извлечь SBP ID (32 alphanumeric символа) из текста PDF."""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        matches = re.findall(r"\b[A-Za-z0-9]{32}\b", text)
+        return matches[0] if matches else None
+    except Exception:
+        return None
+
+
+def _gen_gpb(fields: dict) -> tuple[bytes, str]:
+    from gen_gpb_receipt import generate_gpb_receipt
+    amount = int(re.sub(r"\D", "", fields.get("amount", "1000")) or "1000")
+    raw_card = fields.get("sender_card", "8527")
+    sender_card = re.sub(r"[^\d]", "", raw_card)[-4:] or "8527"
+    return generate_gpb_receipt(
+        amount=amount,
+        sender_name=fields.get("sender_name") or "ИВАН ИВАНОВИЧ И.",
+        sender_card=sender_card,
+        recipient_name=fields.get("recipient_name") or "Анна Ивановна И.",
+        recipient_phone=fields.get("recipient_phone") or "+7(900)000-00-00",
+        recipient_bank=fields.get("recipient_bank") or "Сбербанк",
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+        sbp_number=fields.get("sbp_number", "auto"),
+    )
+
+
+def _gen_alfa_sbp(fields: dict, sbp_id_override: str | None = None) -> tuple[bytes, str]:
+    from gen_sbp_receipt import generate_sbp_receipt
+    amount = int(re.sub(r"\D", "", fields.get("amount", "1000")) or "1000")
+    account = fields.get("account") or None
+    if account in ("auto", "авто", "-", ""):
+        account = None
+    result = generate_sbp_receipt(
+        amount=amount,
+        recipient=fields.get("recipient_name") or "Виктория Игоревна С",
+        phone=fields.get("recipient_phone") or "+7(900)000-00-00",
+        bank=fields.get("recipient_bank") or "Сбербанк",
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+        account=account,
+        message=fields.get("message") or "Перевод денежных средств",
+        sbp_id_override=sbp_id_override,
+    )
+    return result[0], result[1]
+
+
+def _gen_alfa_card(fields: dict) -> tuple[bytes, str]:
+    from gen_card_receipt import generate_card_receipt
+    amount = int(re.sub(r"\D", "", fields.get("amount", "1000")) or "1000")
+    sender_card = re.sub(r"[^\d]", "", fields.get("sender_card", "9999"))[-4:] or "9999"
+    recipient_card = re.sub(r"[^\d]", "", fields.get("recipient_card", "1234"))[-4:] or "1234"
+    return generate_card_receipt(
+        amount=amount,
+        sender_card=sender_card,
+        recipient_card=recipient_card,
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+    )
+
+
+def _gen_alfa_transgran(fields: dict) -> tuple[bytes, str]:
+    from gen_tajik_receipt import generate_tajik_receipt
+    amount = int(re.sub(r"\D", "", fields.get("amount", "1000")) or "1000")
+    commission = int(re.sub(r"\D", "", fields.get("commission", "0")) or "0")
+    credited_currency = (fields.get("credited_currency") or "TJS").strip().upper() or "TJS"
+    if credited_currency in ("-", "авто", "auto"):
+        credited_currency = "TJS"
+    amount_int_str = fields.get("amount_int", "")
+    if amount_int_str and amount_int_str not in ("-", "auto", "авто"):
+        amount_credited: int | None = int(re.sub(r"\D", "", amount_int_str) or "0") or None
+    else:
+        amount_credited = None
+    account = fields.get("account") or None
+    if account in ("auto", "авто", "-", ""):
+        account = None
+    pdf_bytes = generate_tajik_receipt(
+        amount=amount,
+        recipient_name=fields.get("recipient_name") or "Rahimov A.",
+        recipient_phone=fields.get("recipient_phone") or "+992900000000",
+        credited_currency=credited_currency,
+        amount_credited=amount_credited,
+        operation_date=fields.get("operation_date", "auto"),
+        operation_time=fields.get("operation_time", "auto"),
+        receipt_number=fields.get("receipt_number", "auto"),
+        commission=commission,
+        account=account,
+    )
+    fname = f"AM_{int(time.time() * 1000)}.pdf"
+    return pdf_bytes, fname
+
+
+def _new_gen_send_next_field(token: str, chat_id: int, state: dict) -> None:
+    """Отправить следующий вопрос wizard нового генератора."""
+    mode = state["new_gen_mode"]
+    step = state["new_gen_step"]
+    fields_list = _NEW_GEN_WIZARD_FIELDS[mode]
+    total = len(fields_list)
+    _, prompt = fields_list[step]
+    tg_request(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": f"Шаг {step + 1}/{total}: {prompt}\n\nОтправьте «-» чтобы оставить автоматически.",
+        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "❌ Отмена", "callback_data": "main_back"}]]}),
+    })
+
+
+def _run_new_gen(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
+    """Запустить генерацию после сбора всех полей."""
+    mode = state["new_gen_mode"]
+    fields = state["new_gen_values"]
+    label = _NEW_GEN_MODE_LABELS.get(mode, mode)
+
+    # Заменяем "-" на "auto" для дат/времени
+    for k in ("operation_date", "operation_time", "credited_currency", "amount_int"):
+        if fields.get(k) in ("-", "—", "авто"):
+            fields[k] = "auto"
+
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"⏳ Генерирую {label}..."})
+
+    try:
+        if mode == "gpb_sbp":
+            pdf_bytes, filename = _gen_gpb(fields)
+            del USER_STATE[uid]
+            caption = f"✅ Газпромбанк СБП | {fields.get('amount', '?')} руб."
+            tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (filename, pdf_bytes)})
+            _send_main_menu_button(token, chat_id, tg_req)
+            return
+
+        # Для Альфа: пробуем SBP pool
+        sbp_id_override = None
+        used_pool_id = False
+        if mode == "alfa_sbp" and _sbp_pool is not None:
+            entry = _sbp_pool.consume()
+            if entry:
+                sbp_id_override = entry["id"]
+                used_pool_id = True
+
+        if mode == "alfa_sbp":
+            pdf_bytes, filename = _gen_alfa_sbp(fields, sbp_id_override=sbp_id_override)
+        elif mode == "alfa_card":
+            pdf_bytes, filename = _gen_alfa_card(fields)
+        elif mode == "alfa_transgran":
+            pdf_bytes, filename = _gen_alfa_transgran(fields)
+        else:
+            tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неизвестный режим."})
+            return
+
+        # Если использован пул — отправляем сразу
+        if used_pool_id:
+            del USER_STATE[uid]
+            caption = f"✅ {label} | {fields.get('amount', '?')} руб."
+            tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": (filename, pdf_bytes)})
+            _send_main_menu_button(token, chat_id, tg_req)
+            return
+
+        # Иначе сохраняем PDF и предлагаем варианты
+        USER_STATE[uid] = {
+            "awaiting": "new_gen_pending",
+            "new_gen_mode": mode,
+            "new_gen_values": fields,
+            "new_gen_saved_fields": fields,
+            "new_gen_saved_mode": mode,
+            "new_gen_pdf_bytes": pdf_bytes,
+            "new_gen_pdf_filename": filename,
+        }
+        needs_onlypdf_msg = ""
+        if mode in ("alfa_card", "alfa_transgran"):
+            needs_onlypdf_msg = "\n\n⚠️ Этот тип чека требует OnlyPDF (alfa/2 без него)"
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                f"✅ Чек {label} готов!{needs_onlypdf_msg}\n\n"
+                "Выберите действие:\n"
+                "• Пришлите любой реальный СБП-чек → бот извлечёт SBP ID и пересоберёт PDF\n"
+                "• Или получите PDF как есть (для OnlyPDF)"
+            ),
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "📎 Прислать чек для SBP ID", "callback_data": "new_gen_sbp_extract"}],
+                [{"text": "📄 Получить как есть (OnlyPDF)", "callback_data": "new_gen_onlypdf"}],
+                [{"text": "❌ Отмена", "callback_data": "main_back"}],
+            ]}),
+        })
+
+    except FileNotFoundError as e:
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Не найдены донорские файлы: {e}"})
+        _send_main_menu_button(token, chat_id, tg_req)
+    except Exception as e:
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка генерации: {e}"})
+        _send_main_menu_button(token, chat_id, tg_req)
+
+
+def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
+    """Handle /check command: generate a Tajikistan transgran receipt from inline params.
+
+    Expected message format:
+        /check
+        amount: 3000
+        recipient_name: Bobomurodov Kh.
+        recipient_phone: +992938999964
+        credited_currency: TJS
+        amount_int: 354
+        operation_date: 25.09.2025
+        operation_time: 13:45:12
+        receipt_number: auto
+    """
+    def send(txt: str):
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": txt})
+
+    try:
+        from gen_tajik_receipt import generate_from_check_command
+    except ImportError as e:
+        send(f"❌ Модуль gen_tajik_receipt недоступен: {e}")
+        return
+
+    try:
+        pdf_bytes = generate_from_check_command(text)
+    except (ValueError, KeyError) as e:
+        send(f"❌ Ошибка параметров: {e}\n\nПример:\n/check\namount: 3000\nrecipient_name: Иванов И.И.\nrecipient_phone: +992901234567\ncredited_currency: TJS\namount_int: 354")
+        return
+    except RuntimeError as e:
+        send(f"❌ Ошибка генерации: {e}")
+        return
+    except Exception as e:
+        send(f"❌ Внутренняя ошибка: {e}")
+        return
+
+    fname = f"AM_{abs(hash(pdf_bytes)) % 10**16}.pdf"
+    tg_req(token, "sendDocument", {
+        "chat_id": chat_id,
+        "caption": "✅ Квитанция сгенерирована",
+    }, files={"document": (fname, pdf_bytes)})
+
+
 def _handle_alfa_transgran_input(token: str, uid: int, chat_id: int, text: str, msg: dict, tg_req) -> None:
     """Обработка пошагового ввода для Альфа Трансгран."""
     state = USER_STATE[uid]
@@ -3643,6 +3942,54 @@ def run_bot(token: str) -> None:
 
                     _parts = text.split()
                     cmd0 = _parts[0].split("@", 1)[0] if _parts else ""
+
+                    # --- /check command: generate Tajikistan transgran receipt ---
+                    if cmd0 == "/check":
+                        _handle_check_command(token, chat_id, text, tg_request)
+                        continue
+
+                    # --- /add_sbp: добавить SBP ID в пул ---
+                    if cmd0 == "/add_sbp":
+                        if _sbp_pool is None:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ SBP пул недоступен."})
+                            continue
+                        body = text[len("/add_sbp"):].strip()
+                        if not body:
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": "Отправьте SBP ID (по одному на строку или через пробел):\n/add_sbp A61051018121260A0B10040011740901\n\nКаждый ID — ровно 32 символа.",
+                            })
+                            continue
+                        added, skipped = _sbp_pool.add_bulk(body)
+                        total, used, avail = _sbp_pool.status()
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": f"✅ Добавлено: {added} | Пропущено: {skipped}\n\n📊 Пул: всего {total} | использовано {used} | доступно {avail}",
+                        })
+                        continue
+
+                    # --- /pool: статус SBP пула ---
+                    if cmd0 == "/pool":
+                        if _sbp_pool is None:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ SBP пул недоступен."})
+                            continue
+                        total, used, avail = _sbp_pool.status()
+                        entries = _sbp_pool.list_available()
+                        lines = [
+                            f"📊 Пул SBP ID",
+                            f"Всего: {total} | Использовано: {used} | Доступно: {avail}",
+                        ]
+                        if entries:
+                            lines.append("\n🟢 Доступные (первые 10):")
+                            for e in entries[:10]:
+                                bank = e.get("bank", "")
+                                date = e.get("date", "")
+                                lines.append(f"  {e['id']}  {bank} {date}".strip())
+                        else:
+                            lines.append("\n⚠️ Пул пуст. Добавьте: /add_sbp AAAA...")
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "\n".join(lines)})
+                        continue
+
                     if cmd0 in ("/statistika", "/stats"):
                         tg_request(token, "sendMessage", {
                             "chat_id": chat_id,
@@ -3750,11 +4097,51 @@ def run_bot(token: str) -> None:
                                     pass
                                 tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Не удалось добавить (возможно пустой PDF или ошибка)"})
                             continue
+                        # Новый генератор: пользователь прислал реальный чек для извлечения SBP ID
+                        if USER_STATE.get(uid, {}).get("awaiting") == "new_gen_sbp_receipt":
+                            tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Извлекаю SBP ID из чека..."})
+                            try:
+                                fp = tg_get_file_path(token, doc["file_id"])
+                                pdf_data = tg_get_file(token, fp)
+                            except Exception as e:
+                                tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"❌ Ошибка загрузки: {e}"})
+                                continue
+                            sbp_id = _extract_sbp_id_from_pdf(pdf_data)
+                            if not sbp_id:
+                                tg_request(token, "sendMessage", {
+                                    "chat_id": msg["chat"]["id"],
+                                    "text": "❌ SBP ID не найден в этом PDF.\n\nПопробуйте другой чек (СБП-перевод любого банка) или нажмите «Получить как есть».",
+                                    "reply_markup": json.dumps({"inline_keyboard": [
+                                        [{"text": "📄 Получить как есть (OnlyPDF)", "callback_data": "new_gen_onlypdf"}],
+                                        [{"text": "❌ Отмена", "callback_data": "main_back"}],
+                                    ]}),
+                                })
+                                continue
+                            tg_request(token, "sendMessage", {
+                                "chat_id": msg["chat"]["id"],
+                                "text": f"✅ SBP ID найден: `{sbp_id}`\n⏳ Пересобираю чек...",
+                                "parse_mode": "Markdown",
+                            })
+                            state = USER_STATE[uid]
+                            saved_fields = state.get("new_gen_saved_fields") or state.get("new_gen_values", {})
+                            saved_mode = state.get("new_gen_saved_mode") or state.get("new_gen_mode", "alfa_sbp")
+                            label = _NEW_GEN_MODE_LABELS.get(saved_mode, saved_mode)
+                            try:
+                                pdf_bytes, filename = _gen_alfa_sbp(saved_fields, sbp_id_override=sbp_id)
+                                del USER_STATE[uid]
+                                caption = f"✅ {label} | {saved_fields.get('amount', '?')} руб. | SBP ID вставлен"
+                                tg_request(token, "sendDocument", {"chat_id": msg["chat"]["id"], "caption": caption}, files={"document": (filename, pdf_bytes)})
+                            except Exception as e:
+                                tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"❌ Ошибка пересборки: {e}"})
+                            _send_main_menu_button(token, chat_id, tg_request)
+                            continue
+
                         _aw_pdf = (USER_STATE.get(uid, {}).get("awaiting") or "")
                         if (
                             "gen_bank_type" in USER_STATE.get(uid, {})
                             or "gen_transfer_type" in USER_STATE.get(uid, {})
                             or _aw_pdf.startswith("ak_")
+                            or _aw_pdf == "new_gen_field"
                         ):
                             tg_request(token, "sendMessage", {
                                 "chat_id": msg["chat"]["id"],
@@ -3952,6 +4339,23 @@ def run_bot(token: str) -> None:
                             _run_tbank_scratch_gen(token, uid, chat_id, state, tg_request)
                         else:
                             _tbank_send_scratch_field(token, chat_id, state)
+                        continue
+
+                    # Новые генераторы: пошаговый wizard
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "new_gen_field":
+                        state = USER_STATE[uid]
+                        mode = state["new_gen_mode"]
+                        step = state["new_gen_step"]
+                        fields_list = _NEW_GEN_WIZARD_FIELDS.get(mode, [])
+                        if step < len(fields_list):
+                            key, _ = fields_list[step]
+                            value = "auto" if text.strip() in ("-", "—") else text.strip()
+                            state["new_gen_values"][key] = value
+                            state["new_gen_step"] += 1
+                            if state["new_gen_step"] >= len(fields_list):
+                                _run_new_gen(token, uid, chat_id, state, tg_request)
+                            else:
+                                _new_gen_send_next_field(token, chat_id, state)
                         continue
 
                     # Альфа генерация с нуля: пошаговый ввод
@@ -4153,7 +4557,6 @@ def run_bot(token: str) -> None:
                             "message_id": q["message"]["message_id"],
                             "text": (
                                 "✨ Сгенерировать чек\n\n"
-                                "Бот найдёт один чек из базы с нужными буквами.\n\n"
                                 "Выберите тип перевода:"
                             ),
                             "reply_markup": json.dumps({
@@ -4163,6 +4566,8 @@ def run_bot(token: str) -> None:
                                     [{"text": "🌐 Трансгран (скоро)", "callback_data": "gen_type_transgran"}],
                                     [{"text": "🏦 Альфа (с нуля)", "callback_data": "gen_type_alfa_scratch"}],
                                     [{"text": "🅃 ТБанк (с нуля)", "callback_data": "gen_type_tbank"}],
+                                    [{"text": "🏦 Альфа-Банк (новое)", "callback_data": "new_gen_alfa_menu"}],
+                                    [{"text": "🔵 Газпромбанк (новое)", "callback_data": "new_gen_gpb_menu"}],
                                     [{"text": "⬅️ Назад", "callback_data": "main_check"}],
                                 ],
                             }),
@@ -4361,6 +4766,88 @@ def run_bot(token: str) -> None:
                             "reply_markup": json.dumps({"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "main_back"}]]}),
                         })
                         continue
+
+                    # --- Новые генераторы: Альфа-Банк и Газпромбанк ---
+                    if q["data"] == "new_gen_alfa_menu":
+                        USER_STATE[uid] = {}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "🏦 Альфа-Банк — выберите тип чека:",
+                            "reply_markup": json.dumps({"inline_keyboard": [
+                                [{"text": "📱 СБП", "callback_data": "new_gen_start_alfa_sbp"}],
+                                [{"text": "💳 Карта на карту", "callback_data": "new_gen_start_alfa_card"}],
+                                [{"text": "🌍 Трансгран (Таджикистан)", "callback_data": "new_gen_start_alfa_transgran"}],
+                                [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
+                            ]}),
+                        })
+                        continue
+
+                    if q["data"] == "new_gen_gpb_menu":
+                        USER_STATE[uid] = {}
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "🔵 Газпромбанк — выберите тип чека:",
+                            "reply_markup": json.dumps({"inline_keyboard": [
+                                [{"text": "📱 СБП", "callback_data": "new_gen_start_gpb_sbp"}],
+                                [{"text": "⬅️ Назад", "callback_data": "main_generate"}],
+                            ]}),
+                        })
+                        continue
+
+                    if q["data"] in ("new_gen_start_alfa_sbp", "new_gen_start_alfa_card",
+                                     "new_gen_start_alfa_transgran", "new_gen_start_gpb_sbp"):
+                        mode = q["data"].replace("new_gen_start_", "")
+                        label = _NEW_GEN_MODE_LABELS.get(mode, mode)
+                        USER_STATE[uid] = {
+                            "awaiting": "new_gen_field",
+                            "new_gen_mode": mode,
+                            "new_gen_step": 0,
+                            "new_gen_values": {},
+                        }
+                        # Отвечаем новым сообщением (не редактируем — следующий шаг через send)
+                        tg_request(token, "sendMessage", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "text": f"✨ Генерация: {label}\n\nВведите данные по шагам. «-» = авто.",
+                        })
+                        _new_gen_send_next_field(token, q["message"]["chat"]["id"], USER_STATE[uid])
+                        continue
+
+                    if q["data"] == "new_gen_onlypdf":
+                        state = USER_STATE.get(uid, {})
+                        pdf_bytes = state.get("new_gen_pdf_bytes")
+                        filename = state.get("new_gen_pdf_filename", "receipt.pdf")
+                        amount = (state.get("new_gen_values") or state.get("new_gen_saved_fields", {})).get("amount", "?")
+                        mode = state.get("new_gen_mode", "")
+                        label = _NEW_GEN_MODE_LABELS.get(mode, mode)
+                        if uid in USER_STATE:
+                            del USER_STATE[uid]
+                        if pdf_bytes:
+                            caption = f"✅ {label} | {amount} руб.\n\n⚠️ Перед использованием обернуть в OnlyPDF"
+                            tg_request(token, "sendDocument", {"chat_id": q["message"]["chat"]["id"], "caption": caption}, files={"document": (filename, pdf_bytes)})
+                        else:
+                            tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": "❌ PDF не найден, попробуйте снова."})
+                        _send_main_menu_button(token, q["message"]["chat"]["id"], tg_request)
+                        continue
+
+                    if q["data"] == "new_gen_sbp_extract":
+                        state = USER_STATE.get(uid, {})
+                        if not state.get("new_gen_pdf_bytes"):
+                            tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": "❌ Сессия истекла. Начните заново."})
+                            continue
+                        state["awaiting"] = "new_gen_sbp_receipt"
+                        tg_request(token, "sendMessage", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "text": (
+                                "📎 Пришлите любой реальный СБП-чек (любого банка).\n\n"
+                                "Бот извлечёт из него SBP ID и пересоберёт ваш чек с этим ID.\n"
+                                "Чек не должен быть ранее проверен в системе."
+                            ),
+                        })
+                        continue
+                    # --- конец новых генераторов ---
+
                     if q["data"] == "ak_keep_commission":
                         if uid not in USER_STATE or USER_STATE[uid].get("awaiting") != "ak_commission":
                             tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Не тот шаг"})

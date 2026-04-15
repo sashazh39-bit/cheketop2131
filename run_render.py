@@ -100,7 +100,7 @@ def main() -> None:
 
     # Импортируем бот — если упадёт здесь, Render увидит exit(1) и перезапустит
     try:
-        from bot import main as bot_main
+        from bot_standalone import main as bot_main
     except Exception as exc:
         print(f"[render] Ошибка импорта bot.py: {exc}", flush=True)
         _set(last_error=str(exc))
