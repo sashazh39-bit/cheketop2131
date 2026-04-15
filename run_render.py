@@ -37,6 +37,13 @@ def _get_state() -> dict:
         return dict(STATE)
 
 
+def _heartbeat_loop() -> None:
+    """Периодически обновляет heartbeat пока поток бота жив."""
+    while True:
+        time.sleep(30)
+        _set_state(last_bot_heartbeat=time.time())
+
+
 def run_bot():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -44,34 +51,26 @@ def run_bot():
         _set_state(last_bot_error="TELEGRAM_BOT_TOKEN не задан", bot_alive=False)
         return
     try:
-        from receipt_db import build_and_save
-        try:
-            build_and_save()
-            print("receipt_index: build OK", flush=True)
-        except Exception as e:
-            print(f"receipt_index build: {e}", flush=True)
-        from bot_standalone import run_bot as _run_bot
+        from bot import main as _bot_main
     except Exception as e:
-        print(f"Bot init error: {e}", flush=True)
-        _set_state(last_bot_error=f"Bot init error: {e}", bot_alive=False)
+        print(f"Bot import error: {e}", flush=True)
+        _set_state(last_bot_error=f"Bot import error: {e}", bot_alive=False)
         return
 
     _set_state(last_bot_heartbeat=time.time(), bot_alive=True)
-    while True:
-        try:
-            _set_state(last_bot_heartbeat=time.time(), bot_alive=True)
-            _run_bot(token)
-            # Если основной цикл внезапно вернулся — считаем это аварией.
-            raise RuntimeError("bot_standalone.run_bot вернулся без исключения")
-        except Exception as e:
-            _set_state(
-                last_bot_error=str(e)[:500],
-                restart_count=_get_state()["restart_count"] + 1,
-                last_bot_heartbeat=time.time(),
-                bot_alive=True,
-            )
-            print(f"Bot crashed: {e}. Перезапуск через 5 сек...", flush=True)
-            time.sleep(5)
+
+    hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat-thread")
+    hb_thread.start()
+
+    try:
+        _bot_main()
+    except Exception as e:
+        _set_state(
+            last_bot_error=str(e)[:500],
+            restart_count=_get_state()["restart_count"] + 1,
+            bot_alive=False,
+        )
+        print(f"Bot exited with error: {e}", flush=True)
 
 
 def watchdog_loop(bot_thread: threading.Thread) -> None:
