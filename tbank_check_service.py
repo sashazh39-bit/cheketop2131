@@ -54,10 +54,11 @@ RECEIPT_TYPES = ("sbp", "card", "transgran")
 
 SBP_FIELDS = [
     {"key": "datetime",     "label": "Дата и время",         "y": 432.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left"},
-    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 412.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right"},
+    # tol_x: в части чеков (например receipt_13.11.2025) жирная сумма левее эталона (~196 vs 217).
+    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 412.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right", "tol_x": 28},
     {"key": "type_label",   "label": "Тип перевода",         "y": 376.78, "x": 172.28, "font": "F1", "size": 9,  "align": "right"},
     {"key": "status",       "label": "Статус",               "y": 356.78, "x": 216.57, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "amount_small", "label": "Сумма",                "y": 336.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right"},
+    {"key": "amount_small", "label": "Сумма",                "y": 336.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right", "tol_x": 14},
     {"key": "commission",   "label": "Комиссия",             "y": 315.78, "x": 198.1,  "font": "F1", "size": 9,  "align": "right"},
     {"key": "sender",       "label": "Отправитель",          "y": 295.78, "x": 188.54, "font": "F1", "size": 9,  "align": "right"},
     {"key": "phone",        "label": "Телефон получателя",   "y": 275.78, "x": 178.72, "font": "F1", "size": 9,  "align": "right"},
@@ -69,18 +70,18 @@ SBP_FIELDS = [
 
 CARD_FIELDS = [
     {"key": "datetime",     "label": "Дата и время",         "y": 324.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left"},
-    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 304.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right"},
+    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 304.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right", "tol_x": 28},
     {"key": "status",       "label": "Статус",               "y": 248.78, "x": 216.57, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "amount_small", "label": "Сумма",                "y": 228.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right"},
+    {"key": "amount_small", "label": "Сумма",                "y": 228.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right", "tol_x": 14},
     {"key": "sender",       "label": "Отправитель",          "y": 207.78, "x": 188.54, "font": "F1", "size": 9,  "align": "right"},
     {"key": "card_to",      "label": "Карта получателя",     "y": 187.78, "x": 180.88, "font": "F1", "size": 9,  "align": "right"},
 ]
 
 TRANSGRAN_FIELDS = [
     {"key": "datetime",     "label": "Дата и время",         "y": 404.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left"},
-    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 384.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right"},
+    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 384.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right", "tol_x": 28},
     {"key": "status",       "label": "Статус",               "y": 328.78, "x": 204.07, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "amount_small", "label": "Сумма",                "y": 308.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right"},
+    {"key": "amount_small", "label": "Сумма",                "y": 308.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right", "tol_x": 14},
     {"key": "commission",   "label": "Комиссия",             "y": 287.78, "x": 198.1,  "font": "F1", "size": 9,  "align": "right"},
     {"key": "sender",       "label": "Отправитель",          "y": 267.78, "x": 188.54, "font": "F1", "size": 9,  "align": "right"},
     {"key": "phone",        "label": "Телефон получателя",   "y": 247.78, "x": 175.9,  "font": "F1", "size": 9,  "align": "right"},
@@ -218,10 +219,16 @@ def _replace_field_bytes(
     if widths is None:
         widths = REGULAR_WIDTHS if font == "regular" else MEDIUM_WIDTHS
 
-    found = find_tj_at_coords(stream, target_y, target_x, tol_y, tol_x)
+    found = find_tj_at_coords(
+        stream, target_y, target_x, tol_y=tol_y, tol_x=tol_x
+    )
     if found is None:
         return stream
     old_raw, tj_start, tj_end = found
+
+    chunk = stream[:tj_start]
+    tm_matches = list(re.finditer(TM_REGEX, chunk))
+    anchor_x = float(tm_matches[-1].group(1)) if tm_matches else target_x
 
     new_raw = encode_text(new_text, font)
     new_escaped = escape_pdf_literal(new_raw)
@@ -230,11 +237,9 @@ def _replace_field_bytes(
     if right_aligned:
         old_width = cid_width_pt(old_raw, font_size, widths)
         new_width = cid_width_pt(new_raw, font_size, widths)
-        wall = target_x + old_width
+        wall = anchor_x + old_width
         new_x = wall - new_width
 
-        chunk = stream[:tj_start]
-        tm_matches = list(re.finditer(TM_REGEX, chunk))
         if tm_matches:
             tm_m = tm_matches[-1]
             y_str = tm_m.group(2).decode()
@@ -372,6 +377,8 @@ def _replace_all_fields_in_stream(
             right_aligned=(field.get("align", "right") == "right"),
             widths=widths,
             font=font_type,
+            tol_y=field.get("tol_y", 1.5),
+            tol_x=field.get("tol_x", 8.0),
         )
     return stream
 
@@ -448,7 +455,13 @@ def extract_fields(
     fields = _get_field_labels(receipt_type)
     result = {}
     for field in fields:
-        found = find_tj_at_coords(stream, field["y"], field["x"])
+        found = find_tj_at_coords(
+            stream,
+            field["y"],
+            field["x"],
+            tol_y=field.get("tol_y", 1.5),
+            tol_x=field.get("tol_x", 8.0),
+        )
         if found:
             raw_cid, _, _ = found
             font_type = "medium" if field["font"] == "F2" else "regular"

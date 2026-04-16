@@ -1192,9 +1192,23 @@ def _run_tbank_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_
 
         os.unlink(tmp)
         stats_record_pdf(uid, "receipt", "tbank")
+
+        # Оставляем оригинал живым — предлагаем изменить снова или завершить
+        from tbank_check_service import _format_amount_str
+        amt_disp = _format_amount_str(new_amount)
+        state["awaiting"] = None
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"✅ Готово! Сумма изменена на {amt_disp} ₽.\n\nХочешь изменить ещё раз?",
+            "reply_markup": json.dumps({
+                "inline_keyboard": [
+                    [{"text": "🔄 Изменить сумму снова", "callback_data": "tbank_amount_again"}],
+                    [{"text": "✅ Готово, закрыть", "callback_data": "tbank_done"}],
+                ],
+            }),
+        })
     except Exception as e:
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"❌ Ошибка: {e}"})
-    finally:
         if uid in USER_STATE:
             if "file_path" in USER_STATE[uid]:
                 try:
@@ -5303,6 +5317,49 @@ def run_bot(token: str) -> None:
                                 _run_tbank_full_patch(token, uid, q["message"]["chat"]["id"], state, tg_request)
                             else:
                                 _tbank_send_next_field(token, q["message"]["chat"]["id"], state)
+                        continue
+
+                    if q["data"] == "tbank_amount_again":
+                        cid = q["message"]["chat"]["id"]
+                        if uid not in USER_STATE or "file_path" not in USER_STATE.get(uid, {}):
+                            tg_request(token, "sendMessage", {"chat_id": cid, "text": "❌ Чек не найден. Отправьте PDF заново."})
+                            continue
+                        state = USER_STATE[uid]
+                        inp = state["file_path"]
+                        try:
+                            rtype = state.get("tbank_type") or tbank_detect_type(inp)
+                            state["tbank_type"] = rtype
+                            state["awaiting"] = "tbank_new_amount"
+                            hint = _tbank_f2_digit_hint(inp)
+                            last_amt = state.get("tbank_new_amount")
+                            last_disp = f" (прошлый раз: {int(last_amt):,} ₽)".replace(",", " ") if last_amt else ""
+                            tg_request(token, "sendMessage", {
+                                "chat_id": cid,
+                                "text": (
+                                    f"🅃 ТБанк — смена суммы\n"
+                                    f"Тип чека: {rtype.upper()}{last_disp}\n\n"
+                                    f"{hint}"
+                                    "Введите новую сумму (число):"
+                                ),
+                            })
+                        except Exception as e:
+                            tg_request(token, "sendMessage", {"chat_id": cid, "text": f"❌ Ошибка: {e}"})
+                        continue
+
+                    if q["data"] == "tbank_done":
+                        cid = q["message"]["chat"]["id"]
+                        if uid in USER_STATE:
+                            fp = USER_STATE[uid].get("file_path")
+                            if fp:
+                                try:
+                                    os.unlink(fp)
+                                except OSError:
+                                    pass
+                            del USER_STATE[uid]
+                        tg_request(token, "sendMessage", {
+                            "chat_id": cid,
+                            "text": "✅ Готово. Для нового чека — отправьте PDF.",
+                        })
                         continue
 
                     if q["data"] == "bank_auto_free":
