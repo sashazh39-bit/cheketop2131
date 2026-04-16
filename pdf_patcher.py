@@ -107,7 +107,8 @@ def update_id(data: bytearray) -> bool:
     id_m = re.search(rb'/ID\s*\[\s*(<[0-9a-fA-F]+>\s*<[0-9a-fA-F]+>)\s*\]', bytes(data))
     if id_m:
         old_id = id_m.group(1)
-        h = hashlib.md5(bytes(data)).hexdigest().upper()
+        # Oracle BI Publisher always emits lowercase hex in /ID — never uppercase
+        h = hashlib.md5(bytes(data)).hexdigest().lower()
         new_id = f"<{h}> <{h}>".encode()
         data[id_m.start(1) : id_m.end(1)] = new_id[: len(old_id)].ljust(len(old_id))
         return True

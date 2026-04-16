@@ -17,14 +17,25 @@ venv/
 .temp_*
 receipt_test_*.pdf
 
-# PDF тестовые / рабочие файлы
+# Bundled fonts (needed on Render.com where no Office is installed)
+!fonts/*.ttf
+
+# PDF тестовые / рабочие файлы (исключаем донорские директории)
 *.pdf
+!СБП/*.pdf
+!GPB/*.pdf
+!карта_на_карту/*.pdf
+!таджикистан/*.pdf
+!TBANK/*.pdf
 tmp_*/
 tmp_alfa_scratch/
 vtb-generator/
 
 # Логи
 *.log
+
+# Журнал использования бота (локально; не в git — отчёт: python3 usage_report.py 2)
+bot_usage.jsonl
 
 # Изображения тестовые
 img_*.png

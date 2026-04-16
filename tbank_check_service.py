@@ -42,10 +42,37 @@ from tbank_cmap import (
 
 BASE_DIR = Path(__file__).parent
 
+_TBANK_DIR = BASE_DIR / "TBANK"
+
+def _find_tbank_donor(receipt_type: str) -> Path:
+    """Find a donor PDF for the given receipt type from the TBANK/ folder.
+
+    Falls back to ~/Downloads/ paths for backward compatibility.
+    """
+    candidates = sorted(_TBANK_DIR.glob("*.pdf")) if _TBANK_DIR.exists() else []
+    if candidates:
+        return candidates[0]
+    fallback = {
+        "sbp": Path.home() / "Downloads" / "receipt_23.03.2026 (2).pdf",
+        "card": Path.home() / "Downloads" / "receipt_23.03.2026 (1).pdf",
+        "transgran": Path.home() / "Downloads" / "receipt_23.03.2026 (3).pdf",
+    }
+    return fallback.get(receipt_type, fallback["sbp"])
+
+def _pick_template(receipt_type: str) -> Path:
+    """Pick the best template for a receipt type, preferring enriched donors."""
+    enriched = sorted(_TBANK_DIR.glob("*_enriched.pdf")) if _TBANK_DIR.exists() else []
+    if enriched:
+        import random as _random
+        return _random.choice(enriched)
+    fallback = _TBANK_DIR / "receipt_sbp_1.pdf"
+    return fallback
+
+
 TEMPLATES = {
-    "sbp": Path.home() / "Downloads" / "receipt_23.03.2026 (2).pdf",
-    "card": Path.home() / "Downloads" / "receipt_23.03.2026 (1).pdf",
-    "transgran": Path.home() / "Downloads" / "receipt_23.03.2026 (3).pdf",
+    "sbp": _TBANK_DIR / "receipt_sbp_1.pdf",
+    "card": _TBANK_DIR / "receipt_sbp_1.pdf",
+    "transgran": _TBANK_DIR / "receipt_sbp_1.pdf",
 }
 
 # ── Receipt subtypes and their field layouts ──────────────────────────
@@ -53,19 +80,19 @@ TEMPLATES = {
 RECEIPT_TYPES = ("sbp", "card", "transgran")
 
 SBP_FIELDS = [
-    {"key": "datetime",     "label": "Дата и время",         "y": 432.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left"},
-    # tol_x: в части чеков (например receipt_13.11.2025) жирная сумма левее эталона (~196 vs 217).
+    {"key": "datetime",     "label": "Дата и время",         "y": 432.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left",  "tol_x": 8.0},
+    # tol_x=28: в части чеков (например receipt_13.11.2025) жирная сумма левее эталона (~196 vs 217).
     {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 412.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right", "tol_x": 28},
-    {"key": "type_label",   "label": "Тип перевода",         "y": 376.78, "x": 172.28, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "status",       "label": "Статус",               "y": 356.78, "x": 216.57, "font": "F1", "size": 9,  "align": "right"},
+    {"key": "type_label",   "label": "Тип перевода",         "y": 376.78, "x": 172.28, "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "status",       "label": "Статус",               "y": 356.78, "x": 216.57, "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
     {"key": "amount_small", "label": "Сумма",                "y": 336.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right", "tol_x": 14},
-    {"key": "commission",   "label": "Комиссия",             "y": 315.78, "x": 198.1,  "font": "F1", "size": 9,  "align": "right"},
-    {"key": "sender",       "label": "Отправитель",          "y": 295.78, "x": 188.54, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "phone",        "label": "Телефон получателя",   "y": 275.78, "x": 178.72, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "receiver",     "label": "Получатель",           "y": 255.78, "x": 216.55, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "bank",         "label": "Банк получателя",      "y": 235.78, "x": 204.83, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "account",      "label": "Счет списания",        "y": 215.78, "x": 160.8,  "font": "F1", "size": 9,  "align": "right"},
-    {"key": "ident",        "label": "Идентификатор",        "y": 195.78, "x": 123.46, "font": "F1", "size": 9,  "align": "right"},
+    {"key": "commission",   "label": "Комиссия",             "y": 315.78, "x": 198.1,  "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "sender",       "label": "Отправитель",          "y": 295.78, "x": 170.02, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "phone",        "label": "Телефон получателя",   "y": 275.78, "x": 178.72, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "receiver",     "label": "Получатель",           "y": 255.78, "x": 216.55, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "bank",         "label": "Банк получателя",      "y": 235.78, "x": 204.83, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "account",      "label": "Счет списания",        "y": 215.78, "x": 160.95, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "ident",        "label": "Идентификатор",        "y": 195.78, "x": 123.46, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
 ]
 
 CARD_FIELDS = [
@@ -128,6 +155,54 @@ def _find_page_stream(pdf_bytes: bytes) -> tuple[int, int, int, bytes]:
     raise ValueError("No BT content stream found in PDF")
 
 
+def _recompress_zero_delta(
+    pdf_bytes: bytes,
+    stream_start: int,
+    old_stream_len: int,
+    new_decompressed: bytes,
+) -> bytes:
+    """Recompress content stream keeping EXACTLY the same compressed size.
+
+    Tries multiple zlib levels/strategies and optional newline padding to
+    match the original compressed size. This preserves /Length, xref, and
+    startxref — nothing shifts, so the PDF passes integrity checks.
+    """
+    target = old_stream_len
+
+    def _try_compress(data: bytes) -> bytes | None:
+        for level in (6, 7, 8, 9, 5, 4, 3, 2, 1):
+            c = zlib.compress(data, level)
+            if len(c) == target:
+                return c
+            for mem in (4, 5, 6, 7, 8, 9):
+                co = zlib.compressobj(level, zlib.DEFLATED, 15, mem, 0)
+                c2 = co.compress(data) + co.flush()
+                if len(c2) == target:
+                    return c2
+        return None
+
+    # First try without padding
+    exact = _try_compress(new_decompressed)
+    if exact:
+        data = bytearray(pdf_bytes)
+        data[stream_start : stream_start + old_stream_len] = exact
+        return bytes(data)
+
+    # Try with newline padding (up to 1200 newlines to handle heavily modified streams)
+    for pad in range(1, 1200):
+        candidate = new_decompressed + b"\n" * pad
+        exact = _try_compress(candidate)
+        if exact:
+            data = bytearray(pdf_bytes)
+            data[stream_start : stream_start + old_stream_len] = exact
+            return bytes(data)
+
+    # Fallback: delta-based patching
+    return _recompress_and_fix(
+        pdf_bytes, 0, stream_start, old_stream_len, new_decompressed
+    )
+
+
 def _recompress_and_fix(
     pdf_bytes: bytes,
     len_num_start: int,
@@ -137,8 +212,8 @@ def _recompress_and_fix(
 ) -> bytes:
     """Recompress content stream and fix /Length, xref, startxref.
 
-    Exact VTB approach: delta-based patching of xref entries
-    rather than rebuilding from scratch.
+    Delta-based patching of xref entries. Used as fallback when
+    zero-delta padding cannot match the original compressed size.
     """
     new_compressed = zlib.compress(new_decompressed, 6)
     delta = len(new_compressed) - old_stream_len
@@ -334,18 +409,100 @@ def _replace_tj_array_at_coords(
     return stream
 
 
+def get_renderable_chars(pdf_bytes: bytes, font: str = "regular") -> set[int] | None:
+    """Return set of Unicode code points that have actual glyph outlines in the PDF font.
+
+    font: "regular" (F1/TinkoffSans-Regular) or "medium" (F2/TinkoffSans-Medium).
+    Returns None if the font stream cannot be parsed (caller should skip the check).
+    """
+    try:
+        from fontTools.ttLib import TTFont as _TTFont
+        from io import BytesIO as _BytesIO
+        import zlib as _zlib
+        from tbank_cmap import REGULAR_UNI_TO_CID, MEDIUM_UNI_TO_CID
+
+        name_fragment = "Regular" if font == "regular" else "Medium"
+        uni_to_cid = REGULAR_UNI_TO_CID if font == "regular" else MEDIUM_UNI_TO_CID
+
+        # Find FontDescriptor with the matching name and get its FontFile2 stream
+        stream_bytes: bytes | None = None
+        for m in re.finditer(rb"(\d+)\s+0\s+obj", pdf_bytes):
+            chunk = pdf_bytes[m.start() : m.start() + 600]
+            if b"FontDescriptor" not in chunk or b"FontName" not in chunk:
+                continue
+            fn_m = re.search(rb"/FontName/([^\s/\]>]+)", chunk)
+            if not fn_m or name_fragment.encode() not in fn_m.group(1):
+                continue
+            ff2_m = re.search(rb"/FontFile2\s+(\d+)\s+0\s+R", chunk)
+            if not ff2_m:
+                continue
+            stream_obj = int(ff2_m.group(1))
+
+            pat = rb"(" + str(stream_obj).encode() + rb")\s+0\s+obj\s*<<"
+            for sm in re.finditer(pat, pdf_bytes):
+                if int(sm.group(1)) != stream_obj:
+                    continue
+                schunk = pdf_bytes[sm.end() : sm.end() + 500]
+                len_m = re.search(rb"/Length\s+(\d+)", schunk)
+                end_m = re.search(rb">>\s*stream\r?\n", schunk)
+                if not len_m or not end_m:
+                    continue
+                slen = int(len_m.group(1))
+                sstart = sm.end() + end_m.end()
+                raw = pdf_bytes[sstart : sstart + slen]
+                try:
+                    stream_bytes = _zlib.decompress(raw)
+                except _zlib.error:
+                    continue
+                break
+            if stream_bytes:
+                break
+
+        if stream_bytes is None:
+            return None
+
+        tt = _TTFont(_BytesIO(stream_bytes))
+        glyf_table = tt["glyf"]
+        order = tt.getGlyphOrder()
+
+        # Build set of GIDs that have non-empty glyph outlines
+        non_empty_gids: set[int] = set()
+        for gid, name in enumerate(order):
+            g = glyf_table[name]
+            if g.numberOfContours != 0:
+                non_empty_gids.add(gid)
+            elif hasattr(g, "components") and g.components:
+                non_empty_gids.add(gid)
+        tt.close()
+
+        # Map Unicode → CID (= GID for Identity mapping), filter to non-empty
+        renderable: set[int] = set()
+        for uni, cid in uni_to_cid.items():
+            if cid in non_empty_gids:
+                renderable.add(uni)
+        return renderable
+
+    except Exception:
+        return None
+
+
 def _replace_all_fields_in_stream(
     stream: bytes,
     fields: list[dict],
     changes: dict[str, str],
     f1_widths: dict[int, int] | None = None,
     f2_widths: dict[int, int] | None = None,
+    f1_renderable: set[int] | None = None,
+    f2_renderable: set[int] | None = None,
 ) -> bytes:
     """Apply field replacements to a decompressed content stream.
 
     For F2 fields: checks if the new text can be encoded in the F2 font
-    subset. If not, the field is SKIPPED (left unchanged). This is the
-    correct behavior when a character doesn't exist in the font subset.
+    subset. If not, the field is SKIPPED (left unchanged).
+
+    f1_renderable / f2_renderable: sets of Unicode code points with actual
+    glyph outlines in the embedded font. If provided, fields with characters
+    missing from the glyph set are skipped (prevents invisible text).
     """
     if f1_widths is None:
         f1_widths = REGULAR_WIDTHS
@@ -363,9 +520,20 @@ def _replace_all_fields_in_stream(
         is_f2 = field["font"] == "F2"
         font_type = "medium" if is_f2 else "regular"
         widths = f2_widths if is_f2 else f1_widths
+        renderable = f2_renderable if is_f2 else f1_renderable
 
         if is_f2:
-            if not can_encode_in_font(new_val, "medium", f2_widths):
+            # Use hardcoded MEDIUM_WIDTHS for the encodability check (extracted /W
+            # table from the PDF is often a small subset and gives false negatives).
+            if not can_encode_in_font(new_val, "medium", MEDIUM_WIDTHS):
+                continue
+
+        # Skip field if any character lacks a glyph outline in the embedded font
+        if renderable is not None:
+            missing_glyphs = [
+                ch for ch in new_val if ch != " " and ord(ch) not in renderable
+            ]
+            if missing_glyphs:
                 continue
 
         stream = _replace_field_bytes(
@@ -485,6 +653,9 @@ def patch_amount(
         pdf_bytes
     )
 
+    # Amount fields use digits only — check glyph availability for F2
+    f2_renderable = get_renderable_chars(pdf_bytes, "medium")
+
     amount_str = _format_amount_str(new_amount) + " "
     fields = _get_field_labels(receipt_type)
     changes = {}
@@ -493,11 +664,12 @@ def patch_amount(
             changes[field["key"]] = amount_str
 
     new_stream = _replace_all_fields_in_stream(
-        decompressed, fields, changes, f1_widths, f2_widths
+        decompressed, fields, changes, f1_widths, f2_widths,
+        f1_renderable=None, f2_renderable=f2_renderable,
     )
 
-    pdf_bytes = _recompress_and_fix(
-        pdf_bytes, len_num_start, stream_start, stream_len, new_stream
+    pdf_bytes = _recompress_zero_delta(
+        pdf_bytes, stream_start, stream_len, new_stream
     )
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
@@ -531,12 +703,17 @@ def patch_all_fields(
 
             raise ValueError(format_unsupported_error(bad))
 
+    # Check glyph availability to skip fields that would render as invisible text
+    f1_renderable = get_renderable_chars(pdf_bytes, "regular")
+    f2_renderable = get_renderable_chars(pdf_bytes, "medium")
+
     new_stream = _replace_all_fields_in_stream(
-        decompressed, fields, changes, f1_widths, f2_widths
+        decompressed, fields, changes, f1_widths, f2_widths,
+        f1_renderable=f1_renderable, f2_renderable=f2_renderable,
     )
 
-    pdf_bytes = _recompress_and_fix(
-        pdf_bytes, len_num_start, stream_start, stream_len, new_stream
+    pdf_bytes = _recompress_zero_delta(
+        pdf_bytes, stream_start, stream_len, new_stream
     )
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
