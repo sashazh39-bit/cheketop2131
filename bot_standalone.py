@@ -115,6 +115,51 @@ try:
 except Exception:
     _sbp_pool = None  # type: ignore
 
+# --- Alfa SBP operation number persistent counter ---
+_ALFA_OP_COUNTER_FILE = _PERSISTENT_DIR / "alfa_op_counter.json"
+
+
+def _next_alfa_op_id(operation_date: str, operation_time: str = "12:00:00") -> str:
+    """Return the next Alfa-Bank operation ID and persist the counter.
+
+    The sequence number increments by a random delta in [1213, 1293] after each
+    generation, resetting to a time-based estimate when the date changes.
+    """
+    import json as _json
+    from gen_sbp_receipt import _generate_operation_id  # type: ignore
+
+    try:
+        state = _json.loads(_ALFA_OP_COUNTER_FILE.read_text()) if _ALFA_OP_COUNTER_FILE.exists() else {}
+    except Exception:
+        state = {}
+
+    last_date = state.get("date", "")
+    last_seq = state.get("seq", 0)
+
+    today = operation_date if operation_date not in ("auto", "", None) else __import__("datetime").datetime.now().strftime("%d.%m.%Y")
+
+    if last_date != today or last_seq <= 0:
+        # Seed from time-based estimate
+        seeded = _generate_operation_id(today, operation_time)
+        # Extract the 7-digit numeric part (chars 9-15 of C16DDMMYY...)
+        try:
+            last_seq = int(seeded[9:])
+        except Exception:
+            last_seq = 500_000
+    else:
+        # Increment by random delta
+        delta = __import__("random").randint(1213, 1293)
+        last_seq = min(last_seq + delta, 2_199_999)
+
+    new_id = f"C16{today[0:2]}{today[3:5]}{today[6:8]}{last_seq:07d}"
+
+    try:
+        _ALFA_OP_COUNTER_FILE.write_text(_json.dumps({"date": today, "seq": last_seq}))
+    except Exception:
+        pass
+
+    return new_id
+
 VTB_UNSUPPORTED_NOTICE = (
     "⚠️ Нельзя использовать: ё, Ё, неразрывный дефис (‑). "
     "Замените на: е, Е, обычный дефис (-)."
@@ -1220,21 +1265,26 @@ def _run_tbank_amount_patch(token: str, uid: int, chat_id: int, state: dict, tg_
 
 
 def _tbank_f2_digit_hint(pdf_path: str) -> str:
-    """Подсказка: какие цифры реально есть в шрифте F2 (жирная сумма) в этом PDF."""
+    """Подсказка: какие цифры реально отрисуются в шрифте F2 (жирная сумма) в этом PDF."""
     p = Path(pdf_path)
     if not p.exists():
         return ""
     try:
-        _, f2_w = tbank_extract_pdf_font_widths(p.read_bytes())
-        avail = [str(d) for d in range(10) if (0x0131 + d) in f2_w]
+        from tbank_check_service import get_renderable_chars
+        from tbank_cmap import MEDIUM_UNI_TO_CID
+        pdf_bytes = p.read_bytes()
+        f2_renderable = get_renderable_chars(pdf_bytes, "medium")
+        if f2_renderable is None:
+            return ""
+        missing = [str(d) for d in range(10) if MEDIUM_UNI_TO_CID.get(0x30 + d) not in f2_renderable]
     except Exception:
         return ""
-    if not avail:
+    if not missing:
         return ""
     return (
-        "⚠️ В жирной сумме («Итого») в этом PDF встроены только цифры: "
-        + ", ".join(avail)
-        + ".\nОстальные цифры в крупной сумме могут не отобразиться.\n\n"
+        "⚠️ В жирной сумме («Итого») этого чека отсутствуют цифры: "
+        + ", ".join(missing)
+        + ".\nОни будут невидимы. Загрузи обогащённый чек или используй /check для генерации с нуля.\n\n"
     )
 
 
@@ -3400,6 +3450,7 @@ _NEW_GEN_WIZARD_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("recipient_name",   "👤 Получатель (например: Виктория Игоревна С.)"),
         ("recipient_phone",  "📱 Телефон получателя (например: +7(900)351-70-80)"),
         ("recipient_bank",   "🏦 Банк получателя (например: ВТБ, Сбербанк, Т-Банк)"),
+        ("account_last4",    "💳 Последние 4 цифры счёта списания (например: 2476, или - для авто)"),
         ("operation_date",   "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
         ("operation_time",   "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
     ],
@@ -3473,20 +3524,34 @@ def _gen_gpb(fields: dict) -> tuple[bytes, str]:
 
 
 def _gen_alfa_sbp(fields: dict, sbp_id_override: str | None = None) -> tuple[bytes, str]:
-    from gen_sbp_receipt import generate_sbp_receipt
+    from gen_sbp_receipt import generate_sbp_receipt, random_account_with_last4
+
     amount = int(re.sub(r"\D", "", fields.get("amount", "1000")) or "1000")
-    account = fields.get("account") or None
-    if account in ("auto", "авто", "-", ""):
-        account = None
+    op_date = fields.get("operation_date", "auto")
+    op_time = fields.get("operation_time", "auto")
+
+    # Determine full 20-digit account from account_last4 or explicit account field
+    account: str | None = None
+    raw_last4 = fields.get("account_last4") or fields.get("account") or ""
+    raw_last4 = str(raw_last4).strip()
+    if raw_last4 and raw_last4 not in ("auto", "авто", "-", ""):
+        digits = re.sub(r"\D", "", raw_last4)
+        if digits:
+            account = random_account_with_last4(digits[-4:])
+
+    # Auto-incrementing operation number (persisted in _PERSISTENT_DIR)
+    receipt_number = _next_alfa_op_id(op_date, op_time)
+
     result = generate_sbp_receipt(
         amount=amount,
         recipient=fields.get("recipient_name") or "Виктория Игоревна С",
         phone=fields.get("recipient_phone") or "+7(900)000-00-00",
         bank=fields.get("recipient_bank") or "Сбербанк",
-        operation_date=fields.get("operation_date", "auto"),
-        operation_time=fields.get("operation_time", "auto"),
+        operation_date=op_date,
+        operation_time=op_time,
         account=account,
         message=fields.get("message") or "Перевод денежных средств",
+        receipt_number=receipt_number,
         sbp_id_override=sbp_id_override,
     )
     return result[0], result[1]
@@ -3610,20 +3675,15 @@ def _run_new_gen(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
             "new_gen_pdf_bytes": pdf_bytes,
             "new_gen_pdf_filename": filename,
         }
-        needs_onlypdf_msg = ""
-        if mode in ("alfa_card", "alfa_transgran"):
-            needs_onlypdf_msg = "\n\n⚠️ Этот тип чека требует OnlyPDF (alfa/2 без него)"
         tg_req(token, "sendMessage", {
             "chat_id": chat_id,
             "text": (
-                f"✅ Чек {label} готов!{needs_onlypdf_msg}\n\n"
-                "Выберите действие:\n"
-                "• Пришлите любой реальный СБП-чек → бот извлечёт SBP ID и пересоберёт PDF\n"
-                "• Или получите PDF как есть (для OnlyPDF)"
+                f"✅ Чек {label} готов!\n\n"
+                "Выберите действие:"
             ),
             "reply_markup": json.dumps({"inline_keyboard": [
-                [{"text": "📎 Прислать чек для SBP ID", "callback_data": "new_gen_sbp_extract"}],
-                [{"text": "📄 Получить как есть (OnlyPDF)", "callback_data": "new_gen_onlypdf"}],
+                [{"text": "📎 Прислать чек для нового SBP ID", "callback_data": "new_gen_sbp_extract"}],
+                [{"text": "💾 Сохранить PDF", "callback_data": "new_gen_save_pdf"}],
                 [{"text": "❌ Отмена", "callback_data": "main_back"}],
             ]}),
         })
@@ -3693,7 +3753,6 @@ operation_time: auto
 
   spb_number — уникальный номер операции СБП.
     auto = берётся из пула или генерируется.
-    ⚠️ Без реального SBP ID — нужен OnlyPDF.
 
 ━━━━━━━━━━━━━━━━━━━━━
 🏦 АЛЬФА-БАНК — перевод карта на карту
@@ -3707,7 +3766,6 @@ operation_date: auto
 operation_time: auto
 
   sender_card / recipient_card — последние 4 цифры карт
-  ⚠️ Требует обработку в OnlyPDF
 
 ━━━━━━━━━━━━━━━━━━━━━
 🏦 АЛЬФА-БАНК — перевод в Таджикистан
@@ -3724,7 +3782,6 @@ operation_time: auto
 
   credited_currency — валюта получателя (TJS, UZS и т.д.)
   amount_int — сумма в валюте получателя
-  ⚠️ Требует обработку в OnlyPDF
 
 ━━━━━━━━━━━━━━━━━━━━━
 🅃 Т-БАНК — перевод по СБП
@@ -3796,8 +3853,6 @@ def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
     send(f"⏳ Генерирую чек ({label})...")
 
     try:
-        needs_onlypdf = False
-
         if mode in ("gpb_sbp", "gpb"):
             pdf_bytes, filename = _gen_gpb(fields)
 
@@ -3810,21 +3865,33 @@ def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
                 entry = _sbp_pool.consume()
                 sbp_override = entry["id"] if entry else None
             pdf_bytes, filename = _gen_alfa_sbp(fields, sbp_id_override=sbp_override)
-            needs_onlypdf = sbp_override is None
 
         elif mode in ("alfa_card", "card"):
             pdf_bytes, filename = _gen_alfa_card(fields)
-            needs_onlypdf = True
 
         elif mode in ("alfa_transgran", "transgran"):
             pdf_bytes, filename = _gen_alfa_transgran(fields)
-            needs_onlypdf = True
 
         elif mode in ("tbank_sbp", "tbank"):
-            from gen_tbank_receipt import generate_tbank_receipt
+            from gen_tbank_receipt import generate_tbank_receipt, get_missing_chars, _find_donor
+            # Ensure enriched donors exist; create them if needed
+            try:
+                from tbank_enrich_donor import enrich_all, TBANK_DIR as _TBANK_DIR
+                if not list(_TBANK_DIR.glob("*_enriched.pdf")):
+                    enrich_all(_TBANK_DIR)
+            except Exception:
+                pass
             amount_raw = fields.get("amount", "1000")
             amount_int = int(re.sub(r"\D", "", amount_raw) or "1000")
             raw_account = fields.get("sender_account", "408178100000****0000")
+            donor = _find_donor(prefer_enriched=True)
+            # Warn if some name characters can't render
+            text_fields = {
+                "sender_name": fields.get("sender_name") or "",
+                "recipient_name": fields.get("recipient_name") or "",
+                "recipient_bank": fields.get("recipient_bank") or "",
+            }
+            missing_ch = get_missing_chars(donor, text_fields)
             pdf_bytes, filename = generate_tbank_receipt(
                 amount=amount_int,
                 sender_name=fields.get("sender_name") or "Иван Иванович И.",
@@ -3836,7 +3903,14 @@ def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
                 operation_time=fields.get("operation_time", "auto"),
                 spb_number=fields.get("spb_number", "auto"),
                 receipt_number=fields.get("receipt_number", "auto"),
+                donor_path=donor,
             )
+            if missing_ch:
+                send(
+                    f"⚠️ В чеке отсутствуют глифы для символов: {' '.join(missing_ch)}\n"
+                    f"Эти буквы будут невидимы в PDF. "
+                    f"Используй имена из букв: А Б Д И К О П С Т У (заглавные)."
+                )
 
         else:
             send("❌ Режим не поддерживается.")
@@ -3847,8 +3921,6 @@ def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
         return
 
     caption = f"✅ {label} | {fields.get('amount', '?')} руб."
-    if needs_onlypdf:
-        caption += "\n\n⚠️ Перед использованием обернуть в OnlyPDF"
 
     tg_req(token, "sendDocument", {
         "chat_id": chat_id,
@@ -4345,9 +4417,9 @@ def run_bot(token: str) -> None:
                             if not sbp_id:
                                 tg_request(token, "sendMessage", {
                                     "chat_id": msg["chat"]["id"],
-                                    "text": "❌ SBP ID не найден в этом PDF.\n\nПопробуйте другой чек (СБП-перевод любого банка) или нажмите «Получить как есть».",
+                                    "text": "❌ SBP ID не найден в этом PDF.\n\nПопробуйте другой чек (СБП-перевод любого банка) или сохраните PDF как есть.",
                                     "reply_markup": json.dumps({"inline_keyboard": [
-                                        [{"text": "📄 Получить как есть (OnlyPDF)", "callback_data": "new_gen_onlypdf"}],
+                                        [{"text": "💾 Сохранить PDF", "callback_data": "new_gen_save_pdf"}],
                                         [{"text": "❌ Отмена", "callback_data": "main_back"}],
                                     ]}),
                                 })
@@ -5034,7 +5106,7 @@ def run_bot(token: str) -> None:
                         _new_gen_send_next_field(token, q["message"]["chat"]["id"], USER_STATE[uid])
                         continue
 
-                    if q["data"] == "new_gen_onlypdf":
+                    if q["data"] in ("new_gen_save_pdf", "new_gen_onlypdf"):
                         state = USER_STATE.get(uid, {})
                         pdf_bytes = state.get("new_gen_pdf_bytes")
                         filename = state.get("new_gen_pdf_filename", "receipt.pdf")
@@ -5044,7 +5116,7 @@ def run_bot(token: str) -> None:
                         if uid in USER_STATE:
                             del USER_STATE[uid]
                         if pdf_bytes:
-                            caption = f"✅ {label} | {amount} руб.\n\n⚠️ Перед использованием обернуть в OnlyPDF"
+                            caption = f"✅ {label} | {amount} руб."
                             tg_request(token, "sendDocument", {"chat_id": q["message"]["chat"]["id"], "caption": caption}, files={"document": (filename, pdf_bytes)})
                         else:
                             tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": "❌ PDF не найден, попробуйте снова."})

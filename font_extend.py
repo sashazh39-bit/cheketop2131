@@ -28,8 +28,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-# Default path to the full Tahoma TTF (Microsoft Word ships it on macOS)
+# Default path to the full Tahoma TTF.
+# Bundled copy (fonts/tahoma.ttf) is checked first so deployment servers
+# (Render.com, etc.) don't require Microsoft Office.
+_BUNDLED_TAHOMA = str(Path(__file__).parent / "fonts" / "tahoma.ttf")
+
 _TAHOMA_CANDIDATES = [
+    _BUNDLED_TAHOMA,
     "/Applications/Microsoft Word.app/Contents/Resources/DFonts/tahoma.ttf",
     "/Applications/Microsoft Excel.app/Contents/Resources/DFonts/tahoma.ttf",
     "/Applications/Microsoft PowerPoint.app/Contents/Resources/DFonts/tahoma.ttf",

@@ -1082,6 +1082,27 @@ def random_account() -> str:
     return "40817810980480002476"
 
 
+def random_account_with_last4(last4: str) -> str:
+    """Generate a valid Alfa-Bank 20-digit account ending in specific last 4 digits.
+
+    Account structure: 40817810 [key] 8048 [3 random digits] [last4]
+    Total: 8 + 1 + 4 + 3 + 4 = 20 digits.
+    """
+    from patch_account_last4 import _check_account
+    bik = "044525593"
+    last4 = last4.strip()[-4:].zfill(4)
+    branch = "8048"
+    prefix8 = "40817810"
+    for _ in range(50):
+        mid3 = "".join(str(random.randint(0, 9)) for _ in range(3))
+        for key in range(10):
+            candidate = prefix8 + str(key) + branch + mid3 + last4
+            if _check_account(bik, candidate):
+                return candidate
+    # Fallback: just use random_account() if checksum can't be satisfied
+    return random_account()
+
+
 def generate_random_sbp(output_path: str | Path | None = None) -> tuple[bytes, str]:
     """Generate a fully random but realistic SBP receipt.
 

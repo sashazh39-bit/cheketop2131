@@ -17,6 +17,9 @@ venv/
 .temp_*
 receipt_test_*.pdf
 
+# Bundled fonts (needed on Render.com where no Office is installed)
+!fonts/*.ttf
+
 # PDF тестовые / рабочие файлы (исключаем донорские директории)
 *.pdf
 !СБП/*.pdf

@@ -20,9 +20,13 @@ BASE_DIR = Path(__file__).parent
 TBANK_DIR = BASE_DIR / "TBANK"
 
 
-def _find_donor() -> Path:
-    """Pick a random SBP donor from TBANK/ folder."""
-    candidates = sorted(TBANK_DIR.glob("*.pdf"))
+def _find_donor(prefer_enriched: bool = True) -> Path:
+    """Pick an SBP donor from TBANK/ folder, preferring enriched variants."""
+    if prefer_enriched:
+        enriched = sorted(TBANK_DIR.glob("*_enriched.pdf"))
+        if enriched:
+            return random.choice(enriched)
+    candidates = [p for p in sorted(TBANK_DIR.glob("*.pdf")) if "_enriched" not in p.stem]
     if not candidates:
         raise FileNotFoundError(
             "Не найдены донорские PDF для Т-Банка. "
@@ -63,6 +67,24 @@ def _gen_sbp_operation_id() -> str:
     return "A" + "".join(random.choices(chars, k=26))
 
 
+def get_missing_chars(donor_path: Path, text_fields: dict[str, str]) -> list[str]:
+    """Return list of characters in text_fields that lack glyph outlines in the donor's F1 font.
+
+    Used to warn the user which characters will render as invisible.
+    """
+    from tbank_check_service import get_renderable_chars
+    pdf_bytes = donor_path.read_bytes()
+    f1_renderable = get_renderable_chars(pdf_bytes, "regular")
+    if f1_renderable is None:
+        return []
+    missing: set[str] = set()
+    for val in text_fields.values():
+        for ch in val:
+            if ch != " " and ord(ch) not in f1_renderable:
+                missing.add(ch)
+    return sorted(missing)
+
+
 def generate_tbank_receipt(
     amount: int,
     sender_name: str,
@@ -89,7 +111,7 @@ def generate_tbank_receipt(
     )
 
     if donor_path is None:
-        donor_path = _find_donor()
+        donor_path = _find_donor(prefer_enriched=True)
 
     operation_date, operation_time = _auto_datetime(operation_date, operation_time)
 
@@ -99,8 +121,8 @@ def generate_tbank_receipt(
     if receipt_number in ("", "auto", "авто"):
         receipt_number = _gen_receipt_number()
 
-    # Format datetime string as shown in T-Bank receipts
-    datetime_str = f"{operation_date} {operation_time}"
+    # Format datetime string as shown in T-Bank receipts (double-space between date and time)
+    datetime_str = f"{operation_date}  {operation_time}"
 
     # Amount string (bold uses same formatted value)
     amount_str = _format_amount(amount)

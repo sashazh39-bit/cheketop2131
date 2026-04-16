@@ -19,6 +19,7 @@ from tbank_cmap import (
 )
 from tbank_check_service import (
     TEMPLATES,
+    _pick_template,
     SBP_FIELDS,
     CARD_FIELDS,
     TRANSGRAN_FIELDS,
@@ -30,6 +31,7 @@ from tbank_check_service import (
     _update_doc_id,
     _replace_all_fields_in_stream,
     _format_amount_str,
+    get_renderable_chars,
 )
 
 
@@ -106,7 +108,7 @@ def generate_from_scratch(
     template_path: Optional[str | Path] = None,
 ) -> bytes:
     """Generate a T-Bank receipt from scratch by replacing all fields in a donor."""
-    donor = Path(template_path) if template_path else TEMPLATES.get(receipt_type)
+    donor = Path(template_path) if template_path else _pick_template(receipt_type)
     if not donor or not donor.exists():
         raise FileNotFoundError(
             f"Template for {receipt_type} not found at {donor}"
@@ -127,8 +129,12 @@ def generate_from_scratch(
         if bad:
             raise ValueError(format_unsupported_error(bad))
 
+    f1_renderable = get_renderable_chars(pdf_bytes, "regular")
+    f2_renderable = get_renderable_chars(pdf_bytes, "medium")
+
     new_stream = _replace_all_fields_in_stream(
-        decompressed, fields, values, f1_widths, f2_widths
+        decompressed, fields, values, f1_widths, f2_widths,
+        f1_renderable=f1_renderable, f2_renderable=f2_renderable,
     )
 
     pdf_bytes = _recompress_zero_delta(
