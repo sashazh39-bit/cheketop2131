@@ -2005,7 +2005,13 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
         _gen_send_next(state, aw, prompt, chat_id, token, tg_req)
 
     if awaiting in ("gen_type", "gen_subtype", "gen_bank") and state.get("gen_bank_type") is None:
-        send("Выберите тип перевода и банк кнопками выше.")
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "Выберите тип перевода и банк кнопками выше или вернитесь в главное меню.",
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🏠 Главное меню", "callback_data": "main_back"}]]}),
+        })
         return
 
     if awaiting == "gen_amount":
@@ -4897,6 +4903,15 @@ def run_bot(token: str) -> None:
                         continue
 
                     if q["data"] == "gen_bank_menu_vtb":
+                        _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
+                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                                       "alfa_scratch_field", "tbank_scratch_field"):
+                            tg_request(token, "answerCallbackQuery", {
+                                "callback_query_id": q["id"],
+                                "text": "⚠️ Вы в процессе другой операции. Завершите её или нажмите Отмена.",
+                                "show_alert": True,
+                            })
+                            continue
                         USER_STATE[uid] = {"awaiting": "gen_type", "gen_transfer_type": None, "gen_bank_type": None}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
@@ -4993,6 +5008,15 @@ def run_bot(token: str) -> None:
                         continue
 
                     if q["data"] == "gen_subtype_sbp":
+                        _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
+                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                                       "alfa_scratch_field", "tbank_scratch_field"):
+                            tg_request(token, "answerCallbackQuery", {
+                                "callback_query_id": q["id"],
+                                "text": "⚠️ Вы в процессе другой операции. Завершите её или нажмите Отмена.",
+                                "show_alert": True,
+                            })
+                            continue
                         USER_STATE[uid] = {"awaiting": "gen_bank", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": "vtb_sbp"}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
@@ -5011,6 +5035,15 @@ def run_bot(token: str) -> None:
                         })
                         continue
                     if q["data"] == "gen_subtype_vtb_vtb":
+                        _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
+                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                                       "alfa_scratch_field", "tbank_scratch_field"):
+                            tg_request(token, "answerCallbackQuery", {
+                                "callback_query_id": q["id"],
+                                "text": "⚠️ Вы в процессе другой операции. Завершите её или нажмите Отмена.",
+                                "show_alert": True,
+                            })
+                            continue
                         USER_STATE[uid] = {"awaiting": "gen_bank", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": "vtb_vtb_vtb"}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
