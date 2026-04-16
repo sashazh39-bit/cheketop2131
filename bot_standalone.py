@@ -183,43 +183,65 @@ ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен
 # ---------------------------------------------------------------------------
 # Временный доступ: выдаётся командой /grant без редеплоя
 # Хранится в _PERSISTENT_DIR/temp_access.json: {uid_str: expiry_unix_timestamp}
+# В памяти держим кеш — файл читается ОДИН раз при старте, потом только пишется.
+# Это исключает I/O-сбои на Render.com при каждой проверке доступа.
 # ---------------------------------------------------------------------------
-_TEMP_ACCESS_FILE = (_PERSISTENT_DIR / "temp_access.json") if _PERSISTENT_DIR else None
+_TEMP_ACCESS_FILE = _PERSISTENT_DIR / "temp_access.json"
+
+# In-memory cache: uid → expiry timestamp. Заполняется при старте.
+_TEMP_ACCESS_CACHE: dict[int, float] = {}
 
 
-def _load_temp_access() -> dict[int, float]:
-    if not _TEMP_ACCESS_FILE or not _TEMP_ACCESS_FILE.exists():
-        return {}
+def _temp_access_load_from_file() -> None:
+    """Загрузить гранты из файла в кеш (вызывается один раз при старте)."""
+    global _TEMP_ACCESS_CACHE
     try:
-        data = json.loads(_TEMP_ACCESS_FILE.read_text(encoding="utf-8"))
-        return {int(k): float(v) for k, v in data.items()}
+        if _TEMP_ACCESS_FILE.exists():
+            data = json.loads(_TEMP_ACCESS_FILE.read_text(encoding="utf-8"))
+            _TEMP_ACCESS_CACHE = {int(k): float(v) for k, v in data.items()}
+        else:
+            _TEMP_ACCESS_CACHE = {}
     except Exception:
-        return {}
+        _TEMP_ACCESS_CACHE = {}
 
 
-def _save_temp_access(grants: dict[int, float]) -> None:
-    if not _TEMP_ACCESS_FILE:
-        return
+def _temp_access_flush() -> None:
+    """Сохранить текущий кеш в файл."""
     try:
         _PERSISTENT_DIR.mkdir(parents=True, exist_ok=True)
         _TEMP_ACCESS_FILE.write_text(
-            json.dumps({str(k): v for k, v in grants.items()}, ensure_ascii=False, indent=2),
+            json.dumps({str(k): v for k, v in _TEMP_ACCESS_CACHE.items()}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception:
         pass
 
 
+# Загружаем при старте — единственное чтение файла
+_temp_access_load_from_file()
+
+
+def _load_temp_access() -> dict[int, float]:
+    """Вернуть копию текущего кеша (без чтения файла)."""
+    return dict(_TEMP_ACCESS_CACHE)
+
+
+def _save_temp_access(grants: dict[int, float]) -> None:
+    """Обновить кеш и записать в файл."""
+    global _TEMP_ACCESS_CACHE
+    _TEMP_ACCESS_CACHE = dict(grants)
+    _temp_access_flush()
+
+
 def _is_temp_allowed(uid: int) -> bool:
-    """Проверить есть ли у пользователя действующий временный доступ."""
-    grants = _load_temp_access()
-    expiry = grants.get(uid)
+    """Проверить есть ли у пользователя действующий временный доступ (только кеш)."""
+    expiry = _TEMP_ACCESS_CACHE.get(uid)
     if expiry is None:
         return False
     if time.time() > expiry:
-        # Срок истёк — убрать из файла
-        del grants[uid]
-        _save_temp_access(grants)
+        # Срок истёк — убрать из кеша и файла
+        _TEMP_ACCESS_CACHE.pop(uid, None)
+        _temp_access_flush()
         return False
     return True
 
