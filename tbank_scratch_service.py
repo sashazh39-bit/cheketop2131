@@ -24,7 +24,7 @@ from tbank_check_service import (
     TRANSGRAN_FIELDS,
     FIELDS_BY_TYPE,
     _find_page_stream,
-    _recompress_and_fix,
+    _recompress_zero_delta,
     _update_keywords,
     _update_dates,
     _update_doc_id,
@@ -131,8 +131,8 @@ def generate_from_scratch(
         decompressed, fields, values, f1_widths, f2_widths
     )
 
-    pdf_bytes = _recompress_and_fix(
-        pdf_bytes, len_num_start, stream_start, stream_len, new_stream
+    pdf_bytes = _recompress_zero_delta(
+        pdf_bytes, stream_start, stream_len, new_stream
     )
     from datetime import datetime as _dt
     now = _dt.now()

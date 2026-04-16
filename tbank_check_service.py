@@ -144,6 +144,54 @@ def _find_page_stream(pdf_bytes: bytes) -> tuple[int, int, int, bytes]:
     raise ValueError("No BT content stream found in PDF")
 
 
+def _recompress_zero_delta(
+    pdf_bytes: bytes,
+    stream_start: int,
+    old_stream_len: int,
+    new_decompressed: bytes,
+) -> bytes:
+    """Recompress content stream keeping EXACTLY the same compressed size.
+
+    Tries multiple zlib levels/strategies and optional newline padding to
+    match the original compressed size. This preserves /Length, xref, and
+    startxref — nothing shifts, so the PDF passes integrity checks.
+    """
+    target = old_stream_len
+
+    def _try_compress(data: bytes) -> bytes | None:
+        for level in (6, 7, 8, 9, 5, 4, 3, 2, 1):
+            c = zlib.compress(data, level)
+            if len(c) == target:
+                return c
+            for mem in (4, 5, 6, 7, 8, 9):
+                co = zlib.compressobj(level, zlib.DEFLATED, 15, mem, 0)
+                c2 = co.compress(data) + co.flush()
+                if len(c2) == target:
+                    return c2
+        return None
+
+    # First try without padding
+    exact = _try_compress(new_decompressed)
+    if exact:
+        data = bytearray(pdf_bytes)
+        data[stream_start : stream_start + old_stream_len] = exact
+        return bytes(data)
+
+    # Try with newline padding
+    for pad in range(1, 300):
+        candidate = new_decompressed + b"\n" * pad
+        exact = _try_compress(candidate)
+        if exact:
+            data = bytearray(pdf_bytes)
+            data[stream_start : stream_start + old_stream_len] = exact
+            return bytes(data)
+
+    # Fallback: delta-based patching
+    return _recompress_and_fix(
+        pdf_bytes, 0, stream_start, old_stream_len, new_decompressed
+    )
+
+
 def _recompress_and_fix(
     pdf_bytes: bytes,
     len_num_start: int,
@@ -153,8 +201,8 @@ def _recompress_and_fix(
 ) -> bytes:
     """Recompress content stream and fix /Length, xref, startxref.
 
-    Exact VTB approach: delta-based patching of xref entries
-    rather than rebuilding from scratch.
+    Delta-based patching of xref entries. Used as fallback when
+    zero-delta padding cannot match the original compressed size.
     """
     new_compressed = zlib.compress(new_decompressed, 6)
     delta = len(new_compressed) - old_stream_len
@@ -503,8 +551,8 @@ def patch_amount(
         decompressed, fields, changes, f1_widths, f2_widths
     )
 
-    pdf_bytes = _recompress_and_fix(
-        pdf_bytes, len_num_start, stream_start, stream_len, new_stream
+    pdf_bytes = _recompress_zero_delta(
+        pdf_bytes, stream_start, stream_len, new_stream
     )
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
@@ -542,8 +590,8 @@ def patch_all_fields(
         decompressed, fields, changes, f1_widths, f2_widths
     )
 
-    pdf_bytes = _recompress_and_fix(
-        pdf_bytes, len_num_start, stream_start, stream_len, new_stream
+    pdf_bytes = _recompress_zero_delta(
+        pdf_bytes, stream_start, stream_len, new_stream
     )
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
