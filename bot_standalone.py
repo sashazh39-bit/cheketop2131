@@ -180,6 +180,75 @@ _EFFECTIVE_ALLOWED_IDS: frozenset[int] = frozenset(_ALLOWED_IDS | set(_ALWAYS_AL
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
 
+# ---------------------------------------------------------------------------
+# Временный доступ: выдаётся командой /grant без редеплоя
+# Хранится в _PERSISTENT_DIR/temp_access.json: {uid_str: expiry_unix_timestamp}
+# ---------------------------------------------------------------------------
+_TEMP_ACCESS_FILE = (_PERSISTENT_DIR / "temp_access.json") if _PERSISTENT_DIR else None
+
+
+def _load_temp_access() -> dict[int, float]:
+    if not _TEMP_ACCESS_FILE or not _TEMP_ACCESS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(_TEMP_ACCESS_FILE.read_text(encoding="utf-8"))
+        return {int(k): float(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def _save_temp_access(grants: dict[int, float]) -> None:
+    if not _TEMP_ACCESS_FILE:
+        return
+    try:
+        _PERSISTENT_DIR.mkdir(parents=True, exist_ok=True)
+        _TEMP_ACCESS_FILE.write_text(
+            json.dumps({str(k): v for k, v in grants.items()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _is_temp_allowed(uid: int) -> bool:
+    """Проверить есть ли у пользователя действующий временный доступ."""
+    grants = _load_temp_access()
+    expiry = grants.get(uid)
+    if expiry is None:
+        return False
+    if time.time() > expiry:
+        # Срок истёк — убрать из файла
+        del grants[uid]
+        _save_temp_access(grants)
+        return False
+    return True
+
+
+def _is_allowed(uid: int) -> bool:
+    """Проверить разрешён ли доступ (постоянный или временный)."""
+    if not _EFFECTIVE_ALLOWED_IDS:
+        return True
+    if uid in _EFFECTIVE_ALLOWED_IDS:
+        return True
+    return _is_temp_allowed(uid)
+
+
+def _parse_duration(s: str) -> int | None:
+    """Парсить строку типа '24h', '7d', '30m' → секунды. None при ошибке."""
+    s = s.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*(h|d|m|ч|д|м|мин|час|ден|дн)", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit in ("h", "ч", "час"):
+        return n * 3600
+    if unit in ("d", "д", "ден", "дн"):
+        return n * 86400
+    if unit in ("m", "м", "мин"):
+        return n * 60
+    return None
+
 # Статистика PDF: счётчики только для этих пар (telegram user_id → подпись в отчёте).
 STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
     (1445265832, "диролЧ"),
@@ -4186,7 +4255,7 @@ def run_bot(token: str) -> None:
                     msg = upd["message"]
                     uid = msg["from"]["id"]
                     chat_id = msg["chat"]["id"]
-                    if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
+                    if not _is_allowed(uid):
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": ACCESS_DENIED_MSG})
                         continue
                     text = msg.get("text", "").strip()
@@ -4290,6 +4359,99 @@ def run_bot(token: str) -> None:
                         kb = json.loads(km)
                         kb["inline_keyboard"].append([{"text": "🔄 Обновить", "callback_data": "main_zayavki"}, {"text": "⬅️ Назад", "callback_data": "main_back"}])
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": txt, "reply_markup": json.dumps(kb)})
+                        continue
+
+                    # --- /grant: выдать временный доступ (только для постоянных админов) ---
+                    if cmd0 == "/grant":
+                        if uid not in _ALWAYS_ALLOWED_IDS:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "🚫 Только администратор может выдавать доступ."})
+                            continue
+                        parts = _parts[1:]  # [uid, duration]
+                        if len(parts) < 2:
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": (
+                                    "📋 Использование:\n"
+                                    "/grant <user_id> <срок>\n\n"
+                                    "Примеры:\n"
+                                    "/grant 7041518561 24h\n"
+                                    "/grant 7041518561 7d\n"
+                                    "/grant 7041518561 30m\n\n"
+                                    "Единицы: h/ч — часы, d/д — дни, m/м — минуты"
+                                ),
+                            })
+                            continue
+                        try:
+                            target_uid = int(re.sub(r"\D", "", parts[0]))
+                        except (ValueError, IndexError):
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверный user_id."})
+                            continue
+                        secs = _parse_duration(parts[1])
+                        if secs is None:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверный срок. Используйте: 24h, 7d, 30m."})
+                            continue
+                        grants = _load_temp_access()
+                        expiry = time.time() + secs
+                        grants[target_uid] = expiry
+                        _save_temp_access(grants)
+                        exp_str = datetime.fromtimestamp(expiry).strftime("%d.%m.%Y %H:%M")
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": f"✅ Доступ выдан!\n\nUser ID: `{target_uid}`\nДо: {exp_str}",
+                            "parse_mode": "Markdown",
+                        })
+                        continue
+
+                    # --- /revoke: отозвать доступ ---
+                    if cmd0 == "/revoke":
+                        if uid not in _ALWAYS_ALLOWED_IDS:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "🚫 Только администратор может отзывать доступ."})
+                            continue
+                        if len(_parts) < 2:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "Использование: /revoke <user_id>"})
+                            continue
+                        try:
+                            target_uid = int(re.sub(r"\D", "", _parts[1]))
+                        except (ValueError, IndexError):
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверный user_id."})
+                            continue
+                        grants = _load_temp_access()
+                        if target_uid in grants:
+                            del grants[target_uid]
+                            _save_temp_access(grants)
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"✅ Доступ для `{target_uid}` отозван.", "parse_mode": "Markdown"})
+                        else:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"⚠️ У `{target_uid}` нет временного доступа.", "parse_mode": "Markdown"})
+                        continue
+
+                    # --- /access: список выданных доступов ---
+                    if cmd0 == "/access":
+                        if uid not in _ALWAYS_ALLOWED_IDS:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "🚫 Только администратор."})
+                            continue
+                        grants = _load_temp_access()
+                        now = time.time()
+                        # Убираем истёкшие
+                        expired = [k for k, v in grants.items() if v <= now]
+                        for k in expired:
+                            del grants[k]
+                        if expired:
+                            _save_temp_access(grants)
+                        if not grants:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "📋 Активных временных доступов нет."})
+                            continue
+                        lines = ["📋 Активные временные доступы:\n"]
+                        for tuid, exp in sorted(grants.items(), key=lambda x: x[1]):
+                            exp_str = datetime.fromtimestamp(exp).strftime("%d.%m.%Y %H:%M")
+                            remaining = int(exp - now)
+                            if remaining >= 86400:
+                                rem_str = f"{remaining // 86400}д {(remaining % 86400) // 3600}ч"
+                            elif remaining >= 3600:
+                                rem_str = f"{remaining // 3600}ч {(remaining % 3600) // 60}м"
+                            else:
+                                rem_str = f"{remaining // 60}м"
+                            lines.append(f"• `{tuid}` — до {exp_str} (осталось {rem_str})")
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "Markdown"})
                         continue
 
 
@@ -4865,7 +5027,7 @@ def run_bot(token: str) -> None:
                     q = upd["callback_query"]
                     uid = q["from"]["id"]
                     tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"]})
-                    if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
+                    if not _is_allowed(uid):
                         tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
                         continue
                     if q["data"] == "main_check":
