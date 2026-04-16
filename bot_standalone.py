@@ -176,10 +176,101 @@ if _raw:
         _ALLOWED_IDS.add(int(s))
 
 # Фолбэк для пользователя, у которого периодически теряется доступ из-за окружения.
-_ALWAYS_ALLOWED_IDS: frozenset[int] = frozenset({8178442784, 1176744294})
+_ALWAYS_ALLOWED_IDS: frozenset[int] = frozenset({1445265832})
 _EFFECTIVE_ALLOWED_IDS: frozenset[int] = frozenset(_ALLOWED_IDS | set(_ALWAYS_ALLOWED_IDS))
 
 ACCESS_DENIED_MSG = "🚫 Доступ запрещён. Бот доступен только ограниченному кругу пользователей."
+
+# ---------------------------------------------------------------------------
+# Временный доступ: выдаётся командой /grant без редеплоя
+# Хранится в _PERSISTENT_DIR/temp_access.json: {uid_str: expiry_unix_timestamp}
+# В памяти держим кеш — файл читается ОДИН раз при старте, потом только пишется.
+# Это исключает I/O-сбои на Render.com при каждой проверке доступа.
+# ---------------------------------------------------------------------------
+_TEMP_ACCESS_FILE = _PERSISTENT_DIR / "temp_access.json"
+
+# In-memory cache: uid → expiry timestamp. Заполняется при старте.
+_TEMP_ACCESS_CACHE: dict[int, float] = {}
+
+
+def _temp_access_load_from_file() -> None:
+    """Загрузить гранты из файла в кеш (вызывается один раз при старте)."""
+    global _TEMP_ACCESS_CACHE
+    try:
+        if _TEMP_ACCESS_FILE.exists():
+            data = json.loads(_TEMP_ACCESS_FILE.read_text(encoding="utf-8"))
+            _TEMP_ACCESS_CACHE = {int(k): float(v) for k, v in data.items()}
+        else:
+            _TEMP_ACCESS_CACHE = {}
+    except Exception:
+        _TEMP_ACCESS_CACHE = {}
+
+
+def _temp_access_flush() -> None:
+    """Сохранить текущий кеш в файл."""
+    try:
+        _PERSISTENT_DIR.mkdir(parents=True, exist_ok=True)
+        _TEMP_ACCESS_FILE.write_text(
+            json.dumps({str(k): v for k, v in _TEMP_ACCESS_CACHE.items()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+# Загружаем при старте — единственное чтение файла
+_temp_access_load_from_file()
+
+
+def _load_temp_access() -> dict[int, float]:
+    """Вернуть копию текущего кеша (без чтения файла)."""
+    return dict(_TEMP_ACCESS_CACHE)
+
+
+def _save_temp_access(grants: dict[int, float]) -> None:
+    """Обновить кеш и записать в файл."""
+    global _TEMP_ACCESS_CACHE
+    _TEMP_ACCESS_CACHE = dict(grants)
+    _temp_access_flush()
+
+
+def _is_temp_allowed(uid: int) -> bool:
+    """Проверить есть ли у пользователя действующий временный доступ (только кеш)."""
+    expiry = _TEMP_ACCESS_CACHE.get(uid)
+    if expiry is None:
+        return False
+    if time.time() > expiry:
+        # Срок истёк — убрать из кеша и файла
+        _TEMP_ACCESS_CACHE.pop(uid, None)
+        _temp_access_flush()
+        return False
+    return True
+
+
+def _is_allowed(uid: int) -> bool:
+    """Проверить разрешён ли доступ (постоянный или временный)."""
+    if not _EFFECTIVE_ALLOWED_IDS:
+        return True
+    if uid in _EFFECTIVE_ALLOWED_IDS:
+        return True
+    return _is_temp_allowed(uid)
+
+
+def _parse_duration(s: str) -> int | None:
+    """Парсить строку типа '24h', '7d', '30m' → секунды. None при ошибке."""
+    s = s.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*(h|d|m|ч|д|м|мин|час|ден|дн)", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit in ("h", "ч", "час"):
+        return n * 3600
+    if unit in ("d", "д", "ден", "дн"):
+        return n * 86400
+    if unit in ("m", "м", "мин"):
+        return n * 60
+    return None
 
 # Статистика PDF: счётчики только для этих пар (telegram user_id → подпись в отчёте).
 STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
@@ -355,20 +446,26 @@ MAIN_MENU_KB = [
 
 CHANGELOG_TEXT = (
     "📝 Последние изменения\n\n"
-    "• Масштабный рефакторинг навигации:\n"
-    "  — Кнопки «Загрузить чек» и «Сгенерировать чек» объединены под «Чек».\n"
-    "  — Раздел переименован: «Проверка базы» → «База».\n"
-    "  — Убраны «Заявки» и кнопки «Тест»/«Заявка» после генерации.\n\n"
-    "• Выбор банка — новый UI:\n"
-    "  — Альфа Чек | ВТБ в два столбца, «Авто» снизу.\n"
-    "  — У каждого банка своё суб-меню: только сумма / все поля / трансгран.\n\n"
-    "• Автодетект суммы — режим «только сумма» теперь сам определяет сумму из чека;\n"
-    "  пользователь вводит только новое значение. Комиссия сканируется автоматически.\n\n"
-    "• Авто — любой банк: свободный формат замен (СТАРОЕ = НОВОЕ) без привязки к банку.\n\n"
-    "• Выписки — новое меню Альфа / ВТБ с тремя вариантами каждого:\n"
-    "  Редактирование своей / По чеку / Создание с нуля.\n\n"
-    "• Исправлен баг: после генерации нажатие «Главная» больше не ломает навигацию.\n\n"
-    "• База теперь показывает и шаблоны выписок."
+    "16.04.2026\n\n"
+    "• Альфа СБП — исправлена ошибка «No glyph source font» при генерации:\n"
+    "  шрифт Tahoma теперь встроен в бот, MS Office на сервере не нужен.\n\n"
+    "• Убрана надпись OnlyPDF везде — больше нет лишних предупреждений.\n"
+    "  После генерации два чётких варианта:\n"
+    "  «Прислать чек для нового SBP ID» или «Сохранить PDF».\n\n"
+    "• Альфа СБП — новое поле в мастере генерации:\n"
+    "  «Последние 4 цифры счёта списания» — бот сам строит корректный\n"
+    "  20-значный счёт с правильной контрольной цифрой.\n\n"
+    "• Номер операции теперь автоматически растёт на 1213–1293 после\n"
+    "  каждой генерации и сохраняется между перезапусками сервера.\n\n"
+    "• Т-Банк СБП — исправлен визуальный баг «000 ₽» вместо суммы:\n"
+    "  в жирный шрифт добавлены все цифры 0–9 из обычного шрифта.\n\n"
+    "• Т-Банк — поля с невидимыми символами теперь пропускаются;\n"
+    "  бот предупреждает какие буквы отсутствуют в шрифте донора.\n\n"
+    "• Т-Банк — нулевая дельта при патчинге: размер файла всегда\n"
+    "  совпадает с донором, что улучшает прохождение проверок.\n\n"
+    "• Добавлена команда /check для Т-Банк СБП.\n\n"
+    "• Постоянное хранилище на Render.com: sbp_pool и статистика\n"
+    "  теперь переживают редеплой."
 )
 
 ZAYAVKI_DIR = Path(__file__).parent / "заявки"
@@ -2014,7 +2111,13 @@ def _handle_gen_input(token: str, uid: int, chat_id: int, text: str, msg: dict, 
         _gen_send_next(state, aw, prompt, chat_id, token, tg_req)
 
     if awaiting in ("gen_type", "gen_subtype", "gen_bank") and state.get("gen_bank_type") is None:
-        send("Выберите тип перевода и банк кнопками выше.")
+        if uid in USER_STATE:
+            del USER_STATE[uid]
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "Выберите тип перевода и банк кнопками выше или вернитесь в главное меню.",
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "🏠 Главное меню", "callback_data": "main_back"}]]}),
+        })
         return
 
     if awaiting == "gen_amount":
@@ -4189,7 +4292,7 @@ def run_bot(token: str) -> None:
                     msg = upd["message"]
                     uid = msg["from"]["id"]
                     chat_id = msg["chat"]["id"]
-                    if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
+                    if not _is_allowed(uid):
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": ACCESS_DENIED_MSG})
                         continue
                     text = msg.get("text", "").strip()
@@ -4293,6 +4396,99 @@ def run_bot(token: str) -> None:
                         kb = json.loads(km)
                         kb["inline_keyboard"].append([{"text": "🔄 Обновить", "callback_data": "main_zayavki"}, {"text": "⬅️ Назад", "callback_data": "main_back"}])
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": txt, "reply_markup": json.dumps(kb)})
+                        continue
+
+                    # --- /grant: выдать временный доступ (только для постоянных админов) ---
+                    if cmd0 == "/grant":
+                        if uid not in _ALWAYS_ALLOWED_IDS:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "🚫 Только администратор может выдавать доступ."})
+                            continue
+                        parts = _parts[1:]  # [uid, duration]
+                        if len(parts) < 2:
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": (
+                                    "📋 Использование:\n"
+                                    "/grant <user_id> <срок>\n\n"
+                                    "Примеры:\n"
+                                    "/grant 7041518561 24h\n"
+                                    "/grant 7041518561 7d\n"
+                                    "/grant 7041518561 30m\n\n"
+                                    "Единицы: h/ч — часы, d/д — дни, m/м — минуты"
+                                ),
+                            })
+                            continue
+                        try:
+                            target_uid = int(re.sub(r"\D", "", parts[0]))
+                        except (ValueError, IndexError):
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверный user_id."})
+                            continue
+                        secs = _parse_duration(parts[1])
+                        if secs is None:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверный срок. Используйте: 24h, 7d, 30m."})
+                            continue
+                        grants = _load_temp_access()
+                        expiry = time.time() + secs
+                        grants[target_uid] = expiry
+                        _save_temp_access(grants)
+                        exp_str = datetime.fromtimestamp(expiry).strftime("%d.%m.%Y %H:%M")
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": f"✅ Доступ выдан!\n\nUser ID: `{target_uid}`\nДо: {exp_str}",
+                            "parse_mode": "Markdown",
+                        })
+                        continue
+
+                    # --- /revoke: отозвать доступ ---
+                    if cmd0 == "/revoke":
+                        if uid not in _ALWAYS_ALLOWED_IDS:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "🚫 Только администратор может отзывать доступ."})
+                            continue
+                        if len(_parts) < 2:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "Использование: /revoke <user_id>"})
+                            continue
+                        try:
+                            target_uid = int(re.sub(r"\D", "", _parts[1]))
+                        except (ValueError, IndexError):
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ Неверный user_id."})
+                            continue
+                        grants = _load_temp_access()
+                        if target_uid in grants:
+                            del grants[target_uid]
+                            _save_temp_access(grants)
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"✅ Доступ для `{target_uid}` отозван.", "parse_mode": "Markdown"})
+                        else:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": f"⚠️ У `{target_uid}` нет временного доступа.", "parse_mode": "Markdown"})
+                        continue
+
+                    # --- /access: список выданных доступов ---
+                    if cmd0 == "/access":
+                        if uid not in _ALWAYS_ALLOWED_IDS:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "🚫 Только администратор."})
+                            continue
+                        grants = _load_temp_access()
+                        now = time.time()
+                        # Убираем истёкшие
+                        expired = [k for k, v in grants.items() if v <= now]
+                        for k in expired:
+                            del grants[k]
+                        if expired:
+                            _save_temp_access(grants)
+                        if not grants:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "📋 Активных временных доступов нет."})
+                            continue
+                        lines = ["📋 Активные временные доступы:\n"]
+                        for tuid, exp in sorted(grants.items(), key=lambda x: x[1]):
+                            exp_str = datetime.fromtimestamp(exp).strftime("%d.%m.%Y %H:%M")
+                            remaining = int(exp - now)
+                            if remaining >= 86400:
+                                rem_str = f"{remaining // 86400}д {(remaining % 86400) // 3600}ч"
+                            elif remaining >= 3600:
+                                rem_str = f"{remaining // 3600}ч {(remaining % 3600) // 60}м"
+                            else:
+                                rem_str = f"{remaining // 60}м"
+                            lines.append(f"• `{tuid}` — до {exp_str} (осталось {rem_str})")
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "Markdown"})
                         continue
 
 
@@ -4901,7 +5097,7 @@ def run_bot(token: str) -> None:
                     q = upd["callback_query"]
                     uid = q["from"]["id"]
                     tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"]})
-                    if _EFFECTIVE_ALLOWED_IDS and uid not in _EFFECTIVE_ALLOWED_IDS:
+                    if not _is_allowed(uid):
                         tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
                         continue
                     if q["data"] == "main_check":
@@ -4939,6 +5135,15 @@ def run_bot(token: str) -> None:
                         continue
 
                     if q["data"] == "gen_bank_menu_vtb":
+                        _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
+                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                                       "alfa_scratch_field", "tbank_scratch_field"):
+                            tg_request(token, "answerCallbackQuery", {
+                                "callback_query_id": q["id"],
+                                "text": "⚠️ Вы в процессе другой операции. Завершите её или нажмите Отмена.",
+                                "show_alert": True,
+                            })
+                            continue
                         USER_STATE[uid] = {"awaiting": "gen_type", "gen_transfer_type": None, "gen_bank_type": None}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
@@ -5035,6 +5240,15 @@ def run_bot(token: str) -> None:
                         continue
 
                     if q["data"] == "gen_subtype_sbp":
+                        _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
+                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                                       "alfa_scratch_field", "tbank_scratch_field"):
+                            tg_request(token, "answerCallbackQuery", {
+                                "callback_query_id": q["id"],
+                                "text": "⚠️ Вы в процессе другой операции. Завершите её или нажмите Отмена.",
+                                "show_alert": True,
+                            })
+                            continue
                         USER_STATE[uid] = {"awaiting": "gen_bank", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": "vtb_sbp"}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
@@ -5053,6 +5267,15 @@ def run_bot(token: str) -> None:
                         })
                         continue
                     if q["data"] == "gen_subtype_vtb_vtb":
+                        _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
+                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                                       "alfa_scratch_field", "tbank_scratch_field"):
+                            tg_request(token, "answerCallbackQuery", {
+                                "callback_query_id": q["id"],
+                                "text": "⚠️ Вы в процессе другой операции. Завершите её или нажмите Отмена.",
+                                "show_alert": True,
+                            })
+                            continue
                         USER_STATE[uid] = {"awaiting": "gen_bank", "gen_transfer_type": "sbp", "gen_bank_type": None, "gen_vtb_subtype": "vtb_vtb_vtb"}
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
