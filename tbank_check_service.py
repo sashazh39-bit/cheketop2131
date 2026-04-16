@@ -42,10 +42,27 @@ from tbank_cmap import (
 
 BASE_DIR = Path(__file__).parent
 
+_TBANK_DIR = BASE_DIR / "TBANK"
+
+def _find_tbank_donor(receipt_type: str) -> Path:
+    """Find a donor PDF for the given receipt type from the TBANK/ folder.
+
+    Falls back to ~/Downloads/ paths for backward compatibility.
+    """
+    candidates = sorted(_TBANK_DIR.glob("*.pdf")) if _TBANK_DIR.exists() else []
+    if candidates:
+        return candidates[0]
+    fallback = {
+        "sbp": Path.home() / "Downloads" / "receipt_23.03.2026 (2).pdf",
+        "card": Path.home() / "Downloads" / "receipt_23.03.2026 (1).pdf",
+        "transgran": Path.home() / "Downloads" / "receipt_23.03.2026 (3).pdf",
+    }
+    return fallback.get(receipt_type, fallback["sbp"])
+
 TEMPLATES = {
-    "sbp": Path.home() / "Downloads" / "receipt_23.03.2026 (2).pdf",
-    "card": Path.home() / "Downloads" / "receipt_23.03.2026 (1).pdf",
-    "transgran": Path.home() / "Downloads" / "receipt_23.03.2026 (3).pdf",
+    "sbp": _TBANK_DIR / "receipt_sbp_1.pdf",
+    "card": _TBANK_DIR / "receipt_sbp_1.pdf",
+    "transgran": _TBANK_DIR / "receipt_sbp_1.pdf",
 }
 
 # ── Receipt subtypes and their field layouts ──────────────────────────
@@ -53,18 +70,18 @@ TEMPLATES = {
 RECEIPT_TYPES = ("sbp", "card", "transgran")
 
 SBP_FIELDS = [
-    {"key": "datetime",     "label": "Дата и время",         "y": 432.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left"},
-    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 412.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right"},
-    {"key": "type_label",   "label": "Тип перевода",         "y": 376.78, "x": 172.28, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "status",       "label": "Статус",               "y": 356.78, "x": 216.57, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "amount_small", "label": "Сумма",                "y": 336.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "commission",   "label": "Комиссия",             "y": 315.78, "x": 198.1,  "font": "F1", "size": 9,  "align": "right"},
-    {"key": "sender",       "label": "Отправитель",          "y": 295.78, "x": 188.54, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "phone",        "label": "Телефон получателя",   "y": 275.78, "x": 178.72, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "receiver",     "label": "Получатель",           "y": 255.78, "x": 216.55, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "bank",         "label": "Банк получателя",      "y": 235.78, "x": 204.83, "font": "F1", "size": 9,  "align": "right"},
-    {"key": "account",      "label": "Счет списания",        "y": 215.78, "x": 160.8,  "font": "F1", "size": 9,  "align": "right"},
-    {"key": "ident",        "label": "Идентификатор",        "y": 195.78, "x": 123.46, "font": "F1", "size": 9,  "align": "right"},
+    {"key": "datetime",     "label": "Дата и время",         "y": 432.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left",  "tol_x": 8.0},
+    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 412.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right", "tol_x": 8.0},
+    {"key": "type_label",   "label": "Тип перевода",         "y": 376.78, "x": 172.28, "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "status",       "label": "Статус",               "y": 356.78, "x": 216.57, "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "amount_small", "label": "Сумма",                "y": 336.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "commission",   "label": "Комиссия",             "y": 315.78, "x": 198.1,  "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "sender",       "label": "Отправитель",          "y": 295.78, "x": 170.02, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "phone",        "label": "Телефон получателя",   "y": 275.78, "x": 178.72, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "receiver",     "label": "Получатель",           "y": 255.78, "x": 216.55, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "bank",         "label": "Банк получателя",      "y": 235.78, "x": 204.83, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "account",      "label": "Счет списания",        "y": 215.78, "x": 160.95, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "ident",        "label": "Идентификатор",        "y": 195.78, "x": 123.46, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
 ]
 
 CARD_FIELDS = [
@@ -360,7 +377,9 @@ def _replace_all_fields_in_stream(
         widths = f2_widths if is_f2 else f1_widths
 
         if is_f2:
-            if not can_encode_in_font(new_val, "medium", f2_widths):
+            # Use hardcoded MEDIUM_WIDTHS for the encodability check (extracted /W
+            # table from the PDF is often a small subset and gives false negatives).
+            if not can_encode_in_font(new_val, "medium", MEDIUM_WIDTHS):
                 continue
 
         stream = _replace_field_bytes(
@@ -372,6 +391,7 @@ def _replace_all_fields_in_stream(
             right_aligned=(field.get("align", "right") == "right"),
             widths=widths,
             font=font_type,
+            tol_x=field.get("tol_x", 8.0),
         )
     return stream
 

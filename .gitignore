@@ -23,6 +23,7 @@ receipt_test_*.pdf
 !GPB/*.pdf
 !карта_на_карту/*.pdf
 !таджикистан/*.pdf
+!TBANK/*.pdf
 tmp_*/
 tmp_alfa_scratch/
 vtb-generator/

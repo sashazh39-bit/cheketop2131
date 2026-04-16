@@ -11,3 +11,9 @@ services:
         sync: false
       - key: ALLOWED_USER_IDS
         sync: false
+      - key: PERSISTENT_DIR
+        value: /opt/render/project/data
+    disk:
+      name: cheketop-data
+      mountPath: /opt/render/project/data
+      sizeGB: 1

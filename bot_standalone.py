@@ -39,6 +39,14 @@ from pathlib import Path
 _BOT_DIR = Path(__file__).parent
 _ADD_GLYPHS_SCRIPT = _BOT_DIR / "add_glyphs_to_13_03.py"
 
+# Persistent storage: survives Render deploys when a Disk is mounted at /opt/render/project/data
+# Locally defaults to the bot directory so nothing changes.
+_PERSISTENT_DIR = Path(os.environ.get("PERSISTENT_DIR", str(_BOT_DIR)))
+try:
+    _PERSISTENT_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    _PERSISTENT_DIR = _BOT_DIR
+
 # Загрузка .env вручную (без python-dotenv)
 try:
     env_path = Path(__file__).parent / ".env"
@@ -103,7 +111,7 @@ BASE = "https://api.telegram.org/bot"
 # --- SBP пул ---
 try:
     from sbp_pool import SBPPool as _SBPPool
-    _sbp_pool = _SBPPool()
+    _sbp_pool = _SBPPool(_PERSISTENT_DIR / "sbp_pool.json")
 except Exception:
     _sbp_pool = None  # type: ignore
 
@@ -135,7 +143,7 @@ STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
 )
 STATS_IGNORE_USER_IDS: frozenset[int] = frozenset()
 
-STATS_PATH = _BOT_DIR / "bot_pdf_stats.json"
+STATS_PATH = _PERSISTENT_DIR / "bot_pdf_stats.json"
 
 
 def _stats_load() -> dict:
@@ -3641,6 +3649,8 @@ _CHECK_MODES = {
     "card":           "Альфа карта-на-карту",
     "alfa_transgran": "Альфа Трансгран",
     "transgran":      "Альфа Трансгран",
+    "tbank_sbp":      "Т-Банк СБП",
+    "tbank":          "Т-Банк СБП",
 }
 
 _CHECK_HELP = """\
@@ -3714,7 +3724,25 @@ operation_time: auto
 
   credited_currency — валюта получателя (TJS, UZS и т.д.)
   amount_int — сумма в валюте получателя
-  ⚠️ Требует обработку в OnlyPDF\
+  ⚠️ Требует обработку в OnlyPDF
+
+━━━━━━━━━━━━━━━━━━━━━
+🅃 Т-БАНК — перевод по СБП
+━━━━━━━━━━━━━━━━━━━━━
+/check
+mode: tbank_sbp
+amount: 15000
+sender_name: Егор Гладышев
+sender_account: 408178102001****1274
+recipient_name: Евгения К.
+recipient_phone: +7 (908) 540-55-34
+recipient_bank: Сбербанк
+spb_number: auto
+operation_date: auto
+operation_time: auto
+
+  sender_account — номер счёта в формате 408...****XXXX
+  spb_number — ID операции СБП, auto = сгенерировать\
 """
 
 
@@ -3758,7 +3786,8 @@ def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
             "  mode: gpb_sbp\n"
             "  mode: alfa_sbp\n"
             "  mode: alfa_card\n"
-            "  mode: alfa_transgran\n\n"
+            "  mode: alfa_transgran\n"
+            "  mode: tbank_sbp\n\n"
             "Отправьте /check без параметров, чтобы увидеть примеры."
         )
         return
@@ -3790,6 +3819,24 @@ def _handle_check_command(token: str, chat_id: int, text: str, tg_req) -> None:
         elif mode in ("alfa_transgran", "transgran"):
             pdf_bytes, filename = _gen_alfa_transgran(fields)
             needs_onlypdf = True
+
+        elif mode in ("tbank_sbp", "tbank"):
+            from gen_tbank_receipt import generate_tbank_receipt
+            amount_raw = fields.get("amount", "1000")
+            amount_int = int(re.sub(r"\D", "", amount_raw) or "1000")
+            raw_account = fields.get("sender_account", "408178100000****0000")
+            pdf_bytes, filename = generate_tbank_receipt(
+                amount=amount_int,
+                sender_name=fields.get("sender_name") or "Иван Иванович И.",
+                sender_account=raw_account if raw_account not in ("", "auto") else "408178100000****0000",
+                recipient_name=fields.get("recipient_name") or "Анна Ивановна И.",
+                recipient_phone=fields.get("recipient_phone") or "+7(900)000-00-00",
+                recipient_bank=fields.get("recipient_bank") or "Сбербанк",
+                operation_date=fields.get("operation_date", "auto"),
+                operation_time=fields.get("operation_time", "auto"),
+                spb_number=fields.get("spb_number", "auto"),
+                receipt_number=fields.get("receipt_number", "auto"),
+            )
 
         else:
             send("❌ Режим не поддерживается.")
@@ -4125,6 +4172,27 @@ def run_bot(token: str) -> None:
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "\n".join(lines)})
                         continue
 
+                    # --- /sbp: удобное меню управления пулом SBP ID ---
+                    if cmd0 == "/sbp":
+                        if _sbp_pool is None:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "❌ SBP пул недоступен."})
+                            continue
+                        total, used, avail = _sbp_pool.status()
+                        tg_request(token, "sendMessage", {
+                            "chat_id": chat_id,
+                            "text": (
+                                f"📋 Пул SBP ID\n\n"
+                                f"Всего: {total} | Использовано: {used} | Доступно: {avail}"
+                            ),
+                            "reply_markup": json.dumps({"inline_keyboard": [
+                                [{"text": "➕ Добавить ID текстом", "callback_data": "sbp_add_text"}],
+                                [{"text": "📄 Добавить из чека (PDF)", "callback_data": "sbp_add_pdf"}],
+                                [{"text": "📋 Список доступных", "callback_data": "sbp_list"}],
+                                [{"text": "🗑 Очистить использованные", "callback_data": "sbp_clear_used"}],
+                            ]}),
+                        })
+                        continue
+
                     if cmd0 in ("/statistika", "/stats"):
                         tg_request(token, "sendMessage", {
                             "chat_id": chat_id,
@@ -4232,6 +4300,38 @@ def run_bot(token: str) -> None:
                                     pass
                                 tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Не удалось добавить (возможно пустой PDF или ошибка)"})
                             continue
+                        # SBP пул: пользователь прислал PDF для извлечения SBP ID в пул
+                        if USER_STATE.get(uid, {}).get("awaiting") == "sbp_add_pdf_input":
+                            try:
+                                fp = tg_get_file_path(token, doc["file_id"])
+                                pdf_data = tg_get_file(token, fp)
+                            except Exception as e:
+                                tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": f"❌ Ошибка загрузки: {e}"})
+                                del USER_STATE[uid]
+                                continue
+                            sbp_id = _extract_sbp_id_from_pdf(pdf_data)
+                            del USER_STATE[uid]
+                            if not sbp_id:
+                                tg_request(token, "sendMessage", {
+                                    "chat_id": msg["chat"]["id"],
+                                    "text": "❌ SBP ID не найден в этом PDF.\n\nПопробуйте другой СБП-чек или добавьте ID вручную через /sbp.",
+                                })
+                            elif _sbp_pool is not None:
+                                added = _sbp_pool.add(sbp_id)
+                                total, used, avail = _sbp_pool.status()
+                                status = "✅ Добавлен" if added else "⚠️ Уже есть в пуле"
+                                tg_request(token, "sendMessage", {
+                                    "chat_id": msg["chat"]["id"],
+                                    "text": (
+                                        f"{status}: `{sbp_id}`\n\n"
+                                        f"📊 Пул: всего {total} | использовано {used} | доступно {avail}"
+                                    ),
+                                    "parse_mode": "Markdown",
+                                })
+                            else:
+                                tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "❌ Пул недоступен."})
+                            continue
+
                         # Новый генератор: пользователь прислал реальный чек для извлечения SBP ID
                         if USER_STATE.get(uid, {}).get("awaiting") == "new_gen_sbp_receipt":
                             tg_request(token, "sendMessage", {"chat_id": msg["chat"]["id"], "text": "⏳ Извлекаю SBP ID из чека..."})
@@ -4474,6 +4574,21 @@ def run_bot(token: str) -> None:
                             _run_tbank_scratch_gen(token, uid, chat_id, state, tg_request)
                         else:
                             _tbank_send_scratch_field(token, chat_id, state)
+                        continue
+
+                    # SBP пул: добавление через текст
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "sbp_add_text_input":
+                        if _sbp_pool is not None:
+                            added, skipped = _sbp_pool.add_bulk(text)
+                            total, used, avail = _sbp_pool.status()
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": (
+                                    f"✅ Добавлено: {added} | Пропущено (дубли): {skipped}\n\n"
+                                    f"📊 Пул: всего {total} | использовано {used} | доступно {avail}"
+                                ),
+                            })
+                        del USER_STATE[uid]
                         continue
 
                     # Новые генераторы: пошаговый wizard
@@ -4952,6 +5067,67 @@ def run_bot(token: str) -> None:
                         })
                         continue
                     # --- конец новых генераторов ---
+
+                    # --- SBP пул: callback-меню ---
+                    if q["data"] == "sbp_add_text":
+                        if _sbp_pool is None:
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Пул недоступен"})
+                            continue
+                        USER_STATE[uid] = {"awaiting": "sbp_add_text_input"}
+                        tg_request(token, "sendMessage", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "text": (
+                                "Отправьте один или несколько SBP ID (по одному на строку).\n\n"
+                                "Пример:\n"
+                                "A61051018121260A0B10040011740901\n"
+                                "A61061126522550G0B100600117\n\n"
+                                "Каждый ID — ровно 32 символа (буквы и цифры)."
+                            ),
+                        })
+                        continue
+
+                    if q["data"] == "sbp_add_pdf":
+                        if _sbp_pool is None:
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Пул недоступен"})
+                            continue
+                        USER_STATE[uid] = {"awaiting": "sbp_add_pdf_input"}
+                        tg_request(token, "sendMessage", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "text": "Отправьте PDF любого СБП-чека. Бот извлечёт из него SBP ID и добавит в пул.",
+                        })
+                        continue
+
+                    if q["data"] == "sbp_list":
+                        if _sbp_pool is None:
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Пул недоступен"})
+                            continue
+                        entries = _sbp_pool.list_available()
+                        total, used, avail = _sbp_pool.status()
+                        if not entries:
+                            txt = f"📋 Доступных SBP ID: 0 (всего {total}, использовано {used})\n\nДобавьте через /sbp"
+                        else:
+                            lines = [f"📋 Доступные SBP ID ({avail} из {total}):"]
+                            for e in entries[:20]:
+                                bank = e.get("bank", "")
+                                date = e.get("date", "")
+                                lines.append(f"  `{e['id']}`  {bank} {date}".strip())
+                            if avail > 20:
+                                lines.append(f"  ... ещё {avail - 20}")
+                            txt = "\n".join(lines)
+                        tg_request(token, "sendMessage", {"chat_id": q["message"]["chat"]["id"], "text": txt, "parse_mode": "Markdown"})
+                        continue
+
+                    if q["data"] == "sbp_clear_used":
+                        if _sbp_pool is None:
+                            tg_request(token, "answerCallbackQuery", {"callback_query_id": q["id"], "text": "❌ Пул недоступен"})
+                            continue
+                        removed = _sbp_pool.clear_used()
+                        total, used, avail = _sbp_pool.status()
+                        tg_request(token, "sendMessage", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "text": f"🗑 Удалено использованных: {removed}\n\nОсталось доступных: {avail}",
+                        })
+                        continue
 
                     if q["data"] == "ak_keep_commission":
                         if uid not in USER_STATE or USER_STATE[uid].get("awaiting") != "ak_commission":
