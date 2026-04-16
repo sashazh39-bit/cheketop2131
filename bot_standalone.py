@@ -67,6 +67,7 @@ from tbank_check_service import (
     detect_receipt_type as tbank_detect_type,
     is_tbank_pdf,
     RECEIPT_TYPES as TBANK_RECEIPT_TYPES,
+    RECEIPT_TYPE_LABELS as TBANK_TYPE_LABELS,
 )
 from tbank_scratch_service import generate_from_scratch as tbank_generate_scratch
 from alfa_scratch_service import generate_alfa_scratch, get_fields_for_scratch as alfa_get_fields_for_scratch
@@ -4486,21 +4487,54 @@ def run_bot(token: str) -> None:
                             except OSError:
                                 pass
                         USER_STATE[uid] = {"file_path": path, "file_name": fname}
-                        tg_request(token, "sendMessage", {
-                            "chat_id": msg["chat"]["id"],
-                            "text": "📎 Чек получен. Выберите банк:",
-                            "reply_markup": json.dumps({
-                                "inline_keyboard": [
-                                    [
-                                        {"text": "🏦 Альфа", "callback_data": "bank_alfa_sub"},
-                                        {"text": "🏛 ВТБ", "callback_data": "bank_vtb_sub"},
-                                        {"text": "🅃 ТБанк", "callback_data": "bank_tbank_sub"},
+
+                        # Авто-детект Т-Банка: сразу предложить смену суммы
+                        _auto_tbank = False
+                        try:
+                            if is_tbank_pdf(path):
+                                _rtype = tbank_detect_type(path)
+                                _fields = tbank_extract_fields(path, _rtype)
+                                _amt = (_fields.get("amount_small") or _fields.get("amount_bold") or "?").strip()
+                                _rtype_label = TBANK_TYPE_LABELS.get(_rtype, _rtype)
+                                USER_STATE[uid]["tbank_type"] = _rtype
+                                USER_STATE[uid]["bank"] = "tbank"
+                                tg_request(token, "sendMessage", {
+                                    "chat_id": msg["chat"]["id"],
+                                    "text": (
+                                        f"🅃 Чек Т-Банка получен\n"
+                                        f"Тип: {_rtype_label}\n"
+                                        f"Текущая сумма: {_amt} ₽\n\n"
+                                        "Что сделать?"
+                                    ),
+                                    "reply_markup": json.dumps({
+                                        "inline_keyboard": [
+                                            [{"text": "💰 Изменить сумму", "callback_data": "bank_tbank_amount"}],
+                                            [{"text": "📋 Все поля", "callback_data": "bank_tbank_full"}],
+                                            [{"text": "⚙️ Другой банк", "callback_data": "bank_manual_select"}],
+                                            [{"text": "❌ Отмена", "callback_data": "cancel"}],
+                                        ],
+                                    }),
+                                })
+                                _auto_tbank = True
+                        except Exception:
+                            pass
+
+                        if not _auto_tbank:
+                            tg_request(token, "sendMessage", {
+                                "chat_id": msg["chat"]["id"],
+                                "text": "📎 Чек получен. Выберите банк:",
+                                "reply_markup": json.dumps({
+                                    "inline_keyboard": [
+                                        [
+                                            {"text": "🏦 Альфа", "callback_data": "bank_alfa_sub"},
+                                            {"text": "🏛 ВТБ", "callback_data": "bank_vtb_sub"},
+                                            {"text": "🅃 ТБанк", "callback_data": "bank_tbank_sub"},
+                                        ],
+                                        [{"text": "🔍 Авто — любой банк", "callback_data": "bank_auto_free"}],
+                                        [{"text": "❌ Отмена", "callback_data": "cancel"}],
                                     ],
-                                    [{"text": "🔍 Авто — любой банк", "callback_data": "bank_auto_free"}],
-                                    [{"text": "❌ Отмена", "callback_data": "cancel"}],
-                                ],
-                            }),
-                        })
+                                }),
+                            })
                         continue
 
                     # Альфа СБП все поля: пошаговый ввод
@@ -6006,13 +6040,14 @@ def run_bot(token: str) -> None:
                             USER_STATE[uid]["tbank_type"] = rtype
                             USER_STATE[uid]["awaiting"] = "tbank_new_amount"
                             hint = _tbank_f2_digit_hint(inp)
+                            rtype_label = TBANK_TYPE_LABELS.get(rtype, rtype.upper())
                             tg_request(token, "editMessageText", {
                                 "chat_id": q["message"]["chat"]["id"],
                                 "message_id": q["message"]["message_id"],
                                 "text": (
-                                    f"🅃 ТБанк — только сумма\n"
-                                    f"Тип чека: {rtype.upper()}\n"
-                                    f"Текущая сумма: {old_amt}\n\n"
+                                    f"🅃 ТБанк — смена суммы\n"
+                                    f"Тип: {rtype_label}\n"
+                                    f"Текущая сумма: {old_amt} ₽\n\n"
                                     f"{hint}"
                                     "Введите новую сумму (число):"
                                 ),
@@ -6173,11 +6208,12 @@ def run_bot(token: str) -> None:
                             hint = _tbank_f2_digit_hint(inp)
                             last_amt = state.get("tbank_new_amount")
                             last_disp = f" (прошлый раз: {int(last_amt):,} ₽)".replace(",", " ") if last_amt else ""
+                            rtype_label = TBANK_TYPE_LABELS.get(rtype, rtype.upper())
                             tg_request(token, "sendMessage", {
                                 "chat_id": cid,
                                 "text": (
                                     f"🅃 ТБанк — смена суммы\n"
-                                    f"Тип чека: {rtype.upper()}{last_disp}\n\n"
+                                    f"Тип: {rtype_label}{last_disp}\n\n"
                                     f"{hint}"
                                     "Введите новую сумму (число):"
                                 ),
@@ -6199,6 +6235,25 @@ def run_bot(token: str) -> None:
                         tg_request(token, "sendMessage", {
                             "chat_id": cid,
                             "text": "✅ Готово. Для нового чека — отправьте PDF.",
+                        })
+                        continue
+
+                    if q["data"] == "bank_manual_select":
+                        tg_request(token, "editMessageText", {
+                            "chat_id": q["message"]["chat"]["id"],
+                            "message_id": q["message"]["message_id"],
+                            "text": "📎 Выберите банк:",
+                            "reply_markup": json.dumps({
+                                "inline_keyboard": [
+                                    [
+                                        {"text": "🏦 Альфа", "callback_data": "bank_alfa_sub"},
+                                        {"text": "🏛 ВТБ", "callback_data": "bank_vtb_sub"},
+                                        {"text": "🅃 ТБанк", "callback_data": "bank_tbank_sub"},
+                                    ],
+                                    [{"text": "🔍 Авто — любой банк", "callback_data": "bank_auto_free"}],
+                                    [{"text": "❌ Отмена", "callback_data": "cancel"}],
+                                ],
+                            }),
                         })
                         continue
 

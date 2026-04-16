@@ -77,8 +77,6 @@ TEMPLATES = {
 
 # ── Receipt subtypes and their field layouts ──────────────────────────
 
-RECEIPT_TYPES = ("sbp", "card", "transgran")
-
 SBP_FIELDS = [
     {"key": "datetime",     "label": "Дата и время",         "y": 432.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left",  "tol_x": 8.0},
     # tol_x=28: в части чеков (например receipt_13.11.2025) жирная сумма левее эталона (~196 vs 217).
@@ -116,10 +114,33 @@ TRANSGRAN_FIELDS = [
     {"key": "credited_amt", "label": "Сумма зачисления",     "y": 187.78, "x": 233.57, "font": "F1", "size": 9,  "align": "right"},
 ]
 
+# Короткий вариант transgran (MediaBox h≈451): все Y сдвинуты на -40pt
+TRANSGRAN_SHORT_FIELDS = [
+    {"key": "datetime",     "label": "Дата и время",         "y": 364.54, "x": 20.0,   "font": "F1", "size": 8,  "align": "left",  "tol_x": 8.0},
+    {"key": "amount_bold",  "label": "Сумма (жирная)",       "y": 344.39, "x": 217.3,  "font": "F2", "size": 16, "align": "right", "tol_x": 28},
+    {"key": "status",       "label": "Статус",               "y": 288.78, "x": 204.07, "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "amount_small", "label": "Сумма",                "y": 268.78, "x": 232.76, "font": "F1", "size": 9,  "align": "right", "tol_x": 14},
+    {"key": "commission",   "label": "Комиссия",             "y": 247.78, "x": 198.1,  "font": "F1", "size": 9,  "align": "right", "tol_x": 8.0},
+    {"key": "sender",       "label": "Отправитель",          "y": 227.78, "x": 188.54, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "phone",        "label": "Телефон получателя",   "y": 207.78, "x": 175.9,  "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "receiver",     "label": "Получатель",           "y": 187.78, "x": 208.69, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+    {"key": "credited_amt", "label": "Сумма зачисления",     "y": 147.78, "x": 233.57, "font": "F1", "size": 9,  "align": "right", "tol_x": 60.0},
+]
+
 FIELDS_BY_TYPE = {
     "sbp": SBP_FIELDS,
     "card": CARD_FIELDS,
     "transgran": TRANSGRAN_FIELDS,
+    "transgran_short": TRANSGRAN_SHORT_FIELDS,
+}
+
+RECEIPT_TYPES = ("sbp", "card", "transgran", "transgran_short")
+
+RECEIPT_TYPE_LABELS: dict[str, str] = {
+    "sbp":              "По номеру телефона (СБП)",
+    "card":             "По карте",
+    "transgran":        "Трансграничный",
+    "transgran_short":  "Трансграничный",
 }
 
 
@@ -160,6 +181,7 @@ def _recompress_zero_delta(
     stream_start: int,
     old_stream_len: int,
     new_decompressed: bytes,
+    len_num_start: int = 0,
 ) -> bytes:
     """Recompress content stream keeping EXACTLY the same compressed size.
 
@@ -197,9 +219,9 @@ def _recompress_zero_delta(
             data[stream_start : stream_start + old_stream_len] = exact
             return bytes(data)
 
-    # Fallback: delta-based patching
+    # Fallback: delta-based patching (use actual len_num_start, not 0)
     return _recompress_and_fix(
-        pdf_bytes, 0, stream_start, old_stream_len, new_decompressed
+        pdf_bytes, len_num_start, stream_start, old_stream_len, new_decompressed
     )
 
 
@@ -669,7 +691,7 @@ def patch_amount(
     )
 
     pdf_bytes = _recompress_zero_delta(
-        pdf_bytes, stream_start, stream_len, new_stream
+        pdf_bytes, stream_start, stream_len, new_stream, len_num_start=len_num_start
     )
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
@@ -713,7 +735,7 @@ def patch_all_fields(
     )
 
     pdf_bytes = _recompress_zero_delta(
-        pdf_bytes, stream_start, stream_len, new_stream
+        pdf_bytes, stream_start, stream_len, new_stream, len_num_start=len_num_start
     )
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
@@ -744,6 +766,9 @@ def detect_receipt_type(pdf_path: str | Path) -> str:
             return "card"
         if height >= 510:
             return "sbp"
+        # h≈451 — короткий transgran (Y-поля сдвинуты на -40pt)
+        if height <= 460:
+            return "transgran_short"
         return "transgran"
     return "sbp"
 
