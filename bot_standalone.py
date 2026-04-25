@@ -278,7 +278,9 @@ STATS_TRACKED_USERS: tuple[tuple[int, str], ...] = (
     (7076663447, "ДмитрийЧ"),
     (8178442784, "Зимбамбву"),
 )
-STATS_IGNORE_USER_IDS: frozenset[int] = frozenset()
+STATS_IGNORE_USER_IDS: frozenset[int] = frozenset({
+    1445265832,  # ДиролЧ — счётчики заморожены: ни генерация, ни редактирование чеков/выписок не учитываются.
+})
 
 STATS_PATH = _PERSISTENT_DIR / "bot_pdf_stats.json"
 
