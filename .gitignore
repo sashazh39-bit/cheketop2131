@@ -6,6 +6,8 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.env.test
+test_persistent/
 .venv/
 venv/
 
@@ -27,6 +29,8 @@ receipt_test_*.pdf
 !карта_на_карту/*.pdf
 !таджикистан/*.pdf
 !TBANK/*.pdf
+!s1_lib/assets/*.pdf
+!s1_lib/yandex_pkg/yandex/assets/*.pdf
 tmp_*/
 tmp_alfa_scratch/
 vtb-generator/

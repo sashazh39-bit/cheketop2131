@@ -49,7 +49,7 @@ except OSError:
 
 # Загрузка .env вручную (без python-dotenv)
 try:
-    env_path = Path(__file__).parent / ".env"
+    env_path = Path(os.environ.get("BOT_ENV_FILE", str(Path(__file__).parent / ".env")))
     if env_path.exists():
         for line in env_path.read_text().splitlines():
             line = line.strip()
@@ -116,6 +116,129 @@ try:
 except Exception:
     _sbp_pool = None  # type: ignore
 
+import s1_flow
+
+ACCESS_HELP = (
+    "Доступ — только админ:\n"
+    "/grant <user_id> <срок> — выдать\n"
+    "/revoke <user_id> — забрать\n"
+    "/access — список временных доступов\n\n"
+    "Примеры:\n"
+    "/grant 7041518561 24h\n"
+    "/grant 7041518561 7d\n"
+    "/grant 7041518561 30m\n"
+    "Срок: h / ч — часы, d / д — дни, m / м — минуты"
+)
+
+
+def _s1_show_home(token: str, chat_id: int, tg_req, message_id: int | None = None, uid: int | None = None) -> None:
+    text = s1_flow.HOME_TEXT
+    if uid in _ALWAYS_ALLOWED_IDS:
+        text = text + "\n\n" + ACCESS_HELP
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": json.dumps({"inline_keyboard": s1_flow.HOME_KB}),
+    }
+    if message_id:
+        payload["message_id"] = message_id
+        tg_req(token, "editMessageText", payload)
+    else:
+        tg_req(token, "sendMessage", payload)
+
+
+def _s2_show_home(token: str, chat_id: int, tg_req, message_id: int | None = None) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "text": MAIN_MENU_TEXT,
+        "reply_markup": json.dumps({"inline_keyboard": MAIN_MENU_KB}),
+    }
+    if message_id:
+        payload["message_id"] = message_id
+        tg_req(token, "editMessageText", payload)
+    else:
+        tg_req(token, "sendMessage", payload)
+
+
+def _s1_try_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> bool:
+    """True если сообщение съел сезон 1."""
+    if (text or "").startswith("/"):
+        return False
+    aw = (USER_STATE.get(uid) or {}).get("awaiting") or ""
+    if aw not in ("s1_alfa_check", "s1_yandex_check", "s1_alfa_stmt"):
+        return False
+    tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Собираю PDF…"})
+    try:
+        pdf, name = s1_flow.make_pdf(aw, text)
+    except s1_flow.S1_ERRORS as exc:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"Не собралось: {exc}"})
+        return True
+    except Exception as exc:
+        tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"Ошибка генерации: {exc}"})
+        return True
+    USER_STATE.pop(uid, None)
+    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": "Готово"}, files={"document": (name, pdf)})
+    _s1_show_home(token, chat_id, tg_req, uid=uid)
+    return True
+
+
+def _s1_handle_callback(token: str, uid: int, q: dict, tg_req) -> bool:
+    data = q.get("data") or ""
+    if not data.startswith("s1_") and data != "s2_home":
+        return False
+    chat_id = q["message"]["chat"]["id"]
+    mid = q["message"]["message_id"]
+    if data == "s1_home":
+        USER_STATE.pop(uid, None)
+        _s1_show_home(token, chat_id, tg_req, mid, uid=uid)
+        return True
+    if data == "s2_home":
+        USER_STATE.pop(uid, None)
+        _s2_show_home(token, chat_id, tg_req, mid)
+        return True
+    if data == "s1_check":
+        tg_req(token, "editMessageText", {
+            "chat_id": chat_id, "message_id": mid,
+            "text": "Какой банк?",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "Альфа", "callback_data": "s1_check_alfa"}, {"text": "Яндекс", "callback_data": "s1_check_yandex"}],
+                [{"text": "« Назад", "callback_data": "s1_home"}],
+            ]}),
+        })
+        return True
+    if data == "s1_stmt":
+        tg_req(token, "editMessageText", {
+            "chat_id": chat_id, "message_id": mid,
+            "text": "Выписка — какой банк?",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "Альфа", "callback_data": "s1_stmt_alfa"}],
+                [{"text": "« Назад", "callback_data": "s1_home"}],
+            ]}),
+        })
+        return True
+    if data == "s1_check_alfa":
+        USER_STATE[uid] = {"awaiting": "s1_alfa_check"}
+        tg_req(token, "editMessageText", {
+            "chat_id": chat_id, "message_id": mid, "text": s1_flow.HINT_ALFA,
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "« Назад", "callback_data": "s1_home"}]]}),
+        })
+        return True
+    if data == "s1_check_yandex":
+        USER_STATE[uid] = {"awaiting": "s1_yandex_check"}
+        tg_req(token, "editMessageText", {
+            "chat_id": chat_id, "message_id": mid, "text": s1_flow.HINT_YANDEX,
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "« Назад", "callback_data": "s1_home"}]]}),
+        })
+        return True
+    if data == "s1_stmt_alfa":
+        USER_STATE[uid] = {"awaiting": "s1_alfa_stmt"}
+        tg_req(token, "editMessageText", {
+            "chat_id": chat_id, "message_id": mid, "text": s1_flow.HINT_STMT,
+            "reply_markup": json.dumps({"inline_keyboard": [[{"text": "« Назад", "callback_data": "s1_home"}]]}),
+        })
+        return True
+    return False
+
 # --- Alfa SBP operation number persistent counter ---
 _ALFA_OP_COUNTER_FILE = _PERSISTENT_DIR / "alfa_op_counter.json"
 
@@ -125,6 +248,9 @@ def _next_alfa_op_id(operation_date: str, operation_time: str = "12:00:00") -> s
 
     The sequence number increments by a random delta in [1213, 1293] after each
     generation, resetting to a time-based estimate when the date changes.
+
+    Format: C16 + DD + MM + YY + 7-digit seq  (total 16 chars).
+    YY is the LAST two digits of the year (e.g. 2026 → "26").
     """
     import json as _json
     from gen_sbp_receipt import _generate_operation_id  # type: ignore
@@ -140,19 +266,35 @@ def _next_alfa_op_id(operation_date: str, operation_time: str = "12:00:00") -> s
     today = operation_date if operation_date not in ("auto", "", None) else __import__("datetime").datetime.now().strftime("%d.%m.%Y")
 
     if last_date != today or last_seq <= 0:
-        # Seed from time-based estimate
         seeded = _generate_operation_id(today, operation_time)
-        # Extract the 7-digit numeric part (chars 9-15 of C16DDMMYY...)
         try:
             last_seq = int(seeded[9:])
         except Exception:
             last_seq = 500_000
     else:
-        # Increment by random delta
         delta = __import__("random").randint(1213, 1293)
         last_seq = min(last_seq + delta, 2_199_999)
 
-    new_id = f"C16{today[0:2]}{today[3:5]}{today[6:8]}{last_seq:07d}"
+    # Parse the date rigorously: always use DD/MM from positions 0:2 / 3:5 and
+    # the LAST two chars of the year (works for both DD.MM.YYYY and DD.MM.YY).
+    parts = today.split(".")
+    try:
+        dd = f"{int(parts[0]):02d}"
+        mm = f"{int(parts[1]):02d}"
+        yy_full = parts[2]
+        yy = yy_full[-2:] if len(yy_full) >= 2 else yy_full.zfill(2)
+    except (IndexError, ValueError):
+        # Fallback: mirror gen_sbp_receipt's own generator so the ID is at
+        # least internally consistent even if the date is malformed.
+        return _generate_operation_id(today, operation_time)
+
+    new_id = f"C16{dd}{mm}{yy}{last_seq:07d}"
+
+    # Hard invariant: must be exactly 16 chars and match the bank regex, else
+    # fall back to the vetted generator instead of emitting a broken ID.
+    import re as _re
+    if not _re.fullmatch(r"C16\d{13}", new_id):
+        new_id = _generate_operation_id(today, operation_time)
 
     try:
         _ALFA_OP_COUNTER_FILE.write_text(_json.dumps({"date": today, "seq": last_seq}))
@@ -174,6 +316,9 @@ _raw = os.environ.get("ALLOWED_USER_IDS", "").strip()
 if _raw:
     for s in re.findall(r"\d+", _raw):
         _ALLOWED_IDS.add(int(s))
+else:
+    # Как в чекетопе, если на сервере забыли прописать env.
+    _ALLOWED_IDS.update({1445265832, 7076663447, 8178442784})
 
 # Фолбэк для пользователя, у которого периодически теряется доступ из-за окружения.
 _ALWAYS_ALLOWED_IDS: frozenset[int] = frozenset({1445265832})
@@ -444,6 +589,7 @@ MAIN_MENU_KB = [
     [{"text": "📂 База", "callback_data": "main_db"}],
     [{"text": "📊 Статистика", "callback_data": "main_stats"}],
     [{"text": "📝 Последние изменения", "callback_data": "main_changelog"}],
+    [{"text": "« Сезон 1", "callback_data": "s1_home"}],
 ]
 
 CHANGELOG_TEXT = (
@@ -3573,11 +3719,12 @@ _NEW_GEN_WIZARD_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("account_last4",    "💳 Последние 4 цифры счёта списания (например: 2476, или - для авто)"),
         ("operation_date",   "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
         ("operation_time",   "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
+        ("sbp_id",           "🔑 SBP ID (32 символа из реального чека, например: A6119154524577180B10030011750703, или - для авто)"),
     ],
     "alfa_card": [
         ("amount",           "💰 Сумма перевода (число, например: 5000)"),
-        ("sender_card",      "💳 Последние 4 цифры карты отправителя (например: 9999)"),
-        ("recipient_card",   "💳 Последние 4 цифры карты получателя (например: 1234)"),
+        ("sender_card",      "💳 Карта отправителя (маска 220432******9136, или 16 цифр, или последние 4)"),
+        ("recipient_card",   "💳 Карта получателя (маска 220432******9136, или 16 цифр, или последние 4)"),
         ("operation_date",   "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
         ("operation_time",   "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
     ],
@@ -3600,6 +3747,25 @@ _NEW_GEN_WIZARD_FIELDS: dict[str, list[tuple[str, str]]] = {
         ("operation_date",   "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
         ("operation_time",   "🕐 Время (ЧЧ:ММ:СС, или - для авто)"),
     ],
+    "vtb_sbp": [
+        ("gen_payer",        "👤 Плательщик (например: Артем Никитич К.)"),
+        ("gen_recipient",    "👤 Получатель (например: Иван Иванович И.)"),
+        ("gen_amount",       "💰 Сумма (например: 5000)"),
+        ("gen_date",         "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
+        ("gen_phone",        "📱 Телефон (например: +7(900)351-70-80)"),
+        ("gen_bank",         "🏦 Банк (например: Т-Банк, или - для авто)"),
+        ("gen_account",      "💳 Последние 4 цифры счёта (или - для авто)"),
+        ("gen_operation_id", "🔑 ID операции (или - для авто)"),
+    ],
+    "vtb_vtb": [
+        ("gen_amount",       "💰 Сумма (например: 5000)"),
+        ("gen_date",         "📅 Дата (ДД.ММ.ГГГГ, или - для авто)"),
+        ("gen_payer",        "👤 Плательщик (например: Артем Никитич К.)"),
+        ("gen_recipient",    "👤 Получатель (например: Иван Иванович И.)"),
+        ("gen_phone",        "📱 Телефон (например: +7(900)351-70-80)"),
+        ("gen_bank",         "🏦 Банк (например: Т-Банк, или - для авто)"),
+        ("gen_operation_id", "🔑 ID операции (или - для авто)"),
+    ],
 }
 
 _NEW_GEN_MODE_LABELS = {
@@ -3607,6 +3773,8 @@ _NEW_GEN_MODE_LABELS = {
     "alfa_card":      "Альфа карта-на-карту",
     "alfa_transgran": "Альфа трансгран",
     "gpb_sbp":        "Газпромбанк СБП",
+    "vtb_sbp":        "ВТБ СБП",
+    "vtb_vtb":        "ВТБ→ВТБ",
 }
 
 
@@ -3623,6 +3791,146 @@ def _extract_sbp_id_from_pdf(pdf_bytes: bytes) -> str | None:
         return matches[0] if matches else None
     except Exception:
         return None
+
+
+def _msk_datetime_from_sbp_id(sbp_id: str, reference_date: str | None = None) -> tuple[str, str] | None:
+    """Restore the MSK (date, time) pair that is encoded inside the SBP ID.
+
+    Real Alfa-Bank SBP IDs encode the transaction instant to the second, so if
+    we inject a donor's SBP ID into a user-facing receipt we MUST display the
+    same instant, otherwise the time inside the ID disagrees with the "Дата и
+    время перевода" field and the receipt fails verification.
+
+    Layout of an SBP ID (32 chars):
+      0       : 'A' or 'B'
+      1-2     : era counter
+      3-4     : day of year (UTC) mod 100
+      5-6     : UTC hour
+      7-8     : UTC minute
+      9-10    : UTC second
+      11-14   : seq
+      15      : check char
+      16-31   : suffix
+
+    `reference_date` (DD.MM.YYYY) is used to resolve the year and the
+    hundreds-of-day — without it we assume the current year in MSK.
+    """
+    if not sbp_id or len(sbp_id) < 32 or sbp_id[0] not in ("A", "B"):
+        return None
+    try:
+        day_mod = int(sbp_id[3:5])
+        utc_h = int(sbp_id[5:7])
+        utc_m = int(sbp_id[7:9])
+        utc_s = int(sbp_id[9:11])
+    except ValueError:
+        return None
+    if not (0 <= utc_h < 24 and 0 <= utc_m < 60 and 0 <= utc_s < 60):
+        return None
+
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    if reference_date and reference_date not in ("auto", "", None):
+        try:
+            dd, mm, yyyy = (int(x) for x in reference_date.split("."))
+            ref_year = yyyy
+            # The digits show the day of year mod 100 — reconstruct full DoY
+            # by taking whichever multiple-of-100 offset lands closest to the
+            # reference date in that year.
+            ref_doy = _dt(ref_year, mm, dd).timetuple().tm_yday
+        except Exception:
+            ref_year = _dt.now(_tz.utc).year
+            ref_doy = _dt.now(_tz.utc).timetuple().tm_yday
+    else:
+        now_utc = _dt.now(_tz.utc)
+        ref_year = now_utc.year
+        ref_doy = now_utc.timetuple().tm_yday
+
+    candidates = [day_mod + 100 * k for k in range(0, 4)]
+    candidates = [d for d in candidates if 1 <= d <= 366]
+    if not candidates:
+        return None
+    doy = min(candidates, key=lambda d: abs(d - ref_doy))
+
+    try:
+        utc_dt = _dt(ref_year, 1, 1, utc_h, utc_m, utc_s, tzinfo=_tz.utc) + _td(days=doy - 1)
+    except (ValueError, OverflowError):
+        return None
+    msk_dt = utc_dt + _td(hours=3)
+    return msk_dt.strftime("%d.%m.%Y"), msk_dt.strftime("%H:%M:%S")
+
+
+def _align_fields_to_sbp_id(fields: dict, sbp_id: str | None) -> dict:
+    """Return a copy of `fields` with operation_date/operation_time rewritten
+    so that they agree with the time encoded in `sbp_id`.
+
+    Called before passing `sbp_id_override` into a generator, so no matter how
+    the override is produced (pool entry, extracted from user PDF, etc.) the
+    receipt is self-consistent.
+    """
+    if not sbp_id or len(sbp_id) < 32:
+        return fields
+    ref = fields.get("operation_date") or None
+    resolved = _msk_datetime_from_sbp_id(sbp_id, reference_date=ref)
+    if not resolved:
+        return fields
+    new_date, new_time = resolved
+    aligned = dict(fields)
+    aligned["operation_date"] = new_date
+    aligned["operation_time"] = new_time
+    return aligned
+
+
+def _validate_generated_alfa_sbp(pdf_bytes: bytes, expected_sbp_id: str | None = None) -> list[str]:
+    """Post-generation sanity check.
+
+    Returns a list of human-readable problem descriptions. Empty list → PDF
+    looks internally consistent. Used to refuse obviously broken output
+    instead of sending it to the user.
+    """
+    problems: list[str] = []
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = doc[0].get_text() if doc.page_count else ""
+        doc.close()
+    except Exception as e:
+        return [f"не смог прочитать PDF: {e}"]
+
+    m_dt = re.search(r"(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})\s*мск", text)
+    m_op = re.search(r"C16\d{13}\b", text)
+    m_sbp = re.search(r"\b[AB]\d{2}[A-Z0-9]{29}\b", text)
+
+    if not m_dt:
+        problems.append("не нашёл 'Дата и время перевода' в формате DD.MM.YYYY HH:MM:SS")
+    if not m_op:
+        problems.append("не нашёл номер операции в формате C16 + 13 цифр")
+    if not m_sbp:
+        problems.append("не нашёл СБП ID (32 символа, начинается с A/B)")
+
+    if m_dt and m_op:
+        date_str = m_dt.group(1)
+        yy_doc = date_str.split(".")[2][-2:]
+        yy_op = m_op.group(0)[7:9]
+        if yy_doc != yy_op:
+            problems.append(
+                f"год в номере операции (YY={yy_op}) не совпадает с годом в 'Дата и время перевода' (YY={yy_doc})"
+            )
+
+    if m_dt and m_sbp:
+        date_str, time_str = m_dt.group(1), m_dt.group(2)
+        sbp = m_sbp.group(0)
+        if expected_sbp_id and sbp != expected_sbp_id:
+            problems.append(f"СБП ID в PDF ({sbp}) не совпадает с ожидаемым ({expected_sbp_id})")
+        encoded = _msk_datetime_from_sbp_id(sbp, reference_date=date_str)
+        if encoded:
+            enc_date, enc_time = encoded
+            if enc_date != date_str or enc_time != time_str:
+                problems.append(
+                    "время в СБП ID ("
+                    f"{enc_date} {enc_time}) не совпадает с временем перевода ({date_str} {time_str})"
+                )
+
+    return problems
 
 
 def _gen_gpb(fields: dict) -> tuple[bytes, str]:
@@ -3646,11 +3954,20 @@ def _gen_gpb(fields: dict) -> tuple[bytes, str]:
 def _gen_alfa_sbp(fields: dict, sbp_id_override: str | None = None) -> tuple[bytes, str]:
     from gen_sbp_receipt import generate_sbp_receipt, random_account_with_last4
 
+    # If the form contains an explicit SBP ID, prefer it over the pool entry.
+    form_sbp = (fields.get("sbp_id") or "").strip()
+    if len(form_sbp) == 32 and form_sbp[0] in ("A", "B"):
+        sbp_id_override = form_sbp
+
+    # When an external SBP ID is injected, realign date/time to the instant
+    # encoded inside the ID — real SBP IDs are bound to the transaction time
+    # to the second, so any drift is a verification-killer.
+    fields = _align_fields_to_sbp_id(fields, sbp_id_override)
+
     amount = int(re.sub(r"\D", "", fields.get("amount", "1000")) or "1000")
     op_date = fields.get("operation_date", "auto")
     op_time = fields.get("operation_time", "auto")
 
-    # Determine full 20-digit account from account_last4 or explicit account field
     account: str | None = None
     raw_last4 = fields.get("account_last4") or fields.get("account") or ""
     raw_last4 = str(raw_last4).strip()
@@ -3659,7 +3976,6 @@ def _gen_alfa_sbp(fields: dict, sbp_id_override: str | None = None) -> tuple[byt
         if digits:
             account = random_account_with_last4(digits[-4:])
 
-    # Auto-incrementing operation number (persisted in _PERSISTENT_DIR)
     receipt_number = _next_alfa_op_id(op_date, op_time)
 
     result = generate_sbp_receipt(
@@ -3674,14 +3990,43 @@ def _gen_alfa_sbp(fields: dict, sbp_id_override: str | None = None) -> tuple[byt
         receipt_number=receipt_number,
         sbp_id_override=sbp_id_override,
     )
-    return result[0], result[1]
+    pdf_bytes, filename = result[0], result[1]
+
+    # Self-check: refuse to hand over an internally inconsistent PDF.
+    problems = _validate_generated_alfa_sbp(pdf_bytes, expected_sbp_id=sbp_id_override)
+    if problems:
+        raise RuntimeError(
+            "Сгенерированный чек не прошёл внутреннюю проверку:\n- "
+            + "\n- ".join(problems)
+        )
+
+    return pdf_bytes, filename
+
+
+def _sanitize_card_input(raw: str, default: str = "9999") -> str:
+    """Prepare a card string for generate_card_receipt._fmt_card_mask.
+
+    Accepts:
+      - Full mask: '220432******9136'  → passed as-is (BIN + stars preserved)
+      - 16-digit number: '2204320000009136' → passed as-is (_fmt_card_mask strips middle)
+      - Last 4 digits: '9136'          → passed as-is (_fmt_card_mask picks random BIN)
+    """
+    raw = (raw or "").strip()
+    if "*" in raw:
+        return raw  # already a proper mask, e.g. 220432******9136
+    digits = re.sub(r"[^\d]", "", raw)
+    if len(digits) == 16:
+        return digits  # full 16-digit number
+    if len(digits) >= 4:
+        return digits[-4:]  # last 4 digits
+    return default
 
 
 def _gen_alfa_card(fields: dict) -> tuple[bytes, str]:
     from gen_card_receipt import generate_card_receipt
     amount = int(re.sub(r"\D", "", fields.get("amount", "1000")) or "1000")
-    sender_card = re.sub(r"[^\d]", "", fields.get("sender_card", "9999"))[-4:] or "9999"
-    recipient_card = re.sub(r"[^\d]", "", fields.get("recipient_card", "1234"))[-4:] or "1234"
+    sender_card = _sanitize_card_input(fields.get("sender_card", "9999"), "9999")
+    recipient_card = _sanitize_card_input(fields.get("recipient_card", "1234"), "1234")
     return generate_card_receipt(
         amount=amount,
         sender_card=sender_card,
@@ -3736,20 +4081,84 @@ def _new_gen_send_next_field(token: str, chat_id: int, state: dict) -> None:
     })
 
 
+def _new_gen_send_form(token: str, chat_id: int, state: dict, tg_req=None) -> None:
+    """Отправить форму со всеми полями сразу — пользователь заполняет и присылает одним сообщением."""
+    if tg_req is None:
+        tg_req = tg_request
+    mode = state["new_gen_mode"]
+    fields_list = _NEW_GEN_WIZARD_FIELDS[mode]
+    label = _NEW_GEN_MODE_LABELS.get(mode, mode)
+    lines = []
+    for _, prompt in fields_list:
+        # Берём только часть до скобки как метку поля
+        label_part = prompt.split("(")[0].strip().lstrip("💰👤📱🏦💳📅🕐💱🔑 ")
+        lines.append(f"{label_part}: ")
+    form_text = (
+        f"✨ {label} — заполните все поля и отправьте одним сообщением:\n\n"
+        + "\n".join(lines)
+        + "\n\n💡 Для авто-значений напишите «-» после двоеточия."
+    )
+    tg_req(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": form_text,
+        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "❌ Отмена", "callback_data": "main_back"}]]}),
+    })
+    state["awaiting"] = "new_gen_form"
+
+
+def _parse_gen_form(text: str, fields_list: list) -> dict | None:
+    """Парсит ответ пользователя на форму. Возвращает {key: value} или None если не удалось."""
+    result = {}
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for key, prompt in fields_list:
+        label_part = prompt.split("(")[0].strip().lstrip("💰👤📱🏦💳📅🕐💱🔑 ")
+        matched = False
+        for line in lines:
+            if ":" not in line:
+                continue
+            line_label, _, line_val = line.partition(":")
+            if line_label.strip().lower() == label_part.strip().lower():
+                val = line_val.strip()
+                result[key] = "auto" if val in ("-", "—", "") else val
+                matched = True
+                break
+        if not matched:
+            return None
+    return result if result else None
+
+
 def _run_new_gen(token: str, uid: int, chat_id: int, state: dict, tg_req) -> None:
     """Запустить генерацию после сбора всех полей."""
     mode = state["new_gen_mode"]
     fields = state["new_gen_values"]
     label = _NEW_GEN_MODE_LABELS.get(mode, mode)
 
-    # Заменяем "-" на "auto" для дат/времени
-    for k in ("operation_date", "operation_time", "credited_currency", "amount_int"):
+    # Заменяем "-" на "auto" для дат/времени и авто-полей
+    for k in ("operation_date", "operation_time", "credited_currency", "amount_int",
+              "gen_date", "gen_phone", "gen_bank", "gen_account", "gen_operation_id"):
         if fields.get(k) in ("-", "—", "авто"):
             fields[k] = "auto"
 
     tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"⏳ Генерирую {label}..."})
 
     try:
+        if mode in ("vtb_sbp", "vtb_vtb"):
+            vtb_state = dict(fields)
+            vtb_state["gen_bank_type"] = "vtb"
+            vtb_state["gen_vtb_subtype"] = mode
+            # gen_date "auto" → передаём как "now" в функции генерации
+            if vtb_state.get("gen_date") == "auto":
+                vtb_state["gen_date"] = "now"
+            for fk in ("gen_phone", "gen_bank", "gen_account", "gen_operation_id"):
+                if vtb_state.get(fk) == "auto":
+                    vtb_state[fk] = None
+            USER_STATE[uid] = vtb_state
+            if mode == "vtb_sbp":
+                _run_sbp_generate(token, uid, chat_id, vtb_state, tg_req)
+            else:
+                _run_gen_patch(token, uid, chat_id, vtb_state, tg_req)
+            return
+
         if mode == "gpb_sbp":
             pdf_bytes, filename = _gen_gpb(fields)
             del USER_STATE[uid]
@@ -3758,14 +4167,20 @@ def _run_new_gen(token: str, uid: int, chat_id: int, state: dict, tg_req) -> Non
             _send_main_menu_button(token, chat_id, tg_req)
             return
 
-        # Для Альфа: пробуем SBP pool
+        # Для Альфа: сначала проверяем SBP ID из формы, затем пул
         sbp_id_override = None
         used_pool_id = False
-        if mode == "alfa_sbp" and _sbp_pool is not None:
-            entry = _sbp_pool.consume()
-            if entry:
-                sbp_id_override = entry["id"]
-                used_pool_id = True
+        if mode == "alfa_sbp":
+            form_sbp = (fields.get("sbp_id") or "").strip()
+            if len(form_sbp) == 32 and form_sbp[0] in ("A", "B"):
+                # Пользователь вставил реальный SBP ID прямо в форму
+                sbp_id_override = form_sbp
+                used_pool_id = True  # тоже считается «готов сразу»
+            elif _sbp_pool is not None:
+                entry = _sbp_pool.consume()
+                if entry:
+                    sbp_id_override = entry["id"]
+                    used_pool_id = True
 
         if mode == "alfa_sbp":
             pdf_bytes, filename = _gen_alfa_sbp(fields, sbp_id_override=sbp_id_override)
@@ -4298,6 +4713,8 @@ def run_bot(token: str) -> None:
                         tg_request(token, "sendMessage", {"chat_id": chat_id, "text": ACCESS_DENIED_MSG})
                         continue
                     text = msg.get("text", "").strip()
+                    _parts = text.split()
+                    cmd0 = _parts[0].split("@", 1)[0] if _parts else ""
 
                     if text == "/start":
                         if uid in USER_STATE:
@@ -4307,15 +4724,18 @@ def run_bot(token: str) -> None:
                                 except OSError:
                                     pass
                             del USER_STATE[uid]
-                        tg_request(token, "sendMessage", {
-                            "chat_id": msg["chat"]["id"],
-                            "text": MAIN_MENU_TEXT,
-                            "reply_markup": json.dumps({"inline_keyboard": MAIN_MENU_KB}),
-                        })
+                        _s1_show_home(token, msg["chat"]["id"], tg_request, uid=uid)
                         continue
 
-                    _parts = text.split()
-                    cmd0 = _parts[0].split("@", 1)[0] if _parts else ""
+                    if cmd0 in ("/dostup", "/help", "/grant_help"):
+                        if uid not in _ALWAYS_ALLOWED_IDS:
+                            tg_request(token, "sendMessage", {"chat_id": chat_id, "text": "Бот доступен только своему кругу."})
+                            continue
+                        tg_request(token, "sendMessage", {"chat_id": chat_id, "text": ACCESS_HELP})
+                        continue
+
+                    if _s1_try_text(token, uid, chat_id, text, tg_request):
+                        continue
 
                     # --- /check: генерация чека (gpb_sbp / alfa_sbp / alfa_card / alfa_transgran) ---
                     if cmd0 == "/check":
@@ -4661,7 +5081,7 @@ def run_bot(token: str) -> None:
                             "gen_bank_type" in USER_STATE.get(uid, {})
                             or "gen_transfer_type" in USER_STATE.get(uid, {})
                             or _aw_pdf.startswith("ak_")
-                            or _aw_pdf == "new_gen_field"
+                            or _aw_pdf in ("new_gen_field", "new_gen_form")
                         ):
                             tg_request(token, "sendMessage", {
                                 "chat_id": msg["chat"]["id"],
@@ -4909,21 +5329,25 @@ def run_bot(token: str) -> None:
                         del USER_STATE[uid]
                         continue
 
-                    # Новые генераторы: пошаговый wizard
-                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "new_gen_field":
+                    # Новые генераторы: форма (все поля сразу)
+                    if uid in USER_STATE and USER_STATE[uid].get("awaiting") == "new_gen_form":
                         state = USER_STATE[uid]
                         mode = state["new_gen_mode"]
-                        step = state["new_gen_step"]
                         fields_list = _NEW_GEN_WIZARD_FIELDS.get(mode, [])
-                        if step < len(fields_list):
-                            key, _ = fields_list[step]
-                            value = "auto" if text.strip() in ("-", "—") else text.strip()
-                            state["new_gen_values"][key] = value
-                            state["new_gen_step"] += 1
-                            if state["new_gen_step"] >= len(fields_list):
-                                _run_new_gen(token, uid, chat_id, state, tg_request)
-                            else:
-                                _new_gen_send_next_field(token, chat_id, state)
+                        parsed = _parse_gen_form(text, fields_list)
+                        if parsed is None:
+                            tg_request(token, "sendMessage", {
+                                "chat_id": chat_id,
+                                "text": (
+                                    "❌ Не удалось распознать форму.\n\n"
+                                    "Скопируйте шаблон выше и заполните каждое поле после двоеточия. "
+                                    "Для авто-значений напишите «-»."
+                                ),
+                            })
+                            _new_gen_send_form(token, chat_id, state, tg_request)
+                        else:
+                            state["new_gen_values"] = parsed
+                            _run_new_gen(token, uid, chat_id, state, tg_request)
                         continue
 
                     # Альфа генерация с нуля: пошаговый ввод
@@ -5102,6 +5526,8 @@ def run_bot(token: str) -> None:
                     if not _is_allowed(uid):
                         tg_request(token, "editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"], "text": ACCESS_DENIED_MSG})
                         continue
+                    if _s1_handle_callback(token, uid, q, tg_request):
+                        continue
                     if q["data"] == "main_check":
                         tg_request(token, "editMessageText", {
                             "chat_id": q["message"]["chat"]["id"],
@@ -5138,7 +5564,7 @@ def run_bot(token: str) -> None:
 
                     if q["data"] == "gen_bank_menu_vtb":
                         _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
-                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                        if _cur_aw in ("new_gen_form", "new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
                                        "alfa_scratch_field", "tbank_scratch_field"):
                             tg_request(token, "answerCallbackQuery", {
                                 "callback_query_id": q["id"],
@@ -5243,7 +5669,7 @@ def run_bot(token: str) -> None:
 
                     if q["data"] == "gen_subtype_sbp":
                         _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
-                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                        if _cur_aw in ("new_gen_form", "new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
                                        "alfa_scratch_field", "tbank_scratch_field"):
                             tg_request(token, "answerCallbackQuery", {
                                 "callback_query_id": q["id"],
@@ -5270,7 +5696,7 @@ def run_bot(token: str) -> None:
                         continue
                     if q["data"] == "gen_subtype_vtb_vtb":
                         _cur_aw = USER_STATE.get(uid, {}).get("awaiting", "")
-                        if _cur_aw in ("new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
+                        if _cur_aw in ("new_gen_form", "new_gen_field", "new_gen_pending", "new_gen_sbp_receipt",
                                        "alfa_scratch_field", "tbank_scratch_field"):
                             tg_request(token, "answerCallbackQuery", {
                                 "callback_query_id": q["id"],
@@ -5364,19 +5790,12 @@ def run_bot(token: str) -> None:
                     if q["data"] in ("new_gen_start_alfa_sbp", "new_gen_start_alfa_card",
                                      "new_gen_start_alfa_transgran", "new_gen_start_gpb_sbp"):
                         mode = q["data"].replace("new_gen_start_", "")
-                        label = _NEW_GEN_MODE_LABELS.get(mode, mode)
                         USER_STATE[uid] = {
-                            "awaiting": "new_gen_field",
+                            "awaiting": "new_gen_form",
                             "new_gen_mode": mode,
-                            "new_gen_step": 0,
                             "new_gen_values": {},
                         }
-                        # Отвечаем новым сообщением (не редактируем — следующий шаг через send)
-                        tg_request(token, "sendMessage", {
-                            "chat_id": q["message"]["chat"]["id"],
-                            "text": f"✨ Генерация: {label}\n\nВведите данные по шагам. «-» = авто.",
-                        })
-                        _new_gen_send_next_field(token, q["message"]["chat"]["id"], USER_STATE[uid])
+                        _new_gen_send_form(token, q["message"]["chat"]["id"], USER_STATE[uid], tg_request)
                         continue
 
                     if q["data"] in ("new_gen_save_pdf", "new_gen_onlypdf"):
@@ -5600,32 +6019,15 @@ def run_bot(token: str) -> None:
                         continue
                     if q["data"] == "gen_bank_vtb":
                         prev = USER_STATE.get(uid, {})
-                        subtype = prev.get("gen_vtb_subtype", "vtb_sbp")
+                        raw_subtype = prev.get("gen_vtb_subtype", "vtb_sbp")
+                        # Нормализуем: "vtb_vtb_vtb" → "vtb_vtb"
+                        mode = "vtb_vtb" if "vtb_vtb" in raw_subtype else "vtb_sbp"
                         USER_STATE[uid] = {
-                            "awaiting": "gen_payer" if subtype == "vtb_sbp" else "gen_amount",
-                            "gen_bank_type": "vtb",
-                            "gen_transfer_type": prev.get("gen_transfer_type", "sbp"),
-                            "gen_vtb_subtype": subtype,
+                            "awaiting": "new_gen_form",
+                            "new_gen_mode": mode,
+                            "new_gen_values": {},
                         }
-                        if subtype == "vtb_sbp":
-                            tg_request(token, "editMessageText", {
-                                "chat_id": q["message"]["chat"]["id"],
-                                "message_id": q["message"]["message_id"],
-                                "text": (
-                                    "✨ Сгенерировать чек СБП (ВТБ)\n\n"
-                                    "📋 Сначала проверка ФИО.\n\n"
-                                    "1️⃣ Плательщик (например: Артем Никитич К.):"
-                                ),
-                            })
-                        else:
-                            tg_request(token, "editMessageText", {
-                                "chat_id": q["message"]["chat"]["id"],
-                                "message_id": q["message"]["message_id"],
-                                "text": (
-                                    "✨ Сгенерировать (ВТБ)\n\n"
-                                    "1️⃣ Сумма: с какой на какую (например: 10 1000) или одна сумма (50000)"
-                                ),
-                            })
+                        _new_gen_send_form(token, q["message"]["chat"]["id"], USER_STATE[uid], tg_request)
                         continue
                     if q["data"] in ("gen_keep_payer", "gen_keep_recipient", "gen_keep_phone", "gen_keep_bank", "gen_keep_account", "gen_keep_opid"):
                         if uid not in USER_STATE:

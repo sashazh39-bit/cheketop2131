@@ -1,0 +1,892 @@
+{
+ "chars": {
+  "(": {
+   "comp_gids": [],
+   "gid": 56,
+   "width": 784
+  },
+  ")": {
+   "comp_gids": [],
+   "gid": 57,
+   "width": 784
+  },
+  "*": {
+   "comp_gids": [],
+   "gid": 84,
+   "width": 1118
+  },
+  "+": {
+   "comp_gids": [],
+   "gid": 49,
+   "width": 1490
+  },
+  ",": {
+   "comp_gids": [],
+   "gid": 41,
+   "width": 620
+  },
+  "-": {
+   "comp_gids": [],
+   "gid": 58,
+   "width": 744
+  },
+  ".": {
+   "comp_gids": [],
+   "gid": 13,
+   "width": 620
+  },
+  "0": {
+   "comp_gids": [],
+   "gid": 11,
+   "width": 1118
+  },
+  "1": {
+   "comp_gids": [],
+   "gid": 18,
+   "width": 1118
+  },
+  "2": {
+   "comp_gids": [],
+   "gid": 15,
+   "width": 1118
+  },
+  "3": {
+   "comp_gids": [],
+   "gid": 14,
+   "width": 1118
+  },
+  "4": {
+   "comp_gids": [],
+   "gid": 43,
+   "width": 1118
+  },
+  "5": {
+   "comp_gids": [],
+   "gid": 12,
+   "width": 1118
+  },
+  "6": {
+   "comp_gids": [],
+   "gid": 16,
+   "width": 1118
+  },
+  "7": {
+   "comp_gids": [],
+   "gid": 50,
+   "width": 1118
+  },
+  "8": {
+   "comp_gids": [],
+   "gid": 36,
+   "width": 1118
+  },
+  "9": {
+   "comp_gids": [],
+   "gid": 44,
+   "width": 1118
+  },
+  ":": {
+   "comp_gids": [],
+   "gid": 17,
+   "width": 724
+  },
+  "=": {
+   "comp_gids": [],
+   "gid": 35,
+   "width": 1490
+  },
+  "A": {
+   "comp_gids": [],
+   "gid": 61,
+   "width": 1228
+  },
+  "B": {
+   "comp_gids": [],
+   "gid": 80,
+   "width": 1207
+  },
+  "C": {
+   "comp_gids": [],
+   "gid": 52,
+   "width": 1230
+  },
+  "D": {
+   "comp_gids": [],
+   "gid": 92,
+   "width": 1389
+  },
+  "E": {
+   "comp_gids": [],
+   "gid": 47,
+   "width": 1149
+  },
+  "F": {
+   "comp_gids": [],
+   "gid": 81,
+   "width": 1068
+  },
+  "G": {
+   "comp_gids": [],
+   "gid": 105,
+   "width": 1367
+  },
+  "H": {
+   "comp_gids": [],
+   "gid": 104,
+   "width": 1383
+  },
+  "I": {
+   "comp_gids": [],
+   "gid": 82,
+   "width": 764
+  },
+  "J": {
+   "comp_gids": [],
+   "gid": 38,
+   "width": 853
+  },
+  "K": {
+   "comp_gids": [],
+   "gid": 109,
+   "width": 1204
+  },
+  "L": {
+   "comp_gids": [],
+   "gid": 106,
+   "width": 1019
+  },
+  "M": {
+   "comp_gids": [],
+   "gid": 95,
+   "width": 1578
+  },
+  "N": {
+   "comp_gids": [],
+   "gid": 91,
+   "width": 1367
+  },
+  "O": {
+   "comp_gids": [],
+   "gid": 72,
+   "width": 1449
+  },
+  "P": {
+   "comp_gids": [],
+   "gid": 96,
+   "width": 1129
+  },
+  "Q": {
+   "comp_gids": [],
+   "gid": 90,
+   "width": 1449
+  },
+  "R": {
+   "comp_gids": [],
+   "gid": 33,
+   "width": 1271
+  },
+  "S": {
+   "comp_gids": [],
+   "gid": 39,
+   "width": 1141
+  },
+  "T": {
+   "comp_gids": [],
+   "gid": 37,
+   "width": 1196
+  },
+  "U": {
+   "comp_gids": [],
+   "gid": 34,
+   "width": 1343
+  },
+  "V": {
+   "comp_gids": [],
+   "gid": 85,
+   "width": 1222
+  },
+  "W": {
+   "comp_gids": [],
+   "gid": 83,
+   "width": 1847
+  },
+  "X": {
+   "comp_gids": [],
+   "gid": 98,
+   "width": 1189
+  },
+  "Y": {
+   "comp_gids": [],
+   "gid": 107,
+   "width": 1180
+  },
+  "Z": {
+   "comp_gids": [],
+   "gid": 89,
+   "width": 1145
+  },
+  "i": {
+   "comp_gids": [],
+   "gid": 99,
+   "width": 468
+  },
+  "j": {
+   "comp_gids": [],
+   "gid": 101,
+   "width": 577
+  },
+  "n": {
+   "comp_gids": [],
+   "gid": 75,
+   "width": 1142
+  },
+  "o": {
+   "comp_gids": [],
+   "gid": 74,
+   "width": 1112
+  },
+  "r": {
+   "comp_gids": [],
+   "gid": 100,
+   "width": 738
+  },
+  "v": {
+   "comp_gids": [],
+   "gid": 102,
+   "width": 1020
+  },
+  "z": {
+   "comp_gids": [],
+   "gid": 73,
+   "width": 910
+  },
+  " ": {
+   "comp_gids": [],
+   "gid": 10,
+   "width": 640
+  },
+  "Ё": {
+   "comp_gids": [
+    138,
+    139
+   ],
+   "gid": 78,
+   "width": 1149
+  },
+  "А": {
+   "comp_gids": [
+    137
+   ],
+   "gid": 76,
+   "width": 1228
+  },
+  "Б": {
+   "comp_gids": [],
+   "gid": 53,
+   "width": 1207
+  },
+  "В": {
+   "comp_gids": [
+    132
+   ],
+   "gid": 67,
+   "width": 1207
+  },
+  "Г": {
+   "comp_gids": [],
+   "gid": 88,
+   "width": 1039
+  },
+  "Д": {
+   "comp_gids": [],
+   "gid": 42,
+   "width": 1400
+  },
+  "Е": {
+   "comp_gids": [
+    140
+   ],
+   "gid": 94,
+   "width": 1149
+  },
+  "Ж": {
+   "comp_gids": [],
+   "gid": 66,
+   "width": 1831
+  },
+  "З": {
+   "comp_gids": [],
+   "gid": 79,
+   "width": 1091
+  },
+  "И": {
+   "comp_gids": [],
+   "gid": 60,
+   "width": 1372
+  },
+  "Й": {
+   "comp_gids": [],
+   "gid": 111,
+   "width": 1372
+  },
+  "К": {
+   "comp_gids": [],
+   "gid": 21,
+   "width": 1234
+  },
+  "Л": {
+   "comp_gids": [],
+   "gid": 87,
+   "width": 1388
+  },
+  "М": {
+   "comp_gids": [
+    133
+   ],
+   "gid": 68,
+   "width": 1578
+  },
+  "Н": {
+   "comp_gids": [
+    126
+   ],
+   "gid": 48,
+   "width": 1383
+  },
+  "О": {
+   "comp_gids": [
+    136
+   ],
+   "gid": 71,
+   "width": 1449
+  },
+  "П": {
+   "comp_gids": [],
+   "gid": 45,
+   "width": 1383
+  },
+  "Р": {
+   "comp_gids": [
+    129
+   ],
+   "gid": 54,
+   "width": 1129
+  },
+  "С": {
+   "comp_gids": [
+    119
+   ],
+   "gid": 1,
+   "width": 1230
+  },
+  "Т": {
+   "comp_gids": [
+    130
+   ],
+   "gid": 59,
+   "width": 1196
+  },
+  "У": {
+   "comp_gids": [],
+   "gid": 103,
+   "width": 1178
+  },
+  "Ф": {
+   "comp_gids": [],
+   "gid": 108,
+   "width": 1533
+  },
+  "Х": {
+   "comp_gids": [
+    141
+   ],
+   "gid": 114,
+   "width": 1189
+  },
+  "Ц": {
+   "comp_gids": [],
+   "gid": 112,
+   "width": 1403
+  },
+  "Ч": {
+   "comp_gids": [],
+   "gid": 86,
+   "width": 1302
+  },
+  "Ш": {
+   "comp_gids": [],
+   "gid": 77,
+   "width": 1932
+  },
+  "Щ": {
+   "comp_gids": [],
+   "gid": 113,
+   "width": 1962
+  },
+  "Ъ": {
+   "comp_gids": [],
+   "gid": 117,
+   "width": 1412
+  },
+  "Ы": {
+   "comp_gids": [],
+   "gid": 115,
+   "width": 1615
+  },
+  "Ь": {
+   "comp_gids": [],
+   "gid": 116,
+   "width": 1193
+  },
+  "Э": {
+   "comp_gids": [],
+   "gid": 97,
+   "width": 1228
+  },
+  "Ю": {
+   "comp_gids": [],
+   "gid": 70,
+   "width": 1948
+  },
+  "Я": {
+   "comp_gids": [],
+   "gid": 93,
+   "width": 1252
+  },
+  "а": {
+   "comp_gids": [
+    122
+   ],
+   "gid": 8,
+   "width": 1075
+  },
+  "б": {
+   "comp_gids": [],
+   "gid": 30,
+   "width": 1126
+  },
+  "в": {
+   "comp_gids": [],
+   "gid": 7,
+   "width": 1074
+  },
+  "г": {
+   "comp_gids": [],
+   "gid": 55,
+   "width": 850
+  },
+  "д": {
+   "comp_gids": [],
+   "gid": 27,
+   "width": 1143
+  },
+  "е": {
+   "comp_gids": [
+    124
+   ],
+   "gid": 26,
+   "width": 1078
+  },
+  "ж": {
+   "comp_gids": [],
+   "gid": 31,
+   "width": 1496
+  },
+  "з": {
+   "comp_gids": [],
+   "gid": 28,
+   "width": 937
+  },
+  "и": {
+   "comp_gids": [],
+   "gid": 6,
+   "width": 1154
+  },
+  "й": {
+   "comp_gids": [
+    134,
+    135
+   ],
+   "gid": 69,
+   "width": 1154
+  },
+  "к": {
+   "comp_gids": [],
+   "gid": 20,
+   "width": 1020
+  },
+  "л": {
+   "comp_gids": [],
+   "gid": 32,
+   "width": 1137
+  },
+  "м": {
+   "comp_gids": [],
+   "gid": 5,
+   "width": 1308
+  },
+  "н": {
+   "comp_gids": [],
+   "gid": 9,
+   "width": 1153
+  },
+  "о": {
+   "comp_gids": [
+    120
+   ],
+   "gid": 3,
+   "width": 1112
+  },
+  "п": {
+   "comp_gids": [],
+   "gid": 25,
+   "width": 1154
+  },
+  "р": {
+   "comp_gids": [
+    121
+   ],
+   "gid": 4,
+   "width": 1132
+  },
+  "с": {
+   "comp_gids": [
+    123
+   ],
+   "gid": 19,
+   "width": 945
+  },
+  "т": {
+   "comp_gids": [],
+   "gid": 22,
+   "width": 956
+  },
+  "у": {
+   "comp_gids": [
+    125
+   ],
+   "gid": 29,
+   "width": 1020
+  },
+  "ф": {
+   "comp_gids": [],
+   "gid": 2,
+   "width": 1556
+  },
+  "х": {
+   "comp_gids": [
+    131
+   ],
+   "gid": 65,
+   "width": 1014
+  },
+  "ц": {
+   "comp_gids": [],
+   "gid": 23,
+   "width": 1171
+  },
+  "ч": {
+   "comp_gids": [],
+   "gid": 40,
+   "width": 1112
+  },
+  "ш": {
+   "comp_gids": [],
+   "gid": 110,
+   "width": 1594
+  },
+  "щ": {
+   "comp_gids": [],
+   "gid": 62,
+   "width": 1618
+  },
+  "ы": {
+   "comp_gids": [],
+   "gid": 64,
+   "width": 1419
+  },
+  "ь": {
+   "comp_gids": [],
+   "gid": 46,
+   "width": 1025
+  },
+  "э": {
+   "comp_gids": [],
+   "gid": 118,
+   "width": 965
+  },
+  "ю": {
+   "comp_gids": [],
+   "gid": 63,
+   "width": 1560
+  },
+  "я": {
+   "comp_gids": [],
+   "gid": 24,
+   "width": 1081
+  },
+  "ё": {
+   "comp_gids": [
+    127,
+    128
+   ],
+   "gid": 51,
+   "width": 1078
+  }
+ },
+ "donor_files": [
+  "AM_1772740244320.pdf",
+  "AM_1772839692838.pdf",
+  "AM_1772846416605.pdf",
+  "AM_1772847127057.pdf",
+  "AM_1772847475034.pdf",
+  "AM_1772859090244.pdf",
+  "AM_1772880830051.pdf",
+  "AM_1772885079877.pdf",
+  "AM_1772886514075.pdf",
+  "AM_1772886845581.pdf",
+  "AM_1772890482136.pdf",
+  "AM_1772892793982.pdf",
+  "AM_1772892873366.pdf",
+  "AM_1772893069317.pdf",
+  "AM_1772893295846.pdf",
+  "AM_1772893775226.pdf",
+  "AM_1772894350735.pdf",
+  "AM_1772897780200.pdf",
+  "AM_1772900079739.pdf",
+  "AM_1772905258824.pdf",
+  "AM_1772906783048.pdf",
+  "AM_1772921240703.pdf",
+  "AM_1774153110015.pdf",
+  "AM_1776247765685.pdf",
+  "AM_1776247796847.pdf",
+  "document07.03.26 02_15_52.771.pdf",
+  "document07.03.26 17_19_04.243.pdf",
+  "document07.03.26 20_22_30.521.pdf",
+  "document07.03.26_10k.pdf",
+  "uzbekistan.pdf",
+  "max_pass_only_id.pdf",
+  "receipt_sbp_full.pdf",
+  "copy1_id_only.pdf",
+  "copy2_id_datetime.pdf",
+  "exp_d1_testA.pdf",
+  "exp_d2_testA.pdf",
+  "exp_d3_testA.pdf",
+  "id_test_A.pdf",
+  "id_test_B.pdf",
+  "iso2_amount.pdf",
+  "iso4_recipient.pdf",
+  "test3_amount_noID.pdf",
+  "test_iso_alfa_0_baseline.pdf",
+  "test_iso_alfa_6_phone.pdf",
+  "test_iso_alfa_7_account.pdf",
+  "test_iso_card_0_baseline.pdf",
+  "test_iso_mobile_3_datetime.pdf",
+  "test_iso_mobile_6_account.pdf",
+  "test_iso_sbp_0_baseline.pdf",
+  "test_iso_sbp_10_message.pdf",
+  "test_iso_sbp_3_datetime.pdf",
+  "test_iso_sbp_8_account.pdf",
+  "test_iso_transgran_0_baseline.pdf",
+  "test_iso_transgran_5_phone.pdf",
+  "tmp_clean_amount.pdf",
+  "document31.03.26 02_45_36.000.pdf",
+  "AM_1772658254522.pdf",
+  "AM_1772662211587.pdf",
+  "AM_1772663712142.pdf",
+  "AM_17726656032122.pdf",
+  "AM_1772696219503.pdf",
+  "AM_1772696219503_new.pdf",
+  "AM_1772713815431.pdf",
+  "AM_1772713815439.pdf",
+  "AM_1772716326236.pdf",
+  "AM_1772726003497.pdf",
+  "AM_1772746144336.pdf",
+  "AM_1772747535580.pdf",
+  "AM_1772750973752.pdf",
+  "AM_1772752398440.pdf",
+  "AM_1772762973082 (1).pdf",
+  "AM_1772770926679.pdf",
+  "AM_1772774200922.pdf",
+  "AM_1775756526108.pdf",
+  "AM_1776098076408.pdf",
+  "AM_1776098085386.pdf",
+  "AM_1776098097103.pdf",
+  "AM_1776098118745.pdf",
+  "AM_1776251777932.pdf",
+  "document05.03.26 18_07_54.371.pdf",
+  "document05.03.26 23_17_50.470.pdf",
+  "document06.03.26 01_53_12.520.pdf",
+  "document06.03.26 02_28_18.664.pdf",
+  "document06.03.26 05_45_34.465.pdf",
+  "document06.03.26 06_55_22.391.pdf",
+  "AM_1772764613521.pdf",
+  "карта карта.pdf",
+  "AM_1772753581485.pdf",
+  "AM_1772755759435.pdf",
+  "document05.03.26 22_29_10.855.pdf",
+  "AM_1772695796208.pdf",
+  "AM_1772710667186.pdf",
+  "document05.03.26 19_04_16.326.pdf",
+  "AM_1772692201985.pdf",
+  "AM_1772693985386.pdf",
+  "AM_1772694038716.pdf",
+  "AM_1772694576533.pdf",
+  "AM_1772706459005.pdf",
+  "AM_1772712409482.pdf",
+  "AM_1772732401160.pdf",
+  "AM_1772733001024.pdf",
+  "AM_1772734180876.pdf",
+  "AM_1772738791283.pdf",
+  "AM_1772741302753.pdf",
+  "AM_1772749766112.pdf",
+  "AM_1772771280153.pdf",
+  "document05.03.26 20_00_56.642.pdf",
+  "document05.03.26 21_12_31.988.pdf",
+  "document06.03.26 06_11_41.755.pdf",
+  "AM_1772742123750.pdf",
+  "document06.03.26 00_35_59.632_1.pdf",
+  "AM_1772889241178.pdf",
+  "AM_1772905258824.pdf",
+  "document07.03.26 20_22_30.521.pdf",
+  "08-03-26_21-44.pdf",
+  "alfa_universal_donor.pdf",
+  "Профиль 1 платеж2.pdf",
+  "профиль 7 1платеж.pdf",
+  "AM_17726637121421.pdf",
+  "AM_1772882097405.pdf",
+  "AM_1772885589226.pdf",
+  "AM_1772731159601.pdf",
+  "AM_1772641049914.pdf",
+  "AM_1772693176835.pdf",
+  "AM_1772715769202.pdf",
+  "AM_1772762973082.pdf",
+  "AM_1772763093048.pdf",
+  "AM_1772788794599.pdf",
+  "document06.03.26 00_22_11.544.pdf",
+  "document06.03.26 00_23_10.896.pdf",
+  "document06.03.26 02_02_30.089.pdf"
+ ],
+ "donors": 131,
+ "num_glyphs": 142,
+ "sources": {
+  "(": "AM_1772839692838.pdf",
+  ")": "AM_1772839692838.pdf",
+  "*": "AM_1772893069317.pdf",
+  "+": "AM_1772740244320.pdf",
+  ",": "AM_1772740244320.pdf",
+  "-": "AM_1772839692838.pdf",
+  ".": "AM_1772740244320.pdf",
+  "0": "AM_1772740244320.pdf",
+  "1": "AM_1772740244320.pdf",
+  "2": "AM_1772740244320.pdf",
+  "3": "AM_1772740244320.pdf",
+  "4": "AM_1772740244320.pdf",
+  "5": "AM_1772740244320.pdf",
+  "6": "AM_1772740244320.pdf",
+  "7": "AM_1772740244320.pdf",
+  "8": "AM_1772740244320.pdf",
+  "9": "AM_1772740244320.pdf",
+  ":": "AM_1772740244320.pdf",
+  "=": "AM_1772740244320.pdf",
+  "A": "AM_1772839692838.pdf",
+  "B": "AM_1772886514075.pdf",
+  "C": "AM_1772740244320.pdf",
+  "D": "AM_1774153110015.pdf",
+  "E": "AM_1772740244320.pdf",
+  "F": "AM_1772886514075.pdf",
+  "G": "test_iso_sbp_0_baseline.pdf",
+  "H": "test_iso_card_0_baseline.pdf",
+  "I": "AM_1772886845581.pdf",
+  "J": "AM_1772740244320.pdf",
+  "K": "AM_1772716326236.pdf",
+  "L": "test_iso_transgran_0_baseline.pdf",
+  "M": "document07.03.26 02_15_52.771.pdf",
+  "N": "AM_1774153110015.pdf",
+  "O": "AM_1772847475034.pdf",
+  "P": "document07.03.26 17_19_04.243.pdf",
+  "Q": "AM_1774153110015.pdf",
+  "R": "AM_1772740244320.pdf",
+  "S": "AM_1772740244320.pdf",
+  "T": "AM_1772740244320.pdf",
+  "U": "AM_1772740244320.pdf",
+  "V": "AM_1772894350735.pdf",
+  "W": "AM_1772892793982.pdf",
+  "X": "document07.03.26 20_22_30.521.pdf",
+  "Y": "test_iso_transgran_0_baseline.pdf",
+  "Z": "AM_1774153110015.pdf",
+  "i": "uzbekistan.pdf",
+  "j": "uzbekistan.pdf",
+  "n": "AM_1772847475034.pdf",
+  "o": "AM_1772847475034.pdf",
+  "r": "uzbekistan.pdf",
+  "v": "uzbekistan.pdf",
+  "z": "AM_1772847475034.pdf",
+  " ": "AM_1772740244320.pdf",
+  "Ё": "AM_1772885079877.pdf",
+  "А": "AM_1772859090244.pdf",
+  "Б": "AM_1772839692838.pdf",
+  "В": "AM_1772846416605.pdf",
+  "Г": "AM_1772905258824.pdf",
+  "Д": "AM_1772740244320.pdf",
+  "Е": "AM_1776247765685.pdf",
+  "Ж": "AM_1772846416605.pdf",
+  "З": "AM_1772886514075.pdf",
+  "И": "AM_1772839692838.pdf",
+  "Й": "alfa_universal_donor.pdf",
+  "К": "AM_1772740244320.pdf",
+  "Л": "AM_1772900079739.pdf",
+  "М": "AM_1772847127057.pdf",
+  "Н": "AM_1772740244320.pdf",
+  "О": "AM_1772847475034.pdf",
+  "П": "AM_1772740244320.pdf",
+  "Р": "AM_1772839692838.pdf",
+  "С": "AM_1772740244320.pdf",
+  "Т": "AM_1772839692838.pdf",
+  "У": "uzbekistan.pdf",
+  "Ф": "AM_1772663712142.pdf",
+  "Х": "alfa_universal_donor.pdf",
+  "Ц": "alfa_universal_donor.pdf",
+  "Ч": "AM_1772897780200.pdf",
+  "Ш": "AM_1772880830051.pdf",
+  "Щ": "alfa_universal_donor.pdf",
+  "Ъ": "alfa_universal_donor.pdf",
+  "Ы": "alfa_universal_donor.pdf",
+  "Ь": "alfa_universal_donor.pdf",
+  "Э": "document07.03.26 20_22_30.521.pdf",
+  "Ю": "AM_1772847475034.pdf",
+  "Я": "AM_1776247765685.pdf",
+  "а": "AM_1772740244320.pdf",
+  "б": "AM_1772740244320.pdf",
+  "в": "AM_1772740244320.pdf",
+  "г": "AM_1772839692838.pdf",
+  "д": "AM_1772740244320.pdf",
+  "е": "AM_1772740244320.pdf",
+  "ж": "AM_1772740244320.pdf",
+  "з": "AM_1772740244320.pdf",
+  "и": "AM_1772740244320.pdf",
+  "й": "AM_1772847127057.pdf",
+  "к": "AM_1772740244320.pdf",
+  "л": "AM_1772740244320.pdf",
+  "м": "AM_1772740244320.pdf",
+  "н": "AM_1772740244320.pdf",
+  "о": "AM_1772740244320.pdf",
+  "п": "AM_1772740244320.pdf",
+  "р": "AM_1772740244320.pdf",
+  "с": "AM_1772740244320.pdf",
+  "т": "AM_1772740244320.pdf",
+  "у": "AM_1772740244320.pdf",
+  "ф": "AM_1772740244320.pdf",
+  "х": "AM_1772839692838.pdf",
+  "ц": "AM_1772740244320.pdf",
+  "ч": "AM_1772740244320.pdf",
+  "ш": "AM_1772692201985.pdf",
+  "щ": "AM_1772839692838.pdf",
+  "ы": "AM_1772839692838.pdf",
+  "ь": "AM_1772740244320.pdf",
+  "э": "alfa_universal_donor.pdf",
+  "ю": "AM_1772839692838.pdf",
+  "я": "AM_1772740244320.pdf",
+  "ё": "AM_1772740244320.pdf"
+ }
+}
