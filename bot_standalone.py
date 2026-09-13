@@ -169,7 +169,10 @@ def _s1_try_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> bool:
         return False
     tg_req(token, "sendMessage", {"chat_id": chat_id, "text": "⏳ Собираю PDF…"})
     try:
-        pdf, name = s1_flow.make_pdf(aw, text)
+        if aw == "s1_yandex_check":
+            files = s1_flow.make_yandex_pdfs(text)
+        else:
+            files = [s1_flow.make_pdf(aw, text)]
     except s1_flow.S1_ERRORS as exc:
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"Не собралось: {exc}"})
         return True
@@ -177,7 +180,20 @@ def _s1_try_text(token: str, uid: int, chat_id: int, text: str, tg_req) -> bool:
         tg_req(token, "sendMessage", {"chat_id": chat_id, "text": f"Ошибка генерации: {exc}"})
         return True
     USER_STATE.pop(uid, None)
-    tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": "Готово"}, files={"document": (name, pdf)})
+    if aw == "s1_yandex_check" and len(files) > 1:
+        tg_req(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "Три варианта с разными номерами квитанции. "
+                    "Fraudex иногда бракует сам номер — проверяй по очереди.",
+        })
+        for i, (pdf, name) in enumerate(files, 1):
+            tg_req(token, "sendDocument",
+                   {"chat_id": chat_id, "caption": f"Вариант {i}/3"},
+                   files={"document": (name, pdf)})
+    else:
+        pdf, name = files[0]
+        tg_req(token, "sendDocument", {"chat_id": chat_id, "caption": "Готово"},
+               files={"document": (name, pdf)})
     _s1_show_home(token, chat_id, tg_req, uid=uid)
     return True
 

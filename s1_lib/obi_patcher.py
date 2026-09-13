@@ -213,6 +213,26 @@ def _update_length(pdf: bytes, start: int, end: int, new_len: int) -> bytes:
     return pdf[:start] + str(new_len).encode() + pdf[end:]
 
 
+def _update_length1(pdf: bytes, stream_data_start: int,
+                    uncompressed_len: int) -> tuple[bytes, int]:
+    """Set /Length1 in the font dict immediately before `stream`.
+
+    Returns (pdf, byte_delta). No-op when the key is absent or already correct.
+    """
+    window_start = max(0, stream_data_start - 400)
+    window = pdf[window_start:stream_data_start]
+    m = re.search(rb"/Length1\s+(\d+)", window)
+    if not m:
+        return pdf, 0
+    old = m.group(0)
+    new = b"/Length1 %d" % uncompressed_len
+    if old == new:
+        return pdf, 0
+    abs_start = window_start + m.start()
+    pdf = pdf[:abs_start] + new + pdf[abs_start + len(old):]
+    return pdf, len(new) - len(old)
+
+
 def _fix_xref(pdf: bytes, delta: int, start_offset: int) -> bytes:
     xref_start = pdf.rfind(b"xref")
     if xref_start == -1:
@@ -320,13 +340,13 @@ def _rebuild_xref_table(pdf: bytes, style: Optional[str] = None) -> bytes:
     return pdf[:xref_start] + new_table + trailer
 
 
-def _patch_docid_moddate(pdf: bytes, receipt_datetime: Optional[str] = None) -> bytes:
-    """Fully randomize /ID (both entries identical, matching OBI convention),
-    update /CreationDate and /ModDate to the receipt's actual date/time.
+def _patch_docid_moddate(pdf: bytes, receipt_datetime: Optional[str] = None,
+                         style: Optional[str] = None) -> bytes:
+    """Randomize /ID and stamp /CreationDate + /ModDate.
 
-    The original template /ID is a unique fingerprint that fraud checkers
-    use to identify known-forged PDFs.  Replacing both entries with fresh
-    random bytes ensures each generated PDF has a unique, unrecognizable ID.
+    OBI receipts keep both /ID halves identical. iText statements assign a
+    different ID[1] when they touch the file. Mixing the two styles is a
+    forensic tell.
 
     receipt_datetime: optional 'DD.MM.YYYY HH:MM:SS' string extracted from
         the receipt content.  Used to set realistic /CreationDate and /ModDate.
@@ -334,13 +354,13 @@ def _patch_docid_moddate(pdf: bytes, receipt_datetime: Optional[str] = None) -> 
     import os
     from datetime import datetime, timezone, timedelta
 
+    if style is None:
+        style = "itext" if b"/ITXT" in pdf else "obi"
+
     # --- Generate fresh random /ID ---
-    # Oracle BI Publisher sets ID[0] at creation; iText 4.2.0 (which post-
-    # processes genuine Alfa Bank statements) assigns a *different* ID[1]
-    # when it modifies the file.  Using two identical IDs is a detectable
-    # forensic signal — generate two independent 16-byte random values.
-    id0_hex = os.urandom(16).hex().lower().encode()  # OBI original ID
-    id1_hex = os.urandom(16).hex().lower().encode()  # iText-assigned ID
+    id0_hex = os.urandom(16).hex().lower().encode()
+    id1_hex = (os.urandom(16).hex().lower().encode() if style == "itext"
+               else id0_hex)
     new_id_hex = id0_hex  # keep for logging
 
     # Match the FULL /ID entry including the closing >] to avoid leaving
@@ -1436,6 +1456,10 @@ def _rebuild_font_and_remap(pdf_bytes: bytes, tahoma_path: Optional[str] = None)
             pdf_bytes = _update_length(pdf_bytes, adj_ls, adj_le, len(new_raw))
             ld = len(str(len(new_raw)).encode()) - len(str(len(raw)).encode())
             total_delta += len(new_raw) - len(raw) + ld
+            # /Length1 is the uncompressed TTF size; leaving the donor's
+            # value after a rebuild is a length-lie Fraudex flags.
+            pdf_bytes, l1d = _update_length1(pdf_bytes, adj_ds, len(new_font_bytes))
+            total_delta += l1d
             font_done = True
             logger.debug("_rebuild: replaced font stream (%d bytes compressed)", len(new_raw))
             continue
@@ -1723,6 +1747,8 @@ def obi_patch_pdf(
         pdf_bytes = _update_length(pdf_bytes, adj_len_start, adj_len_end, new_len)
         len_delta = len(new_len_bytes) - len(old_len_bytes)
         total_delta += delta + len_delta
+        pdf_bytes, l1d = _update_length1(pdf_bytes, adj_data_start, len(clean_font))
+        total_delta += l1d
         if first_change_offset is None:
             first_change_offset = fi["data_start"]
         logger.info("Restored clean font stream (%d bytes)", len(clean_font))
@@ -1731,12 +1757,11 @@ def obi_patch_pdf(
         pdf_bytes = _fix_xref(pdf_bytes, total_delta, first_change_offset)
         pdf_bytes = _update_startxref(pdf_bytes)
 
-    # --- Full font rebuild: sequential GIDs, no gaps, single CMap block ------
-    # Replaces the old orphan-removal + /BaseFont patching steps.
-    # _rebuild_font_and_remap creates a fresh Tahoma subset for exactly the
-    # characters used in the final document, assigns sequential GIDs 0,1,2,...
-    # (identical to what Oracle BI Publisher generates natively), re-encodes
-    # all content streams, and updates /W, /BaseFont, /FontName.
+    # Rebuild the subset with sequential GIDs and a fresh XXXXXX+Tahoma
+    # prefix. Leaving the donor font bytes and /BaseFont tag untouched
+    # fingerprints the template (same hash + different text = «подмена»).
+    # A receipt that already passed Fraudex (AM_1788461083521) has a
+    # different Length1/prefix than its donor — same rebuild path.
     pdf_bytes = _rebuild_font_and_remap(pdf_bytes)
 
     # Extract receipt datetime from replacements.

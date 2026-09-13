@@ -1,6 +1,7 @@
 """Сезон 1: PDF без перевода — Альфа / Яндекс столбиком."""
 from __future__ import annotations
 
+import datetime
 import random
 import re
 import sys
@@ -20,44 +21,42 @@ for _p in (_VENDOR / "yandex_pkg", _VENDOR, _YA_DESK, _ALFA_DESK):
 
 from generator import AlfaReceiptError, account_control_key, build as build_alfa  # noqa: E402
 from statement import StatementError, build as build_statement  # noqa: E402
-from yandex import YandexReceiptError, generate_yandex_receipt  # noqa: E402
+from yandex import YandexReceiptError, generate_yandex_variants  # noqa: E402
 
 HINT_ALFA = (
     "Чек Альфа · СБП\n"
-    "Пиши столбиком, без подписей — одно значение на строку:\n\n"
+    "Дата и время подставятся сами (сейчас, МСК).\n"
+    "Пиши столбиком, без подписей:\n\n"
     "34090\n"
-    "11.09.2026 00:42\n"
     "Андрей Кириллович Н\n"
     "+79962323353\n"
     "Сбербанк\n"
     "9039\n"
     "Перевод денежных средств\n\n"
     "1 сумма\n"
-    "2 дата и время\n"
-    "3 получатель\n"
-    "4 телефон получателя\n"
-    "5 банк\n"
-    "6 последние 4 цифры счёта\n"
-    "7 комментарий"
+    "2 получатель\n"
+    "3 телефон получателя\n"
+    "4 банк\n"
+    "5 последние 4 цифры счёта\n"
+    "6 комментарий"
 )
 
 HINT_YANDEX = (
     "Чек Яндекс · СБП\n"
+    "Дата и время подставятся сами (сейчас, МСК).\n"
     "Пиши столбиком, без подписей:\n\n"
     "9900\n"
-    "10.09.2026 01:45\n"
     "Александр Евгеньевич Ж.\n"
     "+79003517080\n"
     "Дарья Романовна С.\n"
     "+79627158324\n"
     "Сбербанк\n\n"
     "1 сумма\n"
-    "2 дата и время\n"
-    "3 отправитель\n"
-    "4 телефон отправителя\n"
-    "5 получатель\n"
-    "6 телефон получателя\n"
-    "7 банк получателя"
+    "2 отправитель\n"
+    "3 телефон отправителя\n"
+    "4 получатель\n"
+    "5 телефон получателя\n"
+    "6 банк получателя"
 )
 
 HINT_STMT = (
@@ -100,19 +99,42 @@ def _amount(s: str) -> float:
     return float(s)
 
 
+def _msk_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).replace(tzinfo=None)
+
+
+def _stamp_now() -> datetime.datetime:
+    """Wall clock in MSK at generation; seconds never 00 (that is a tell)."""
+    now = _msk_now()
+    if now.second == 0:
+        now = now.replace(second=random.randint(1, 59))
+    return now
+
+
+def _looks_date(s: str) -> bool:
+    s = re.sub(r"\s+", " ", s.strip())
+    return bool(re.match(r"^\d{2}\.\d{2}\.\d{4}(\s+\d{2}:\d{2}(:\d{2})?)?", s))
+
+
+def _strip_optional_date(rows: list[str], without_date: int) -> list[str]:
+    """Date is stamped automatically; an extra date line is ignored."""
+    if len(rows) == without_date + 1 and _looks_date(rows[1]):
+        return [rows[0]] + rows[2:]
+    return rows
+
+
 def _dt(s: str) -> str:
     s = re.sub(r"\s+", " ", s.strip())
     s = re.sub(r"\s*мск\s*$", "", s, flags=re.I)
-    for fmt, out in (
-        (r"^(\d{2}\.\d{2}\.\d{4}) (\d{2}:\d{2}:\d{2})$", r"\1 \2"),
-        (r"^(\d{2}\.\d{2}\.\d{4}) (\d{2}:\d{2})$", r"\1 \2:00"),
-        (r"^(\d{2}\.\d{2}\.\d{4})$", None),
-    ):
-        m = re.match(fmt, s)
-        if m:
-            if out is None:
-                raise ValueError("нужны дата и время, например 11.09.2026 00:42")
-            return m.expand(out)
+    m = re.match(r"^(\d{2}\.\d{2}\.\d{4}) (\d{2}:\d{2}:\d{2})$", s)
+    if m:
+        return f"{m.group(1)} {m.group(2)}"
+    m = re.match(r"^(\d{2}\.\d{2}\.\d{4}) (\d{2}:\d{2})$", s)
+    if m:
+        # Genuine SBP ids never encode seconds 00; padding HH:MM with :00 is a tell.
+        return f"{m.group(1)} {m.group(2)}:{random.randint(1, 59):02d}"
+    if re.match(r"^\d{2}\.\d{2}\.\d{4}$", s):
+        raise ValueError("нужны дата и время, например 11.09.2026 00:42")
     raise ValueError(f"непонятная дата: {s}")
 
 
@@ -150,13 +172,14 @@ def account_from_last4(last4: str) -> str:
 
 
 def parse_alfa_check(text: str) -> dict:
-    rows = _lines(text)
-    if len(rows) != 7:
-        raise ValueError(f"нужно 7 строк, пришло {len(rows)}")
-    amount, date, recipient, phone, bank, last4, comment = rows
+    rows = _strip_optional_date(_lines(text), 6)
+    if len(rows) != 6:
+        raise ValueError(f"нужно 6 строк (без даты), пришло {len(rows)}")
+    amount, recipient, phone, bank, last4, comment = rows
+    now = _stamp_now()
     return {
         "amount": _amount(amount),
-        "transfer_dt": _dt(date),
+        "transfer_dt": now.strftime("%d.%m.%Y %H:%M:%S"),
         "recipient": recipient,
         "phone": phone_alfa(phone),
         "bank": bank,
@@ -166,16 +189,17 @@ def parse_alfa_check(text: str) -> dict:
 
 
 def parse_yandex_check(text: str) -> dict:
-    rows = _lines(text)
-    if len(rows) != 7:
-        raise ValueError(f"нужно 7 строк, пришло {len(rows)}")
-    amount, date, fio_from, phone_from, fio_to, phone_to, bank = rows
-    transfer = _dt(date)
-    day = transfer.split()[0]
+    rows = _strip_optional_date(_lines(text), 6)
+    if len(rows) != 6:
+        raise ValueError(f"нужно 6 строк (без даты), пришло {len(rows)}")
+    amount, fio_from, phone_from, fio_to, phone_to, bank = rows
+    now = _stamp_now()
+    utc = now - datetime.timedelta(hours=3)
     return {
         "amount": _amount(amount),
-        "transfer": transfer,
-        "doc_date": day,
+        "transfer": now.strftime("%d.%m.%Y %H:%M:%S"),
+        "doc_date": now.strftime("%d.%m.%Y"),
+        "creation_date": f"D:{utc.strftime('%Y%m%d%H%M%S')}Z",
         "fio_from": fio_from,
         "phone_from": phone_yandex(phone_from),
         "fio_to": fio_to,
@@ -233,11 +257,32 @@ def parse_statement(text: str) -> dict:
     }
 
 
+def make_yandex_pdfs(text: str) -> list[tuple[bytes, str]]:
+    """Several interchangeable receipts: Fraudex fingerprints the receipt number.
+
+    Filenames are UUID.pdf — the same form Yandex Bank writes on download.
+    """
+    return [(v["pdf"], v["filename"]) for v in
+            generate_yandex_variants(parse_yandex_check(text), 3)]
+
+
+def alfa_download_name(formed_dt: str | None = None) -> str:
+    """Alfa app writes AM_<epoch_ms>.pdf at download time (now), never
+    before the transfer — that mismatch is what Fraudex flagged."""
+    msk = datetime.timezone(datetime.timedelta(hours=3))
+    t = datetime.datetime.now(msk)
+    millis = int(t.timestamp() * 1000) + random.randint(1, 999)
+    return f"AM_{millis}.pdf"
+
+
 def make_pdf(kind: str, text: str) -> tuple[bytes, str]:
     if kind == "s1_alfa_check":
-        return build_alfa(parse_alfa_check(text)), "alfa_sbp.pdf"
+        meta: dict = {}
+        pdf = build_alfa(parse_alfa_check(text), meta=meta)
+        return pdf, meta.get("filename") or alfa_download_name(meta.get("formed_dt"))
     if kind == "s1_yandex_check":
-        return generate_yandex_receipt(parse_yandex_check(text)), "yandex_sbp.pdf"
+        v = generate_yandex_variants(parse_yandex_check(text), 1)[0]
+        return v["pdf"], v["filename"]
     if kind == "s1_alfa_stmt":
         return build_statement(parse_statement(text)), "alfa_statement.pdf"
     raise ValueError("неизвестный тип")

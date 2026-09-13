@@ -780,7 +780,7 @@ def build(data: dict, template: str = TEMPLATE, seed: Optional[int] = None) -> b
     # iText stamps /ModDate with a real wall-clock time, never a round noon.
     # Seconds and minutes are both non-zero on genuine statements.
     stamp = f"{formed} {rng.randint(9, 17):02d}:{rng.randint(1, 59):02d}:{rng.randint(1, 59):02d}"
-    pdf = _op._patch_docid_moddate(pdf, stamp)
+    pdf = _op._patch_docid_moddate(pdf, stamp, style="itext")
     pdf = _op._rebuild_xref_table(pdf, style="itext")
     return pdf
 

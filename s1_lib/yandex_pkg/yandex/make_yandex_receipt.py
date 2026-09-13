@@ -418,8 +418,11 @@ def make_sbp_id(transfer: datetime.datetime, rng: random.Random = random) -> str
     rand = ("".join(rng.choice("0123456789") for _ in range(4))
             + rng.choice("0123456789MN"))
     counter = f"0B10{rng.randint(1, 20):02d}"
+    # Printed time is HH:MM; the ID still carries seconds. A UI that pads
+    # missing seconds as :00 produces 00 in every file — genuine ones never do.
+    second = transfer.second or rng.randint(1, 59)
     sbp = (rng.choice("AB") + f"{day:04d}" + utc.strftime("%H%M")
-           + f"{transfer.second:02d}" + rand + counter
+           + f"{second:02d}" + rand + counter
            + sbp_scheme_tail(utc.date()))
     assert len(sbp) == 32
     return sbp
@@ -429,8 +432,8 @@ def make_ref_number(op_date: datetime.date, rng: random.Random = random) -> str:
     return op_date.strftime("%Y%m%d") + f"{rng.randrange(10**7):07d}"
 
 
-AUTH_LETTERS = "IJKLMNPRTZ"      # every letter seen in genuine codes, and only
-                                 # those: RIR998 L47R8J 42T4PZ RK833L T0N5MR R9N031
+AUTH_LETTERS = "BIJKLMNPRTVZ"    # letters seen in genuine codes, and only those:
+                                 # RIR998 L47R8J 42T4PZ RK833L T0N5MR R9N031 2349BV
 
 
 def make_auth_code(rng: random.Random = random) -> str:
@@ -441,6 +444,66 @@ def make_auth_code(rng: random.Random = random) -> str:
 
 
 # ── field layout (keyed by the y-coordinate of the value run) ───────────────
+
+_FIO_INITIAL = re.compile(r"^(.+\s)([А-ЯЁA-Z])\.?$")
+
+
+def normalize_fio(name: str) -> str:
+    """Yandex always prints a period after the single-letter initial (Ж. / С.)."""
+    name = (name or "").strip()
+    m = _FIO_INITIAL.match(name)
+    if m:
+        return m.group(1) + m.group(2) + "."
+    return name
+
+
+def rewrite_value_column(stream: bytes, values: dict, bank: Bank) -> bytes:
+    """Replace right-column F1/10 runs with a real literal-string parser.
+
+    A regex ``(.*?)`` stops at the first raw ``)`` byte, and GID payloads of
+    СБП identifiers often contain 0x29. The leftover donor glyphs then sit
+    next to the new text and trip Fraudex's «подмена текста».
+    """
+    out = bytearray()
+    last = 0
+    for start, inner in iter_literal_strings(stream):
+        end = start + 1 + len(inner) + 1
+        if not re.match(rb"\s*Tj", stream[end:end + 8]):
+            continue
+        lookbehind = stream[max(0, start - 80):start]
+        m = re.search(
+            rb"(1 0 0 1 )([\d.]+)( )([\d.]+)( Tm\s*/F1 )(10)( Tf\s*0 0 0 rg\s*)\Z",
+            lookbehind)
+        if not m:
+            continue
+        x = float(m.group(2))
+        y = float(m.group(4))
+        # labels sit at x=20; only the right-hand value column is replaced
+        if x < 200:
+            continue
+        new_text = values.get(round(y, 2))
+        if new_text is None:
+            continue
+        raw = unescape_pdf_string(inner)
+        old_gids = [(b0 << 8) | b1 for b0, b1 in zip(raw[0::2], raw[1::2])]
+        old_full = "".join(bank.gid2char.get(g, "") for g in old_gids)
+        # Preserve the value's exact leading whitespace (JasperReports emits a
+        # varying number of leading spaces per field); never inject our own.
+        prefix = old_full[:len(old_full) - len(old_full.lstrip(" "))]
+        new_full = prefix + new_text
+        size = 10.0
+        old_w = sum(bank.gid2width.get(g, 0) for g in old_gids) * size / bank.upm
+        right = x + old_w
+        new_x = right - bank.width(new_full, size)
+        new_str = gids_to_pdf_string([bank.char2gid[c] for c in new_full])
+        chunk_start = start - len(m.group(0))
+        out += stream[last:chunk_start]
+        out += (m.group(1) + fmt_num(new_x) + m.group(3) + m.group(4)
+                + m.group(5) + m.group(6) + m.group(7) + new_str)
+        last = end
+    out += stream[last:]
+    return bytes(out)
+
 
 def format_amount(value) -> str:
     """Money the way Java's ru_RU DecimalFormat writes it: comma decimal mark
@@ -481,6 +544,8 @@ def build(data: dict, template: str = TEMPLATE, out_path: str = None,
     sbp_id = data.get("sbp_id") or make_sbp_id(transfer, rng)
     ref_no = data.get("ref_no") or make_ref_number(ref_date, rng)
     auth = data.get("auth_code") or make_auth_code(rng)
+    fio_from = normalize_fio(data["fio_from"])
+    fio_to = normalize_fio(data["fio_to"])
 
     # value text keyed by the run's y-coordinate (from the template layout)
     values = {
@@ -490,9 +555,9 @@ def build(data: dict, template: str = TEMPLATE, out_path: str = None,
         686.72: data.get("status", "Выполнено"),
         661.72: data.get("bank_from", "Яндекс Банк"),
         636.72: data["phone_from"],
-        611.72: data["fio_from"],
+        611.72: fio_from,
         586.72: data["phone_to"],
-        561.72: data["fio_to"],
+        561.72: fio_to,
         536.72: data["bank_to"],
         486.72: f"{format_amount(data['amount'])} \u20bd",
         436.72: auth,
@@ -509,36 +574,7 @@ def build(data: dict, template: str = TEMPLATE, out_path: str = None,
     # ── rewrite the content stream (obj 7) ──────────────────────────────────
     cdict, cdata = stream_of(objects[7])
     stream = zlib.decompress(cdata)
-
-    run_re = re.compile(
-        rb"(1 0 0 1 )([\d.]+)( )([\d.]+)( Tm\s*/F1 )(10)( Tf\s*0 0 0 rg\s*)\((.*?)\)(\s*Tj)",
-        re.S)
-
-    def repl(m):
-        x = float(m.group(2)); y = float(m.group(4))
-        # labels sit at x=20; only the right-hand value column is replaced, so a
-        # label sharing a value's y-coordinate is never overwritten.
-        if x < 200:
-            return m.group(0)
-        new_text = values.get(round(y, 2))
-        if new_text is None:
-            return m.group(0)
-        raw = unescape_pdf_string(m.group(8))
-        old_gids = [(b0 << 8) | b1 for b0, b1 in zip(raw[0::2], raw[1::2])]
-        old_full = "".join(bank.gid2char.get(g, "") for g in old_gids)
-        # Preserve the value's exact leading whitespace (JasperReports emits a
-        # varying number of leading spaces per field); never inject our own.
-        prefix = old_full[:len(old_full) - len(old_full.lstrip(" "))]
-        new_full = prefix + new_text
-        size = 10.0
-        old_w = sum(bank.gid2width.get(g, 0) for g in old_gids) * size / bank.upm
-        right = x + old_w
-        new_x = right - bank.width(new_full, size)
-        new_str = gids_to_pdf_string([bank.char2gid[c] for c in new_full])
-        return (m.group(1) + fmt_num(new_x) + m.group(3) + m.group(4)
-                + m.group(5) + m.group(6) + m.group(7) + new_str + m.group(9))
-
-    new_stream = run_re.sub(repl, stream)
+    new_stream = rewrite_value_column(stream, values, bank)
 
     # ── collect used F1 gids from the FINAL stream ───────────────────────────
     used = f1_used_gids(new_stream)

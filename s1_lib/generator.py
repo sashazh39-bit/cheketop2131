@@ -145,6 +145,17 @@ def _parse_dt(transfer_dt) -> datetime.datetime:
     raise AlfaReceiptError(f"Cannot parse transfer_dt: {transfer_dt!r}")
 
 
+def am_download_name(formed_dt: datetime.datetime, rng: random.Random = random) -> str:
+    """Filename the Alfa app writes: AM_<epoch_ms>.pdf.
+
+    Millis are the download clock (now), plus jitter so two saves never collide.
+    """
+    msk = datetime.timezone(datetime.timedelta(hours=3))
+    now = datetime.datetime.now(msk)
+    millis = int(now.timestamp() * 1000) + rng.randint(0, 999)
+    return f"AM_{millis}.pdf"
+
+
 # ── helper: operation id ───────────────────────────────────────────────────
 # The 7 digits after C16DDMMYY are NOT random: the first four are Alfa's
 # running daily operation counter and the last three a channel id.
@@ -443,15 +454,18 @@ def build(data: dict,
 
     # Сформирована = when the receipt was downloaded: after the transfer but
     # never in the future, or a checker comparing it to the clock rejects it.
-    now_msk       = datetime.datetime.now(_MSK).replace(tzinfo=None)
-    formed_offset = rng.randint(3, 120)
-    formed_dt     = dt + datetime.timedelta(minutes=formed_offset)
-    if formed_dt > now_msk:
-        # Land somewhere between the transfer and now; if the transfer itself
-        # is in the future the caller asked for it, so keep the small offset.
-        span = int((now_msk - dt).total_seconds() // 60)
-        formed_dt = (dt + datetime.timedelta(minutes=rng.randint(2, span))
-                     if span >= 2 else dt + datetime.timedelta(minutes=1))
+    now_msk = datetime.datetime.now(_MSK).replace(tzinfo=None)
+    # Receipt is issued at generation time. If the transfer is "now", stamp
+    # «Сформирована» with the same clock — never a future minute.
+    if dt >= now_msk - datetime.timedelta(minutes=1):
+        formed_dt = now_msk
+    else:
+        formed_offset = rng.randint(2, 12)
+        formed_dt = dt + datetime.timedelta(minutes=formed_offset)
+        if formed_dt > now_msk:
+            span = int((now_msk - dt).total_seconds() // 60)
+            formed_dt = (dt + datetime.timedelta(minutes=rng.randint(2, span))
+                         if span >= 2 else now_msk)
     formed_str    = formed_dt.strftime("%d.%m.%Y\xa0%H:%M\xa0мск")
 
     opid   = _make_opid(dt, rng)
@@ -464,6 +478,7 @@ def build(data: dict,
             "formed_dt":   formed_dt.strftime("%d.%m.%Y %H:%M мск"),
             "transfer_dt": dt.strftime("%d.%m.%Y %H:%M:%S мск"),
             "amount":      amount_str.strip(),
+            "filename":    am_download_name(formed_dt, rng),
         })
 
     # ── load donor ───────────────────────────────────────────────────────
