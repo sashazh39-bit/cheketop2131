@@ -27,6 +27,7 @@ _ur.install_opener(_ur.build_opener(*_handlers))
 import json
 import os
 import re
+import sys
 import subprocess
 import tempfile
 import time
@@ -4698,6 +4699,14 @@ def run_bot(token: str) -> None:
             except Exception:
                 pass
             err_msg = body or e.reason
+            if e.code == 409:
+                print(
+                    "⚠️ getUpdates 409 Conflict: второй экземпляр бота "
+                    "(часто python3 bot.py на Маке). Жду 20 сек…",
+                    flush=True,
+                )
+                time.sleep(20)
+                continue
             if e.code == 400:
                 offset = 0
                 print(f"⚠️ getUpdates 400: {err_msg[:120]}")
@@ -7118,34 +7127,61 @@ def run_bot(token: str) -> None:
                 traceback.print_exc()
 
 
+def _cloud_poller_allowed() -> bool:
+    """Render/Railway/run_render — да. Голый запуск на Маке — нет (ломает 24/7)."""
+    if os.environ.get("ALLOW_LOCAL_POLLER") == "1":
+        return True
+    if os.environ.get("RENDER"):
+        return True
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        return True
+    # run_render.py всегда облако; прямой python3 bot_standalone.py на Маке — нет
+    return Path(sys.argv[0]).name == "run_render.py"
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         print("Задайте TELEGRAM_BOT_TOKEN (в .env или export)")
         return
+    if not _cloud_poller_allowed():
+        print(
+            "Бот 24/7 живёт на Render. Локальный запуск даёт Telegram 409 "
+            "и он перестаёт отвечать.\n"
+            "Проверка: https://cheketop2131.onrender.com/healthz\n"
+            "Только если Render выключен: ALLOW_LOCAL_POLLER=1 python3 bot_standalone.py",
+            flush=True,
+        )
+        return
     if _proxy_url:
         _masked = _proxy_url.split("@")[-1] if "@" in _proxy_url else _proxy_url[:50]
         print("🔒 Прокси:", _masked)
     # Проверка токена и сброс webhook (иначе getUpdates даёт 400)
-    try:
-        r = tg_request(token, "getMe")
-        if r.get("ok"):
-            print("✅ Бот:", r["result"].get("username", "?"))
-            if _EFFECTIVE_ALLOWED_IDS:
-                print("🔐 Доступ: только", len(_EFFECTIVE_ALLOWED_IDS), "пользовател(ей)")
-            dw = tg_request(token, "deleteWebhook", {"drop_pending_updates": True})
-            if not dw.get("ok"):
-                print("⚠️ deleteWebhook:", dw.get("description", dw))
-            run_bot(token)
-        else:
-            print("❌ Токен неверный:", r.get("description"))
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            print("❌ Токен неверный (401). Сделай в @BotFather:")
-            print("   /mybots → выбери бота → API Token → Revoke current token")
-            print("   Обнови .env с новым токеном")
-        else:
-            print("❌ Ошибка HTTP:", e.code, e.reason)
+    while True:
+        try:
+            r = tg_request(token, "getMe")
+            if r.get("ok"):
+                print("✅ Бот:", r["result"].get("username", "?"))
+                if _EFFECTIVE_ALLOWED_IDS:
+                    print("🔐 Доступ: только", len(_EFFECTIVE_ALLOWED_IDS), "пользовател(ей)")
+                dw = tg_request(token, "deleteWebhook", {"drop_pending_updates": False})
+                if not dw.get("ok"):
+                    print("⚠️ deleteWebhook:", dw.get("description", dw))
+                run_bot(token)
+                print("run_bot() вышел — перезапуск через 5 сек", flush=True)
+            else:
+                print("❌ Токен неверный:", r.get("description"))
+                return
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print("❌ Токен неверный (401). Сделай в @BotFather:")
+                print("   /mybots → выбери бота → API Token → Revoke current token")
+                print("   Обнови .env с новым токеном")
+                return
+            print("❌ Ошибка HTTP:", e.code, e.reason, "— повтор через 8 сек", flush=True)
+        except Exception as exc:
+            print(f"❌ Бот упал: {exc} — перезапуск через 8 сек", flush=True)
+        time.sleep(8)
 
 
 if __name__ == "__main__":

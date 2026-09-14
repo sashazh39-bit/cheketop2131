@@ -106,22 +106,33 @@ def main() -> None:
         _set(last_error=str(exc))
         sys.exit(1)
 
+    os.environ["ALLOW_LOCAL_POLLER"] = "1"
     _set(bot_alive=True)
     print("[render] Запускаем бота (polling) в главном потоке...", flush=True)
 
-    try:
-        bot_main()  # блокирует; внутри есть restart-loop
-    except SystemExit:
-        raise
-    except Exception as exc:
-        _set(bot_alive=False, last_error=str(exc)[:500])
-        print(f"[render] Бот упал: {exc}", flush=True)
-        sys.exit(1)
-
-    # Если bot_main() вернулся штатно — всё равно выходим,
-    # чтобы Render мог перезапустить при необходимости.
-    print("[render] bot_main() завершился — выход", flush=True)
-    sys.exit(0)
+    # Не выходим: Render перезапускает процесс, но 1–2 мин бот мёртв.
+    while True:
+        try:
+            bot_main()
+            print("[render] bot_main() завершился — перезапуск через 5 сек", flush=True)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            if code == 0:
+                print("[render] штатный выход — перезапуск через 5 сек", flush=True)
+            else:
+                _set(bot_alive=False, last_error=str(exc)[:500])
+                print(f"[render] SystemExit {code} — перезапуск через 8 сек", flush=True)
+                time.sleep(8)
+                _set(bot_alive=True)
+                continue
+        except Exception as exc:
+            _set(bot_alive=False, last_error=str(exc)[:500])
+            print(f"[render] Бот упал: {exc} — перезапуск через 8 сек", flush=True)
+            time.sleep(8)
+            _set(bot_alive=True)
+            continue
+        time.sleep(5)
+        _set(bot_alive=True)
 
 
 if __name__ == "__main__":
