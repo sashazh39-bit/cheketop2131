@@ -4684,7 +4684,11 @@ def _handle_vtb_transgran_input(token: str, uid: int, chat_id: int, text: str, m
 
 
 
+LAST_POLL_TS = 0.0
+
+
 def run_bot(token: str) -> None:
+    global LAST_POLL_TS
     offset = 0
     print("Бот запущен (без зависимостей)...")
 
@@ -4692,6 +4696,7 @@ def run_bot(token: str) -> None:
         try:
             # timeout 10 — короткий long-poll, меньше обрывов на нестабильной сети
             r = tg_request(token, "getUpdates", {"offset": offset, "timeout": 10})
+            LAST_POLL_TS = time.time()
         except urllib.error.HTTPError as e:
             body = ""
             try:
@@ -4741,7 +4746,7 @@ def run_bot(token: str) -> None:
                     _parts = text.split()
                     cmd0 = _parts[0].split("@", 1)[0] if _parts else ""
 
-                    if text == "/start":
+                    if cmd0 == "/start":
                         if uid in USER_STATE:
                             if "file_path" in USER_STATE[uid]:
                                 try:
@@ -7127,31 +7132,10 @@ def run_bot(token: str) -> None:
                 traceback.print_exc()
 
 
-def _cloud_poller_allowed() -> bool:
-    """Render/Railway/run_render — да. Голый запуск на Маке — нет (ломает 24/7)."""
-    if os.environ.get("ALLOW_LOCAL_POLLER") == "1":
-        return True
-    if os.environ.get("RENDER"):
-        return True
-    if os.environ.get("RAILWAY_ENVIRONMENT"):
-        return True
-    # run_render.py всегда облако; прямой python3 bot_standalone.py на Маке — нет
-    return Path(sys.argv[0]).name == "run_render.py"
-
-
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         print("Задайте TELEGRAM_BOT_TOKEN (в .env или export)")
-        return
-    if not _cloud_poller_allowed():
-        print(
-            "Бот 24/7 живёт на Render. Локальный запуск даёт Telegram 409 "
-            "и он перестаёт отвечать.\n"
-            "Проверка: https://cheketop2131.onrender.com/healthz\n"
-            "Только если Render выключен: ALLOW_LOCAL_POLLER=1 python3 bot_standalone.py",
-            flush=True,
-        )
         return
     if _proxy_url:
         _masked = _proxy_url.split("@")[-1] if "@" in _proxy_url else _proxy_url[:50]

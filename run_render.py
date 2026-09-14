@@ -44,11 +44,21 @@ class HealthHandler(BaseHTTPRequestHandler):
         uptime = int(time.time() - st.get("uptime_started", time.time()))
 
         if self.path in ("/", "/healthz"):
+            try:
+                import bot_standalone as _bot
+                poll_ts = float(getattr(_bot, "LAST_POLL_TS", 0) or 0)
+            except Exception:
+                poll_ts = 0
+            poll_age = (time.time() - poll_ts) if poll_ts else None
+            starting = uptime < 90 and not poll_ts
+            polling = poll_ts > 0 and poll_age is not None and poll_age < 60
+            alive = bool(polling or starting)
             status = 200 if alive else 503
             payload = {
-                "status": "ok" if alive else "starting",
+                "status": "ok" if polling else ("starting" if starting else "not_polling"),
                 "uptime_sec": uptime,
                 "bot_alive": alive,
+                "last_poll_age_sec": None if poll_age is None else int(poll_age),
                 "last_error": st.get("last_error", ""),
             }
             body = json.dumps(payload, ensure_ascii=False).encode()
