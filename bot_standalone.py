@@ -4685,6 +4685,7 @@ def _handle_vtb_transgran_input(token: str, uid: int, chat_id: int, text: str, m
 
 
 LAST_POLL_TS = 0.0
+TG_ALLOWED_UPDATES = ["message", "edited_message", "callback_query"]
 
 
 def run_bot(token: str) -> None:
@@ -4695,7 +4696,11 @@ def run_bot(token: str) -> None:
     while True:
         try:
             # timeout 10 — короткий long-poll, меньше обрывов на нестабильной сети
-            r = tg_request(token, "getUpdates", {"offset": offset, "timeout": 10})
+            r = tg_request(token, "getUpdates", {
+                "offset": offset,
+                "timeout": 10,
+                "allowed_updates": TG_ALLOWED_UPDATES,
+            })
             LAST_POLL_TS = time.time()
         except urllib.error.HTTPError as e:
             body = ""
@@ -4755,6 +4760,13 @@ def run_bot(token: str) -> None:
                                     pass
                             del USER_STATE[uid]
                         _s1_show_home(token, msg["chat"]["id"], tg_request, uid=uid)
+                        continue
+
+                    if cmd0 and cmd0.startswith("/") and cmd0 not in (
+                        "/check", "/add_sbp", "/pool", "/sbp", "/main",
+                        "/grant", "/revoke", "/access", "/dostup", "/help", "/grant_help",
+                    ):
+                        _s1_show_home(token, chat_id, tg_request, uid=uid)
                         continue
 
                     if cmd0 in ("/dostup", "/help", "/grant_help"):
@@ -7151,6 +7163,11 @@ def main() -> None:
                 dw = tg_request(token, "deleteWebhook", {"drop_pending_updates": False})
                 if not dw.get("ok"):
                     print("⚠️ deleteWebhook:", dw.get("description", dw))
+                cmds = tg_request(token, "setMyCommands", {"commands": [
+                    {"command": "start", "description": "Главное меню"},
+                ]})
+                if not cmds.get("ok"):
+                    print("⚠️ setMyCommands:", cmds.get("description", cmds))
                 run_bot(token)
                 print("run_bot() вышел — перезапуск через 5 сек", flush=True)
             else:
