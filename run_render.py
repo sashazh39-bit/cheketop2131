@@ -38,7 +38,7 @@ def _get() -> dict:
 
 
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
+    def _health_response(self, include_body: bool) -> None:
         st = _get()
         alive = st.get("bot_alive", False)
         uptime = int(time.time() - st.get("uptime_started", time.time()))
@@ -56,7 +56,8 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if include_body:
+                self.wfile.write(body)
         elif self.path == "/metrics":
             body = (
                 f"bot_alive {1 if alive else 0}\n"
@@ -66,11 +67,20 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if include_body:
+                self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"Not Found")
+            if include_body:
+                self.wfile.write(b"Not Found")
+
+    def do_GET(self) -> None:
+        self._health_response(True)
+
+    def do_HEAD(self) -> None:
+        # UptimeRobot по умолчанию шлёт HEAD; без этого Python отдаёт 501.
+        self._health_response(False)
 
     def log_message(self, fmt, *args) -> None:  # silence access log
         pass
